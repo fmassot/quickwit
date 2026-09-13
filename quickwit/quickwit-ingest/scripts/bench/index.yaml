@@ -1,0 +1,12 @@
+version: 0.8
+index_id: bench
+doc_mapping:
+  mode: dynamic
+  field_mappings:
+    - name: ts
+      type: datetime
+      input_formats: [unix_timestamp]
+      fast: true
+  timestamp_field: ts
+indexing_settings:
+  commit_timeout_secs: 30
