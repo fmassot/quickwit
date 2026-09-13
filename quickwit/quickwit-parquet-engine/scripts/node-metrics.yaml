@@ -1,0 +1,12 @@
+version: 0.8
+node_id: metrics-1
+listen_address: 0.0.0.0
+rest:
+  listen_port: 7280
+grpc_listen_port: 7281
+enable_standalone_compactors: false
+data_dir: /home/ec2-user/qwdata
+metastore_uri: s3://<your-bucket>/metrics-metastore
+default_index_root_uri: s3://<your-bucket>/metrics-indexes
+indexer:
+  enable_otlp_endpoint: true
