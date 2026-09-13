@@ -90,7 +90,7 @@ fn make_hosts(n: usize, rng: &mut StdRng) -> Vec<Host> {
             ];
             let mut values = [0f64; 10];
             for v in values.iter_mut() {
-                *v = rng.gen_range(0.0..100.0);
+                *v = rng.gen_range(0.0..100.0f64).round();
             }
             Host { attrs, values }
         })
@@ -99,7 +99,8 @@ fn make_hosts(n: usize, rng: &mut StdRng) -> Vec<Host> {
 
 fn step(host: &mut Host, rng: &mut StdRng) {
     for v in host.values.iter_mut() {
-        *v = (*v + rng.gen_range(-1.0..1.0)).clamp(0.0, 100.0);
+        // TSBS cpu fields are integers in 0..=100 (random walk).
+        *v = (*v + rng.gen_range(-1.0..=1.0)).round().clamp(0.0, 100.0);
     }
 }
 
