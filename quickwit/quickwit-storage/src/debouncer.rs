@@ -175,6 +175,14 @@ impl<T: Storage> Storage for DebouncedStorage<T> {
         self.underlying.put(path, payload).await
     }
 
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> crate::StorageResult<()> {
+        self.underlying.put_if_absent(path, payload).await
+    }
+
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
         self.underlying.copy_to(path, output).await
     }

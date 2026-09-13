@@ -72,6 +72,24 @@ pub trait Storage: fmt::Debug + Send + Sync + 'static {
     /// Saves a file into the storage.
     async fn put(&self, path: &Path, payload: Box<dyn PutPayload>) -> StorageResult<()>;
 
+    /// Saves a file into the storage only if no object exists at `path` yet
+    /// (create-if-absent, `If-None-Match: *` on S3).
+    ///
+    /// Returns [`StorageErrorKind::AlreadyExists`] if an object is already present. This is the
+    /// primitive used for fencing sequentially numbered logs: two writers racing for the same
+    /// key observe exactly one success.
+    ///
+    /// Not every backend supports conditional writes. The default implementation fails with
+    /// [`StorageErrorKind::Internal`].
+    async fn put_if_absent(&self, path: &Path, _payload: Box<dyn PutPayload>) -> StorageResult<()> {
+        let err = anyhow::anyhow!(
+            "conditional writes are not supported for storage `{}` (path: `{}`)",
+            self.uri(),
+            path.display(),
+        );
+        Err(StorageErrorKind::Internal.with_error(err))
+    }
+
     /// Copies the file associated to `Path` into an `AsyncWrite`.
     /// This function is required to call `.flush()` before it successfully returns.
     ///

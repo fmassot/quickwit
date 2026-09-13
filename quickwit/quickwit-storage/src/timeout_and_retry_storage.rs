@@ -63,6 +63,13 @@ impl Storage for TimeoutAndRetryStorage {
         self.underlying.put(path, payload).await
     }
 
+    async fn put_if_absent(&self, path: &Path, payload: Box<dyn PutPayload>) -> StorageResult<()> {
+        // Deliberately not retried here: a retry after an ambiguous failure (timeout after the
+        // PUT landed) would surface as `AlreadyExists` and be indistinguishable from being fenced.
+        // Callers disambiguate by reading the object back.
+        self.underlying.put_if_absent(path, payload).await
+    }
+
     fn copy_to<'life0, 'life1, 'life2, 'async_trait>(
         &'life0 self,
         path: &'life1 Path,

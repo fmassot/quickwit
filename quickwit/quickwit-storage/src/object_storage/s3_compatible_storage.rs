@@ -398,6 +398,7 @@ impl S3CompatibleObjectStorage {
         key: &'a str,
         payload: Box<dyn crate::PutPayload>,
         len: u64,
+        if_absent: bool,
     ) -> Result<(), Retry<StorageError>> {
         // For MD5 uploads, compute Content-MD5 before streaming the body.
         // The AWS SDK no-ops ChecksumAlgorithm::Md5, so MD5 must be sent via
@@ -417,6 +418,10 @@ impl S3CompatibleObjectStorage {
         crate::metrics::OBJECT_STORAGE_UPLOAD_NUM_BYTES.inc_by(len);
         let _timer = HistogramTimer::new(&crate::metrics::OBJECT_STORAGE_PUT_OBJECT_DURATION);
 
+        // `If-None-Match: *` turns the PUT into a create-if-absent. S3 answers 412
+        // `PreconditionFailed` if the key exists, mapped to `StorageErrorKind::AlreadyExists`.
+        let if_none_match: Option<String> = if_absent.then(|| "*".to_string());
+
         self.s3_client
             .put_object()
             .bucket(bucket)
@@ -425,6 +430,7 @@ impl S3CompatibleObjectStorage {
             .content_length(len as i64)
             .set_checksum_algorithm(aws_checksum_algorithm(self.checksum_algorithm))
             .set_content_md5(content_md5)
+            .set_if_none_match(if_none_match)
             .send()
             .await
             .inspect_err(|error| {
@@ -450,10 +456,11 @@ impl S3CompatibleObjectStorage {
         key: &'a str,
         payload: Box<dyn crate::PutPayload>,
         len: u64,
+        if_absent: bool,
     ) -> StorageResult<()> {
         let bucket = &self.bucket;
         aws_retry(&self.retry_params, || async {
-            self.put_single_part_single_try(bucket, key, payload.clone(), len)
+            self.put_single_part_single_try(bucket, key, payload.clone(), len, if_absent)
                 .await
         })
         .await
@@ -929,11 +936,30 @@ impl Storage for S3CompatibleObjectStorage {
         let total_len = payload.len();
         let part_num_bytes = self.multipart_policy.part_num_bytes(total_len);
         let put_result = if self.disable_multipart_upload || part_num_bytes >= total_len {
-            self.put_single_part(&key, payload, total_len).await
+            self.put_single_part(&key, payload, total_len, false).await
         } else {
             self.put_multipart(&key, payload, part_num_bytes, total_len)
                 .await
         };
+        if put_result.is_err() {
+            crate::metrics::OBJECT_STORAGE_PUT_ERRORS_TOTAL.inc();
+        }
+        put_result
+    }
+
+    #[instrument(name = "storage.s3.put_if_absent", level = "debug", skip(self, payload), fields(payload_len = payload.len()))]
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> crate::StorageResult<()> {
+        crate::metrics::OBJECT_STORAGE_PUT_TOTAL.inc();
+        let _permit = REQUEST_SEMAPHORE.acquire().await;
+        let key = self.key(path);
+        let total_len = payload.len();
+        // Conditional writes are only issued as single-part PUTs. Multipart would require the
+        // condition on `CompleteMultipartUpload`, and the callers (WAL objects) are MiB-sized.
+        let put_result = self.put_single_part(&key, payload, total_len, true).await;
         if put_result.is_err() {
             crate::metrics::OBJECT_STORAGE_PUT_ERRORS_TOTAL.inc();
         }

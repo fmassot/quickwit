@@ -18,15 +18,18 @@ use std::io::Cursor;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
+use bytesize::ByteSize;
+use futures::stream::{self, StreamExt};
 use quickwit_common::uri::{Protocol, Uri};
 use quickwit_config::StorageBackend;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use crate::prefix_storage::add_prefix_to_storage;
-use crate::storage::SendableAsync;
+use crate::storage::{ListObjectsStream, ObjectMetadata, SendableAsync};
 use crate::{
     BulkDeleteError, OwnedBytes, Storage, StorageErrorKind, StorageFactory, StorageResolverError,
     StorageResult,
@@ -93,6 +96,41 @@ impl Storage for RamStorage {
         let payload_bytes = payload.read_all().await?;
         self.put_data(path, payload_bytes).await;
         Ok(())
+    }
+
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> crate::StorageResult<()> {
+        let payload_bytes = payload.read_all().await?;
+        let mut files = self.files.write().await;
+        if files.contains_key(path) {
+            let err = anyhow::anyhow!("object `{}` already exists", path.display());
+            return Err(StorageErrorKind::AlreadyExists.with_error(err));
+        }
+        files.insert(path.to_path_buf(), payload_bytes);
+        Ok(())
+    }
+
+    fn list(&self, prefix: &Path) -> ListObjectsStream {
+        let files = self.files.clone();
+        let prefix = prefix.to_path_buf();
+        stream::once(async move {
+            let files = files.read().await;
+            let mut objects: Vec<ObjectMetadata> = files
+                .iter()
+                .filter(|(path, _)| path.starts_with(&prefix))
+                .map(|(path, bytes)| ObjectMetadata {
+                    path: path.clone(),
+                    size: ByteSize::b(bytes.len() as u64),
+                    last_modified: SystemTime::UNIX_EPOCH,
+                })
+                .collect();
+            objects.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(objects)
+        })
+        .boxed()
     }
 
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {

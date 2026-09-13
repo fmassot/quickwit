@@ -36,7 +36,7 @@ pub use debouncer::AsyncDebouncer;
 pub(crate) use debouncer::DebouncedStorage;
 
 pub use self::payload::PutPayload;
-pub use self::storage::{ListObjectsStream, ObjectMetadata, Storage};
+pub use self::storage::{ListObjectsStream, ObjectMetadata, SendableAsync, Storage};
 
 mod bundle_storage;
 mod error;
@@ -352,6 +352,53 @@ pub(crate) mod test_suite {
         test_delete_missing_file(storage)
             .await
             .context("delete_missing_file")?;
+        test_put_if_absent(storage).await.context("put_if_absent")?;
+        Ok(())
+    }
+
+    async fn test_put_if_absent(storage: &mut dyn Storage) -> anyhow::Result<()> {
+        let test_path = Path::new("put_if_absent/000001");
+        assert!(!storage.exists(test_path).await?);
+
+        // First conditional write wins.
+        storage
+            .put_if_absent(test_path, Box::new(b"first".to_vec()))
+            .await?;
+        assert_eq!(storage.get_all(test_path).await?.as_slice(), b"first");
+
+        // Second one loses with `AlreadyExists` and must not clobber the object.
+        let error = storage
+            .put_if_absent(test_path, Box::new(b"second".to_vec()))
+            .await
+            .expect_err("conditional write on an existing object should fail");
+        assert_eq!(error.kind(), StorageErrorKind::AlreadyExists);
+        assert_eq!(storage.get_all(test_path).await?.as_slice(), b"first");
+
+        // Racing writers: exactly one success.
+        let race_path = Path::new("put_if_absent/race");
+        let results = futures::future::join_all((0..8u8).map(|i| {
+            let payload: Box<dyn crate::PutPayload> = Box::new(vec![i]);
+            storage.put_if_absent(race_path, payload)
+        }))
+        .await;
+        let num_successes = results.iter().filter(|result| result.is_ok()).count();
+        assert_eq!(num_successes, 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| error.kind() == StorageErrorKind::AlreadyExists)
+        );
+        let winner = storage.get_all(race_path).await?;
+        assert_eq!(winner.len(), 1);
+
+        storage.delete(test_path).await?;
+        storage.delete(race_path).await?;
+        // Once deleted, the slot is free again.
+        storage
+            .put_if_absent(test_path, Box::new(b"third".to_vec()))
+            .await?;
+        storage.delete(test_path).await?;
         Ok(())
     }
 

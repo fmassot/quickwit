@@ -29,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
 use crate::metrics::object_storage_get_slice_in_flight_guards;
-use crate::storage::SendableAsync;
+use crate::storage::{ListObjectsStream, ObjectMetadata, SendableAsync};
 use crate::{
     BulkDeleteError, DebouncedStorage, DeleteFailure, OwnedBytes, Storage, StorageError,
     StorageErrorKind, StorageFactory, StorageResolverError, StorageResult,
@@ -200,6 +200,45 @@ impl Storage for LocalFileStorage {
         Ok(())
     }
 
+    #[tracing::instrument(name = "storage.local_file.put_if_absent", level = "debug", skip(self, payload), fields(payload_len = payload.len()))]
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> crate::StorageResult<()> {
+        let full_path = self.full_path(path)?;
+        let parent_dir = full_path.parent().ok_or_else(|| {
+            let err = anyhow::anyhow!("no parent directory for {full_path:?}");
+            StorageErrorKind::Internal.with_error(err)
+        })?;
+        tokio::fs::create_dir_all(parent_dir).await?;
+        // Cheap early exit; the `hard_link` below is what actually guarantees atomicity.
+        if tokio::fs::try_exists(&full_path).await? {
+            let err = anyhow::anyhow!("object `{}` already exists", path.display());
+            return Err(StorageErrorKind::AlreadyExists.with_error(err));
+        }
+        let mut reader = payload.byte_stream().await?.into_async_read();
+        let named_temp_file = tempfile::NamedTempFile::new_in(parent_dir)?;
+        let (temp_std_file, temp_filepath) = named_temp_file.into_parts();
+        let mut temp_tokio_file = tokio::fs::File::from_std(temp_std_file);
+        tokio::io::copy(&mut reader, &mut temp_tokio_file).await?;
+        temp_tokio_file.flush().await?;
+        temp_tokio_file.sync_data().await?;
+        // Unlike `rename`, `link` fails if the destination exists, which gives us
+        // create-if-absent semantics atomically. The temp file is unlinked on drop.
+        match tokio::fs::hard_link(&temp_filepath, &full_path).await {
+            Ok(()) => {}
+            Err(io_error) if io_error.kind() == ErrorKind::AlreadyExists => {
+                let err = anyhow::anyhow!("object `{}` already exists", path.display());
+                return Err(StorageErrorKind::AlreadyExists.with_error(err));
+            }
+            Err(io_error) => return Err(StorageErrorKind::Io.with_error(io_error)),
+        }
+        drop(temp_filepath);
+        tokio::fs::File::open(parent_dir).await?.sync_data().await?;
+        Ok(())
+    }
+
     #[tracing::instrument(
         name = "storage.local_file.copy_to",
         level = "debug",
@@ -335,6 +374,74 @@ impl Storage for LocalFileStorage {
         &self.uri
     }
 
+    /// Lists files under `prefix`, recursively. `prefix` is a path prefix in the object store
+    /// sense: `foo/ba` matches `foo/bar` and `foo/baz/qux`. Returned paths are relative to the
+    /// storage root. Emits a single batch.
+    fn list(&self, prefix: &Path) -> ListObjectsStream {
+        let root = self.root.clone();
+        let prefix = prefix.to_path_buf();
+        let full_path_result = self.full_path(&prefix);
+        futures::stream::once(async move {
+            let full_prefix = full_path_result?;
+            // Walk from the deepest existing directory that contains the prefix.
+            let walk_root = if tokio::fs::metadata(&full_prefix)
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+            {
+                full_prefix.clone()
+            } else {
+                full_prefix
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| root.clone())
+            };
+            let mut objects = Vec::new();
+            let mut pending_dirs = vec![walk_root];
+            while let Some(dir) = pending_dirs.pop() {
+                let mut read_dir = match tokio::fs::read_dir(&dir).await {
+                    Ok(read_dir) => read_dir,
+                    Err(io_error) if io_error.kind() == ErrorKind::NotFound => continue,
+                    Err(io_error) => return Err(io_error.into()),
+                };
+                while let Some(entry) = read_dir.next_entry().await? {
+                    let path = entry.path();
+                    let file_type = entry.file_type().await?;
+                    if file_type.is_dir() {
+                        pending_dirs.push(path);
+                        continue;
+                    }
+                    if !file_type.is_file() {
+                        continue;
+                    }
+                    if !path.starts_with(&full_prefix)
+                        && !path
+                            .to_string_lossy()
+                            .starts_with(&*full_prefix.to_string_lossy())
+                    {
+                        continue;
+                    }
+                    let metadata = entry.metadata().await?;
+                    let relative_path = path
+                        .strip_prefix(&root)
+                        .map_err(|_| {
+                            StorageErrorKind::Internal
+                                .with_error(anyhow::anyhow!("path `{path:?}` outside of root"))
+                        })?
+                        .to_path_buf();
+                    objects.push(ObjectMetadata {
+                        path: relative_path,
+                        size: bytesize::ByteSize::b(metadata.len()),
+                        last_modified: metadata.modified()?,
+                    });
+                }
+            }
+            objects.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(objects)
+        })
+        .boxed()
+    }
+
     #[tracing::instrument(
         name = "storage.local_file.file_num_bytes",
         level = "debug",
@@ -395,6 +502,57 @@ mod tests {
         let mut local_file_storage = LocalFileStorage::from_uri(&uri)?;
         storage_test_suite(&mut local_file_storage).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_local_file_storage_list() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = Uri::from_str(&format!("{}", temp_dir.path().display())).unwrap();
+        let storage = LocalFileStorage::from_uri(&uri).unwrap();
+        for path in [
+            "a/wal/000001.wal",
+            "a/wal/000002.wal",
+            "a/other.txt",
+            "b/wal/000001.wal",
+        ] {
+            storage
+                .put(Path::new(path), Box::new(b"x".to_vec()))
+                .await
+                .unwrap();
+        }
+        let list = |prefix: &'static str| {
+            let storage = storage.clone();
+            async move {
+                let mut paths = Vec::new();
+                let mut stream = storage.list(Path::new(prefix));
+                while let Some(batch) = stream.next().await {
+                    paths.extend(batch.unwrap().into_iter().map(|meta| meta.path));
+                }
+                paths
+            }
+        };
+        assert_eq!(
+            list("a/wal").await,
+            vec![
+                PathBuf::from("a/wal/000001.wal"),
+                PathBuf::from("a/wal/000002.wal")
+            ]
+        );
+        assert_eq!(
+            list("a/wal/").await,
+            vec![
+                PathBuf::from("a/wal/000001.wal"),
+                PathBuf::from("a/wal/000002.wal")
+            ]
+        );
+        assert_eq!(list("a/wal/00000").await.len(), 2);
+        assert_eq!(
+            list("a/wal/000002").await,
+            vec![PathBuf::from("a/wal/000002.wal")]
+        );
+        assert_eq!(list("a").await.len(), 3);
+        assert_eq!(list("").await.len(), 4);
+        assert!(list("nope").await.is_empty());
     }
 
     #[tokio::test]

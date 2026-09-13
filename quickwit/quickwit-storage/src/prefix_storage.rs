@@ -59,6 +59,16 @@ impl Storage for PrefixStorage {
         self.storage.put(&self.prefix.join(path), payload).await
     }
 
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> crate::StorageResult<()> {
+        self.storage
+            .put_if_absent(&self.prefix.join(path), payload)
+            .await
+    }
+
     async fn copy_to(
         &self,
         path: &Path,
