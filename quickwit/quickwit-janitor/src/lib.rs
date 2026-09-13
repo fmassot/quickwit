@@ -14,11 +14,13 @@
 
 #![deny(clippy::disallowed_methods)]
 
+use anyhow::Context as _;
 use quickwit_actors::{ActorHandle, Mailbox, Universe};
 use quickwit_common::pubsub::EventBroker;
 use quickwit_compaction::planner::CompactionPlanner;
 use quickwit_config::NodeConfig;
 use quickwit_indexing::actors::MergeSchedulerService;
+use quickwit_ingest::ingest_v3::IngestV3Config;
 use quickwit_metastore::SplitInfo;
 use quickwit_proto::metastore::MetastoreServiceClient;
 use quickwit_search::SearchJobPlacer;
@@ -33,7 +35,9 @@ mod retention_policy_execution;
 
 pub use janitor_service::JanitorService;
 
-use crate::actors::{DeleteTaskService, GarbageCollector, RetentionPolicyExecutor};
+use crate::actors::{
+    DeleteTaskService, GarbageCollector, IngestWalGarbageCollector, RetentionPolicyExecutor,
+};
 
 #[derive(utoipa::OpenApi)]
 #[openapi(components(schemas(SplitInfo)))]
@@ -54,6 +58,21 @@ pub async fn start_janitor_service(
     info!("starting janitor service");
     let garbage_collector = GarbageCollector::new(metastore.clone(), storage_resolver.clone());
     let (_, garbage_collector_handle) = universe.spawn_builder().spawn(garbage_collector);
+
+    // Ingest v3: GC of the object-store WAL (logs of dead ingesters, old fences).
+    if let Some(ingest_v3_config) = IngestV3Config::from_env()? {
+        let wal_storage = storage_resolver
+            .resolve(&ingest_v3_config.wal_uri)
+            .await
+            .context("failed to resolve the ingest v3 WAL storage")?;
+        let ingest_wal_garbage_collector = IngestWalGarbageCollector::new(
+            wal_storage,
+            metastore.clone(),
+            ingest_v3_config.gc_min_age,
+        );
+        let (_, _handle) = universe.spawn_builder().spawn(ingest_wal_garbage_collector);
+        info!(wal_uri = %ingest_v3_config.wal_uri, "started ingest WAL garbage collector");
+    }
 
     let retention_policy_executor = RetentionPolicyExecutor::new(metastore.clone());
     let (_, retention_policy_executor_handle) =

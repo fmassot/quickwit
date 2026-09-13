@@ -93,6 +93,10 @@ impl Storage for CountingStorage {
         self.inner.put(path, payload).await
     }
 
+    async fn put_if_absent(&self, path: &Path, payload: Box<dyn PutPayload>) -> StorageResult<()> {
+        self.inner.put_if_absent(path, payload).await
+    }
+
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
         // We do not know the final byte count without intercepting the writer,
         // so we conservatively count the request only. `copy_to` is not on the

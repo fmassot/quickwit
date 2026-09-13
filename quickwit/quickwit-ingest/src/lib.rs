@@ -21,6 +21,7 @@ mod ingest_api_service;
 #[allow(clippy::disallowed_methods)]
 mod ingest_service;
 mod ingest_v2;
+pub mod ingest_v3;
 mod memory_capacity;
 mod metrics;
 mod mrecordlog_async;

@@ -37,6 +37,10 @@ pub enum StorageErrorKind {
     Timeout,
     /// Io error.
     Io,
+    /// A conditional write failed because the target object already exists.
+    ///
+    /// Only returned by [`crate::Storage::put_if_absent`].
+    AlreadyExists,
 }
 
 /// Generic Storage Resolver Error.

@@ -1,0 +1,12 @@
+version: 0.8
+node_id: bench-1
+listen_address: 0.0.0.0
+rest:
+  listen_port: 7280
+enable_standalone_compactors: true
+data_dir: /home/ec2-user/qwdata
+metastore_uri: s3://<your-bucket>/metastore
+default_index_root_uri: s3://<your-bucket>/indexes
+ingest_api:
+  max_queue_disk_usage: 40GiB
+  max_queue_memory_usage: 8GiB

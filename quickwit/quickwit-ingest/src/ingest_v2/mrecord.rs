@@ -84,6 +84,12 @@ impl MRecord {
         }
     }
 
+    /// Same as [`Self::encode`], materialized into a single contiguous [`Bytes`].
+    pub fn encode_to_bytes(&self) -> Bytes {
+        let mut buf = self.encode();
+        buf.copy_to_bytes(buf.remaining())
+    }
+
     /// Encodes the record using the extensible `HeaderVersion::V1` format (a protobuf
     /// `MRecordV1` payload). Not yet used by the write path; see [`Self::encode`].
     pub fn encode_v1(&self) -> Bytes {

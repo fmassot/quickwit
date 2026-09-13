@@ -8895,6 +8895,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "bytesize",
+ "crc32fast",
  "criterion",
  "fail",
  "futures",
@@ -8911,8 +8912,10 @@ dependencies = [
  "quickwit-doc-mapper",
  "quickwit-metrics",
  "quickwit-proto",
+ "quickwit-storage",
  "rand 0.10.2",
  "rand_distr",
+ "rayon",
  "serde",
  "serde_json",
  "serde_json_borrow",
@@ -8926,6 +8929,7 @@ dependencies = [
  "tracing-opentelemetry",
  "ulid",
  "utoipa",
+ "zstd",
 ]
 
 [[package]]
@@ -9021,6 +9025,7 @@ dependencies = [
  "quickwit-doc-mapper",
  "quickwit-index-management",
  "quickwit-indexing",
+ "quickwit-ingest",
  "quickwit-metastore",
  "quickwit-metrics",
  "quickwit-parquet-engine",

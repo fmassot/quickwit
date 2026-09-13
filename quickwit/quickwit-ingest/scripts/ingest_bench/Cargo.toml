@@ -1,0 +1,16 @@
+[package]
+name = "ingest_bench"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: not part of the quickwit workspace.
+[workspace]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = 3

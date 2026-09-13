@@ -15,6 +15,7 @@
 use std::io;
 use std::iter::once;
 
+use bytes::Bytes;
 use bytesize::ByteSize;
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -34,11 +35,66 @@ pub(super) enum AppendDocBatchError {
     QueueNotFound(QueueId),
 }
 
+/// Encodes a document batch into the `MRecord`s that get written to the WAL, appending a
+/// `Commit` record when `force_commit` is set.
+pub(super) fn encode_doc_batch(doc_batch: DocBatchV2, force_commit: bool) -> Vec<Bytes> {
+    let docs = doc_batch
+        .into_docs()
+        .map(|(_doc_uid, doc)| MRecord::Doc(doc).encode_to_bytes());
+    if force_commit {
+        docs.chain(once(MRecord::Commit.encode_to_bytes()))
+            .collect()
+    } else {
+        docs.collect()
+    }
+}
+
+/// Appends non-empty, already encoded `MRecord`s to the WAL queue `queue_id` and returns the
+/// position of the last one.
+///
+/// # Panics
+///
+/// Panics if `mrecords` is empty.
+#[instrument(
+    name = "ingester.append_mrecords",
+    skip_all,
+    fields(queue_id, num_records = mrecords.len())
+)]
+pub(super) async fn append_encoded_mrecords(
+    mrecordlog: &mut MultiRecordLogAsync,
+    queue_id: &QueueId,
+    mrecords: Vec<Bytes>,
+) -> Result<Position, AppendDocBatchError> {
+    assert!(!mrecords.is_empty(), "`mrecords` should not be empty");
+
+    #[cfg(feature = "failpoints")]
+    fail_point!("ingester:append_records", |_| {
+        let io_error = io::Error::from(io::ErrorKind::PermissionDenied);
+        Err(AppendDocBatchError::Io(io_error))
+    });
+
+    let append_result = mrecordlog
+        .append_records(queue_id, None, mrecords.into_iter())
+        .await;
+    match append_result {
+        Ok(Some(offset)) => Ok(Position::offset(offset)),
+        Ok(None) => panic!("`mrecords` should not be empty"),
+        Err(AppendError::IoError(io_error)) => Err(AppendDocBatchError::Io(io_error)),
+        Err(AppendError::MissingQueue(queue_id)) => {
+            Err(AppendDocBatchError::QueueNotFound(queue_id))
+        }
+        Err(AppendError::Past) => {
+            panic!("`append_records` should be called with `position_opt: None`")
+        }
+    }
+}
+
 /// Appends a non-empty document batch to the WAL queue `queue_id`.
 ///
 /// # Panics
 ///
 /// Panics if `doc_batch` is empty.
+#[cfg(test)]
 #[instrument(
     name = "ingester.append_doc_batch",
     skip_all,
@@ -55,47 +111,8 @@ pub(super) async fn append_non_empty_doc_batch(
     doc_batch: DocBatchV2,
     force_commit: bool,
 ) -> Result<Position, AppendDocBatchError> {
-    let append_result = if force_commit {
-        let encoded_mrecords = doc_batch
-            .into_docs()
-            .map(|(_doc_uid, doc)| MRecord::Doc(doc).encode())
-            .chain(once(MRecord::Commit.encode()));
-
-        #[cfg(feature = "failpoints")]
-        fail_point!("ingester:append_records", |_| {
-            let io_error = io::Error::from(io::ErrorKind::PermissionDenied);
-            Err(AppendDocBatchError::Io(io_error))
-        });
-
-        mrecordlog
-            .append_records(queue_id, None, encoded_mrecords)
-            .await
-    } else {
-        let encoded_mrecords = doc_batch
-            .into_docs()
-            .map(|(_doc_uid, doc)| MRecord::Doc(doc).encode());
-
-        #[cfg(feature = "failpoints")]
-        fail_point!("ingester:append_records", |_| {
-            let io_error = io::Error::from(io::ErrorKind::PermissionDenied);
-            Err(AppendDocBatchError::Io(io_error))
-        });
-
-        mrecordlog
-            .append_records(queue_id, None, encoded_mrecords)
-            .await
-    };
-    match append_result {
-        Ok(Some(offset)) => Ok(Position::offset(offset)),
-        Ok(None) => panic!("`doc_batch` should not be empty"),
-        Err(AppendError::IoError(io_error)) => Err(AppendDocBatchError::Io(io_error)),
-        Err(AppendError::MissingQueue(queue_id)) => {
-            Err(AppendDocBatchError::QueueNotFound(queue_id))
-        }
-        Err(AppendError::Past) => {
-            panic!("`append_records` should be called with `position_opt: None`")
-        }
-    }
+    let mrecords = encode_doc_batch(doc_batch, force_commit);
+    append_encoded_mrecords(mrecordlog, queue_id, mrecords).await
 }
 
 /// Error returned when the mrecordlog does not have enough capacity to store some records.

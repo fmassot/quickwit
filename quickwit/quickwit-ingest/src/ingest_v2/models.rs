@@ -55,6 +55,8 @@ pub(super) struct IngesterShard {
     pub shard_status_rx: watch::Receiver<ShardStatus>,
     /// Instant at which the shard was last written to.
     pub last_write_instant: Instant,
+    /// Ingest v3: the shard's records live in this in-memory queue instead of the mrecordlog.
+    pub mem_queue: Option<Arc<crate::ingest_v3::mem_queue::MemQueue>>,
 }
 
 /// Builder for `IngesterShard`. By default, the shard is open, is empty (i.e. the replication and
@@ -73,9 +75,16 @@ pub(super) struct IngesterShardBuilder {
     validate_docs: bool,
     is_advertisable: bool,
     last_write_instant: Option<Instant>,
+    mem_queue: Option<Arc<crate::ingest_v3::mem_queue::MemQueue>>,
 }
 
 impl IngesterShardBuilder {
+    /// Ingest v3: backs the shard with an in-memory queue.
+    pub fn with_mem_queue(mut self, mem_queue: Arc<crate::ingest_v3::mem_queue::MemQueue>) -> Self {
+        self.mem_queue = Some(mem_queue);
+        self
+    }
+
     /// Sets the shard state. Defaults to `ShardState::Open`.
     pub fn with_state(mut self, shard_state: ShardState) -> Self {
         self.shard_state = shard_state;
@@ -152,6 +161,7 @@ impl IngesterShardBuilder {
             shard_status_tx,
             shard_status_rx,
             last_write_instant: self.last_write_instant.unwrap_or_else(Instant::now),
+            mem_queue: self.mem_queue,
         }
     }
 }
@@ -176,6 +186,7 @@ impl IngesterShard {
             validate_docs: false,
             is_advertisable: false,
             last_write_instant: None,
+            mem_queue: None,
         }
     }
 
@@ -239,7 +250,9 @@ impl IngesterShard {
         replication_position_inclusive: Position,
         now: Instant,
     ) {
-        if self.replication_position_inclusive == replication_position_inclusive {
+        // Positions only move forward: with ingest v3 they are applied in batches after each
+        // WAL flush, and an older batch must never overwrite a newer one.
+        if replication_position_inclusive <= self.replication_position_inclusive {
             return;
         }
         self.replication_position_inclusive = replication_position_inclusive;

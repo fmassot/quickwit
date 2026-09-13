@@ -132,6 +132,12 @@ impl ToStorageErrorKind for CreateMultipartUploadError {
 
 impl ToStorageErrorKind for PutObjectError {
     fn to_storage_error_kind(&self) -> StorageErrorKind {
+        // `If-None-Match: *` violated: the object already exists. S3 returns HTTP 412 with this
+        // error code. (HTTP 409 `ConditionalRequestConflict` is a transient conflict between two
+        // concurrent conditional writes and is retryable, so it stays a `Service` error.)
+        if self.meta().code() == Some("PreconditionFailed") {
+            return StorageErrorKind::AlreadyExists;
+        }
         StorageErrorKind::Service
     }
 }

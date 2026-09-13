@@ -16,8 +16,10 @@ mod delete_task_pipeline;
 mod delete_task_planner;
 mod delete_task_service;
 mod garbage_collector;
+mod ingest_wal_garbage_collector;
 mod retention_policy_executor;
 
 pub use delete_task_service::{DELETE_SERVICE_TASK_DIR_NAME, DeleteTaskService};
 pub use garbage_collector::GarbageCollector;
+pub use ingest_wal_garbage_collector::IngestWalGarbageCollector;
 pub use retention_policy_executor::RetentionPolicyExecutor;

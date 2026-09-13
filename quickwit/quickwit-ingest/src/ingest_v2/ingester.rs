@@ -52,8 +52,10 @@ use super::fetch::FetchStreamTask;
 use super::idle::CloseIdleShardsTask;
 use super::models::IngesterShard;
 use super::mrecordlog_utils::{
-    AppendDocBatchError, append_non_empty_doc_batch, check_enough_capacity, wal_stats,
+    AppendDocBatchError, append_encoded_mrecords, check_enough_capacity, encode_doc_batch,
+    wal_stats,
 };
+use super::object_wal_acks::ObjectWalAckApplier;
 use super::rate_meter::RateMeter;
 use super::state::{IngesterState, InnerIngesterState, WeakIngesterState};
 use crate::estimate_size;
@@ -61,6 +63,9 @@ use crate::ingest_v2::doc_mapper::get_or_try_build_doc_mapper;
 use crate::ingest_v2::metrics::{
     RESET_SHARDS_OPERATIONS_TOTAL, STATUS, report_wal_limits, report_wal_usage,
 };
+use crate::ingest_v3::mem_queue::MemQueue;
+use crate::ingest_v3::wal::{WalError, WalId};
+use crate::ingest_v3::{ObjectWal, OpenedObjectWal};
 use crate::metrics::{DOCS_BYTES_TOTAL, DOCS_TOTAL, VALIDITY};
 use crate::mrecordlog_async::MultiRecordLogAsync;
 
@@ -95,6 +100,13 @@ pub struct Ingester {
     self_node_id: NodeId,
     control_plane: ControlPlaneServiceClient,
     state: IngesterState,
+    /// Ingest v3: object-store WAL. When set, persist requests are acknowledged only once their
+    /// records are durable in it, and fetch streams only serve durable records.
+    object_wal: Option<ObjectWal>,
+    /// Ingest v3: applies replication positions once per WAL flush.
+    ack_applier: Option<ObjectWalAckApplier>,
+    /// Ingest v3: node-wide buffered bytes of the in-memory queues.
+    mem_queue_usage: Arc<crate::ingest_v3::mem_queue::MemQueueUsage>,
     disk_capacity: ByteSize,
     memory_capacity: ByteSize,
     rate_limiter_settings: RateLimiterSettings,
@@ -119,18 +131,27 @@ impl Ingester {
         memory_capacity: ByteSize,
         rate_limiter_settings: RateLimiterSettings,
         idle_shard_timeout: Duration,
+        object_wal_opt: Option<OpenedObjectWal>,
     ) -> IngestV2Result<Self> {
         let self_node_id: NodeId = cluster.self_node_id();
+        let object_wal = object_wal_opt
+            .as_ref()
+            .map(|opened| opened.object_wal.clone());
         let state = IngesterState::load(
             cluster.clone(),
             wal_dir_path,
             disk_capacity,
             memory_capacity,
             rate_limiter_settings,
+            object_wal_opt,
         )
         .await;
 
+        let mem_queue_usage = state.mem_queue_usage();
         let weak_state = state.weak();
+        let ack_applier = object_wal
+            .clone()
+            .map(|object_wal| ObjectWalAckApplier::spawn(object_wal, weak_state.clone()));
         BroadcastLocalShardsTask::spawn(cluster.clone(), weak_state.clone());
         BroadcastIngesterCapacityScoreTask::spawn(cluster, weak_state.clone());
         CloseIdleShardsTask::spawn(weak_state, idle_shard_timeout);
@@ -141,6 +162,9 @@ impl Ingester {
             self_node_id,
             control_plane,
             state,
+            object_wal,
+            ack_applier,
+            mem_queue_usage,
             disk_capacity,
             memory_capacity,
             rate_limiter_settings,
@@ -177,18 +201,24 @@ impl Ingester {
             shard.doc_mapping_uid(),
             doc_mapping_json,
         )?;
-        match mrecordlog.create_queue(&queue_id).await {
-            Ok(_) => {}
-            Err(CreateQueueError::AlreadyExists) => {
-                error!("WAL queue `{queue_id}` already exists");
-                let message = format!("WAL queue `{queue_id}` already exists");
-                return Err(IngestV2Error::Internal(message));
-            }
-            Err(CreateQueueError::IoError(io_error)) => {
-                error!("failed to create WAL queue `{queue_id}`: {io_error}",);
-                let message = format!("failed to create WAL queue `{queue_id}`: {io_error}");
-                return Err(IngestV2Error::Internal(message));
-            }
+        let mem_queue_opt = if self.object_wal.is_some() {
+            // Ingest v3: records live in memory, the object WAL makes them durable.
+            Some(Arc::new(MemQueue::new(state.mem_queue_usage.clone(), 0)))
+        } else {
+            match mrecordlog.create_queue(&queue_id).await {
+                Ok(_) => {}
+                Err(CreateQueueError::AlreadyExists) => {
+                    error!("WAL queue `{queue_id}` already exists");
+                    let message = format!("WAL queue `{queue_id}` already exists");
+                    return Err(IngestV2Error::Internal(message));
+                }
+                Err(CreateQueueError::IoError(io_error)) => {
+                    error!("failed to create WAL queue `{queue_id}`: {io_error}",);
+                    let message = format!("failed to create WAL queue `{queue_id}`: {io_error}");
+                    return Err(IngestV2Error::Internal(message));
+                }
+            };
+            None
         };
         let index_uid = shard.index_uid().clone();
         let source_id = shard.source_id.clone();
@@ -196,14 +226,27 @@ impl Ingester {
         let rate_limiter = RateLimiter::from_settings(self.rate_limiter_settings);
         let rate_meter = RateMeter::default();
 
-        let shard = IngesterShard::builder(index_uid, source_id, shard_id)
+        let mut shard_builder = IngesterShard::builder(index_uid, source_id, shard_id)
             .with_rate_limiter(rate_limiter)
             .with_rate_meter(rate_meter)
             .with_doc_mapper(doc_mapper)
             .with_validate_docs(validate_docs)
-            .with_last_write(now)
-            .build();
+            .with_last_write(now);
+        if let Some(mem_queue) = mem_queue_opt {
+            shard_builder = shard_builder.with_mem_queue(mem_queue);
+        }
+        let shard = shard_builder.build();
         entry.insert(shard);
+        // Ingest v3: make the queue's existence durable, so that a restart recovers it even if
+        // it never holds a record. The caller waits for the marker before acknowledging.
+        if let Some(object_wal) = &self.object_wal {
+            object_wal.append_queue_marker(&queue_id).map_err(|error| {
+                error!("failed to record WAL queue `{queue_id}` in the object WAL: {error}");
+                IngestV2Error::Internal(format!(
+                    "failed to record WAL queue `{queue_id}` in the object WAL: {error}"
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -342,6 +385,9 @@ impl Ingester {
                 "routing error: expected ingester ID `{}`, got `{}`",
                 self.self_node_id, persist_request.ingester_id,
             )));
+        }
+        if self.object_wal.is_some() {
+            return self.persist_inner_v3(persist_request).await;
         }
         let mut persist_successes = Vec::with_capacity(persist_request.subrequests.len());
         let mut persist_failures = Vec::new();
@@ -535,21 +581,22 @@ impl Ingester {
                 );
             }
         }
-        // finally write locally
+        // finally write locally, and to the object WAL when ingest v3 is enabled
+        let mut pending_acks: Vec<PendingAck> = Vec::new();
+        let mut max_wal_id: Option<WalId> = None;
         {
             let now = Instant::now();
             for subrequest in pending_persist_subrequests.into_values() {
                 let queue_id = subrequest.queue_id;
 
                 let batch_num_docs = subrequest.doc_batch.num_docs() as u64;
+                let mrecords = encode_doc_batch(subrequest.doc_batch, force_commit);
+                let num_records = mrecords.len() as u64;
+                // Cheap: `Bytes` clones are reference counted.
+                let object_wal_records = self.object_wal.as_ref().map(|_| mrecords.clone());
 
-                let append_result = append_non_empty_doc_batch(
-                    &mut state_guard.mrecordlog,
-                    &queue_id,
-                    subrequest.doc_batch,
-                    force_commit,
-                )
-                .await;
+                let append_result =
+                    append_encoded_mrecords(&mut state_guard.mrecordlog, &queue_id, mrecords).await;
 
                 let current_position_inclusive = match append_result {
                     Ok(current_position_inclusive) => current_position_inclusive,
@@ -582,22 +629,65 @@ impl Ingester {
                     }
                 };
 
-                state_guard
-                    .shards
-                    .get_mut(&queue_id)
-                    .expect("shard should exist")
-                    .set_replication_position_inclusive(current_position_inclusive.clone(), now);
+                if let (Some(object_wal), Some(records)) = (&self.object_wal, object_wal_records) {
+                    let last_position = current_position_inclusive
+                        .as_u64()
+                        .expect("append should return an offset");
+                    let first_position = last_position + 1 - num_records;
+                    match object_wal.append(&queue_id, first_position, records) {
+                        Ok(wal_id) => {
+                            max_wal_id = Some(match max_wal_id {
+                                Some(max) => max.max(wal_id),
+                                None => wal_id,
+                            });
+                        }
+                        Err(error) => {
+                            let reason = match error {
+                                WalError::BufferFull => PersistFailureReason::WalFull,
+                                _ => PersistFailureReason::NodeUnavailable,
+                            };
+                            rate_limited_warn!(
+                                limit_per_min = 10,
+                                "failed to append records to the object WAL for shard \
+                                 `{queue_id}`: {error}"
+                            );
+                            let persist_failure = PersistFailure {
+                                subrequest_id: subrequest.subrequest_id,
+                                index_uid: subrequest.index_uid,
+                                source_id: subrequest.source_id,
+                                reason: reason as i32,
+                            };
+                            persist_failures.push(persist_failure);
+                            continue;
+                        }
+                    }
+                }
 
                 let persist_success = PersistSuccess {
                     subrequest_id: subrequest.subrequest_id,
                     index_uid: subrequest.index_uid,
                     source_id: subrequest.source_id,
                     shard_id: subrequest.shard_id,
-                    replication_position_inclusive: Some(current_position_inclusive),
+                    replication_position_inclusive: Some(current_position_inclusive.clone()),
                     num_persisted_docs: batch_num_docs as u32,
                     parse_failures: subrequest.parse_failures,
                 };
-                persist_successes.push(persist_success);
+                if self.object_wal.is_none() {
+                    // Ingest v2: records are durable as soon as they are in the local WAL.
+                    state_guard
+                        .shards
+                        .get_mut(&queue_id)
+                        .expect("shard should exist")
+                        .set_replication_position_inclusive(current_position_inclusive, now);
+                    persist_successes.push(persist_success);
+                } else {
+                    // Ingest v3: acknowledge after the object WAL flush.
+                    pending_acks.push(PendingAck {
+                        queue_id,
+                        position: current_position_inclusive,
+                        persist_success,
+                    });
+                }
             }
         }
         if !shards_to_close.is_empty() {
@@ -647,6 +737,50 @@ impl Ingester {
             closed_shards,
         };
 
+        // Ingest v3: wait for the records to be durable in the object WAL and for the shards'
+        // replication positions (which make the records visible to fetch streams) to be
+        // applied, then acknowledge. Positions are applied once per flush by the ack applier
+        // rather than by each request, to keep the ingester lock out of the ack path.
+        if !pending_acks.is_empty() {
+            let ack_applier = self
+                .ack_applier
+                .as_ref()
+                .expect("pending acks imply an object WAL");
+            let wal_id = max_wal_id.expect("pending acks imply an appended WAL id");
+            ack_applier.record(
+                wal_id,
+                pending_acks
+                    .iter()
+                    .map(|pending_ack| (pending_ack.queue_id.clone(), pending_ack.position.clone()))
+                    .collect(),
+            );
+            match ack_applier.wait_applied(wal_id).await {
+                Ok(()) => {
+                    for pending_ack in pending_acks {
+                        persist_successes.push(pending_ack.persist_success);
+                    }
+                }
+                Err(error) => {
+                    error!("failed to persist records to the object WAL: {error}");
+                    for pending_ack in pending_acks {
+                        let persist_failure = PersistFailure {
+                            subrequest_id: pending_ack.persist_success.subrequest_id,
+                            index_uid: pending_ack.persist_success.index_uid,
+                            source_id: pending_ack.persist_success.source_id,
+                            reason: PersistFailureReason::NodeUnavailable as i32,
+                        };
+                        persist_failures.push(persist_failure);
+                    }
+                    if matches!(error, WalError::Fenced) {
+                        // Another incarnation of this node owns the log: stop accepting writes.
+                        if let Ok(mut state_guard) = self.state.lock_partially("fenced").await {
+                            state_guard.set_status(IngesterStatus::Failed).await;
+                        }
+                    }
+                }
+            }
+        }
+
         #[cfg(test)]
         {
             persist_successes.sort_by_key(|success| success.subrequest_id);
@@ -660,6 +794,324 @@ impl Ingester {
             routing_update: Some(routing_update),
         };
         Ok(persist_response)
+    }
+
+    /// Ingest v3 persist path. Never holds an async lock across an `.await`:
+    ///
+    /// 1. take the ingester lock briefly to pick a shard per subrequest and grab its in-memory
+    ///    queue, doc mapper and rate limiter decision;
+    /// 2. validate documents (CPU pool), no lock held;
+    /// 3. append to the shard's in-memory queue (µs, per-queue mutex) and to the object WAL;
+    /// 4. wait for durability and for the replication positions to be applied.
+    async fn persist_inner_v3(
+        &self,
+        persist_request: PersistRequest,
+    ) -> IngestV2Result<PersistResponse> {
+        let object_wal = self.object_wal.as_ref().expect("ingest v3");
+        let ack_applier = self.ack_applier.as_ref().expect("ingest v3");
+        let commit_type = persist_request.commit_type();
+        let force_commit = commit_type == CommitTypeV2::Force;
+        let num_subrequests = persist_request.subrequests.len();
+        let mut persist_successes = Vec::with_capacity(num_subrequests);
+        let mut persist_failures = Vec::new();
+
+        struct Picked {
+            subrequest: PersistSubrequest,
+            queue_id: QueueId,
+            shard_id: ShardId,
+            mem_queue: Arc<MemQueue>,
+            doc_mapper: Arc<quickwit_doc_mapper::DocMapper>,
+            validate_docs: bool,
+            from_position_exclusive: Position,
+        }
+        let mut picked: Vec<Picked> = Vec::with_capacity(num_subrequests);
+
+        // 1. Pick shards.
+        let routing_update = {
+            let mut state_guard = self.state.lock_partially("persist").await?;
+            let status = state_guard.status();
+            if !status.accepts_write_requests() {
+                for subrequest in persist_request.subrequests {
+                    persist_failures.push(PersistFailure {
+                        subrequest_id: subrequest.subrequest_id,
+                        index_uid: subrequest.index_uid,
+                        source_id: subrequest.source_id,
+                        reason: PersistFailureReason::NodeUnavailable as i32,
+                    });
+                }
+                return Ok(PersistResponse {
+                    ingester_id: persist_request.ingester_id,
+                    successes: Vec::new(),
+                    failures: persist_failures,
+                    routing_update: None,
+                });
+            }
+            let memory_used = state_guard.mem_queue_usage.num_bytes();
+            let mut total_requested_capacity = 0u64;
+            for subrequest in persist_request.subrequests {
+                let Some(shard) = state_guard
+                    .find_most_capacity_shard_mut(subrequest.index_uid(), &subrequest.source_id)
+                else {
+                    warn!(
+                        index_uid=%subrequest.index_uid(),
+                        source_id=%subrequest.source_id,
+                        "no open shard found on ingester"
+                    );
+                    persist_failures.push(PersistFailure {
+                        subrequest_id: subrequest.subrequest_id,
+                        index_uid: subrequest.index_uid,
+                        source_id: subrequest.source_id,
+                        reason: PersistFailureReason::NoShardsAvailable as i32,
+                    });
+                    continue;
+                };
+                let Some(mem_queue) = shard.mem_queue.clone() else {
+                    error!("shard `{}` has no in-memory queue", shard.queue_id());
+                    persist_failures.push(PersistFailure {
+                        subrequest_id: subrequest.subrequest_id,
+                        index_uid: subrequest.index_uid,
+                        source_id: subrequest.source_id,
+                        reason: PersistFailureReason::NodeUnavailable as i32,
+                    });
+                    continue;
+                };
+                shard.is_advertisable = true;
+                let Some(doc_batch) = subrequest.doc_batch.as_ref().filter(|b| !b.is_empty())
+                else {
+                    warn!("received empty persist request");
+                    persist_successes.push(PersistSuccess {
+                        subrequest_id: subrequest.subrequest_id,
+                        index_uid: subrequest.index_uid,
+                        source_id: subrequest.source_id,
+                        shard_id: Some(shard.shard_id.clone()),
+                        replication_position_inclusive: Some(
+                            shard.replication_position_inclusive.clone(),
+                        ),
+                        num_persisted_docs: 0,
+                        parse_failures: Vec::new(),
+                    });
+                    continue;
+                };
+                let requested_capacity = estimate_size(doc_batch).as_u64();
+                if memory_used + total_requested_capacity + requested_capacity
+                    > self.memory_capacity.as_u64()
+                {
+                    rate_limited_warn!(
+                        limit_per_min = 10,
+                        "failed to persist records to ingester `{}`: in-memory queues are full \
+                         ({} bytes buffered)",
+                        self.self_node_id,
+                        memory_used
+                    );
+                    persist_failures.push(PersistFailure {
+                        subrequest_id: subrequest.subrequest_id,
+                        index_uid: subrequest.index_uid,
+                        source_id: subrequest.source_id,
+                        reason: PersistFailureReason::WalFull as i32,
+                    });
+                    continue;
+                }
+                if !shard
+                    .rate_limiter
+                    .acquire_bytes(ByteSize::b(requested_capacity))
+                {
+                    debug!(
+                        "failed to persist records to shard `{}`: rate limited",
+                        shard.queue_id()
+                    );
+                    persist_failures.push(PersistFailure {
+                        subrequest_id: subrequest.subrequest_id,
+                        index_uid: subrequest.index_uid,
+                        source_id: subrequest.source_id,
+                        reason: PersistFailureReason::NoShardsAvailable as i32,
+                    });
+                    continue;
+                }
+                total_requested_capacity += requested_capacity;
+                shard.rate_meter.update(doc_batch.num_bytes() as u64);
+                picked.push(Picked {
+                    queue_id: shard.queue_id(),
+                    shard_id: shard.shard_id.clone(),
+                    mem_queue,
+                    doc_mapper: shard.doc_mapper_opt.clone().expect("shard should be open"),
+                    validate_docs: shard.validate_docs,
+                    from_position_exclusive: shard.replication_position_inclusive.clone(),
+                    subrequest,
+                });
+            }
+            let (open_shard_counts, closed_shards) = state_guard.get_shard_snapshot();
+            let capacity_score = state_guard
+                .wal_capacity_tracker
+                .score(ByteSize::b(0), ByteSize::b(memory_used))
+                as u32;
+            let source_shard_updates = open_shard_counts
+                .into_iter()
+                .map(|(index_uid, source_id, count)| SourceShardUpdate {
+                    index_uid: Some(index_uid),
+                    source_id,
+                    open_shard_count: count as u32,
+                })
+                .collect();
+            RoutingUpdate {
+                capacity_score,
+                source_shard_updates,
+                closed_shards,
+            }
+        };
+
+        // 2. Validate, 3. append.
+        let mut pending_acks: Vec<PendingAck> = Vec::new();
+        let mut max_wal_id: Option<WalId> = None;
+        for Picked {
+            mut subrequest,
+            queue_id,
+            shard_id,
+            mem_queue,
+            doc_mapper,
+            validate_docs,
+            from_position_exclusive,
+        } in picked
+        {
+            let doc_batch = subrequest.doc_batch.take().expect("checked above");
+            let original_batch_num_bytes = doc_batch.num_bytes() as u64;
+            let (valid_doc_batch, parse_failures) = if validate_docs {
+                validate_doc_batch(doc_batch, doc_mapper).await?
+            } else {
+                (doc_batch, Vec::new())
+            };
+            if valid_doc_batch.is_empty() {
+                counter!(parent: DOCS_TOTAL, labels: [label_values!(VALIDITY => "invalid")])
+                    .inc_by(parse_failures.len() as u64);
+                counter!(parent: DOCS_BYTES_TOTAL, labels: [label_values!(VALIDITY => "invalid")])
+                    .inc_by(original_batch_num_bytes);
+                persist_successes.push(PersistSuccess {
+                    subrequest_id: subrequest.subrequest_id,
+                    index_uid: subrequest.index_uid,
+                    source_id: subrequest.source_id,
+                    shard_id: Some(shard_id),
+                    replication_position_inclusive: Some(from_position_exclusive),
+                    num_persisted_docs: 0,
+                    parse_failures,
+                });
+                continue;
+            }
+            counter!(parent: DOCS_TOTAL, labels: [label_values!(VALIDITY => "valid")])
+                .inc_by(valid_doc_batch.num_docs() as u64);
+            counter!(parent: DOCS_BYTES_TOTAL, labels: [label_values!(VALIDITY => "valid")])
+                .inc_by(valid_doc_batch.num_bytes() as u64);
+            if !parse_failures.is_empty() {
+                counter!(parent: DOCS_TOTAL, labels: [label_values!(VALIDITY => "invalid")])
+                    .inc_by(parse_failures.len() as u64);
+                counter!(parent: DOCS_BYTES_TOTAL, labels: [label_values!(VALIDITY => "invalid")])
+                    .inc_by(original_batch_num_bytes - valid_doc_batch.num_bytes() as u64);
+            }
+            let batch_num_docs = valid_doc_batch.num_docs() as u64;
+            let mrecords = encode_doc_batch(valid_doc_batch, force_commit);
+            let num_records = mrecords.len() as u64;
+            // Append to memory (serving) and to the object WAL (durability). Both are
+            // synchronous and take only per-queue / per-writer mutexes.
+            let last_position = mem_queue.append(mrecords.iter().cloned());
+            let first_position = last_position + 1 - num_records;
+            match object_wal.append(&queue_id, first_position, mrecords) {
+                Ok(wal_id) => {
+                    max_wal_id = Some(match max_wal_id {
+                        Some(max) => max.max(wal_id),
+                        None => wal_id,
+                    });
+                }
+                Err(error) => {
+                    let reason = match error {
+                        WalError::BufferFull => PersistFailureReason::WalFull,
+                        _ => PersistFailureReason::NodeUnavailable,
+                    };
+                    rate_limited_warn!(
+                        limit_per_min = 10,
+                        "failed to append records to the object WAL for shard `{queue_id}`: \
+                         {error}"
+                    );
+                    persist_failures.push(PersistFailure {
+                        subrequest_id: subrequest.subrequest_id,
+                        index_uid: subrequest.index_uid,
+                        source_id: subrequest.source_id,
+                        reason: reason as i32,
+                    });
+                    continue;
+                }
+            }
+            let position = Position::offset(last_position);
+            pending_acks.push(PendingAck {
+                queue_id,
+                position: position.clone(),
+                persist_success: PersistSuccess {
+                    subrequest_id: subrequest.subrequest_id,
+                    index_uid: subrequest.index_uid,
+                    source_id: subrequest.source_id,
+                    shard_id: Some(shard_id),
+                    replication_position_inclusive: Some(position),
+                    num_persisted_docs: batch_num_docs as u32,
+                    parse_failures,
+                },
+            });
+        }
+        report_wal_usage(
+            mrecordlog::ResourceUsage {
+                disk_used_bytes: 0,
+                memory_used_bytes: self.state_mem_queue_usage_bytes() as usize,
+                memory_allocated_bytes: self.state_mem_queue_usage_bytes() as usize,
+            },
+            self.disk_capacity,
+            self.memory_capacity,
+        );
+
+        // 4. Wait for durability and applied positions.
+        if !pending_acks.is_empty() {
+            let wal_id = max_wal_id.expect("pending acks imply an appended WAL id");
+            ack_applier.record(
+                wal_id,
+                pending_acks
+                    .iter()
+                    .map(|pending_ack| (pending_ack.queue_id.clone(), pending_ack.position.clone()))
+                    .collect(),
+            );
+            match ack_applier.wait_applied(wal_id).await {
+                Ok(()) => {
+                    for pending_ack in pending_acks {
+                        persist_successes.push(pending_ack.persist_success);
+                    }
+                }
+                Err(error) => {
+                    error!("failed to persist records to the object WAL: {error}");
+                    for pending_ack in pending_acks {
+                        persist_failures.push(PersistFailure {
+                            subrequest_id: pending_ack.persist_success.subrequest_id,
+                            index_uid: pending_ack.persist_success.index_uid,
+                            source_id: pending_ack.persist_success.source_id,
+                            reason: PersistFailureReason::NodeUnavailable as i32,
+                        });
+                    }
+                    if matches!(error, WalError::Fenced)
+                        && let Ok(mut state_guard) = self.state.lock_partially("fenced").await
+                    {
+                        state_guard.set_status(IngesterStatus::Failed).await;
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            persist_successes.sort_by_key(|success| success.subrequest_id);
+            persist_failures.sort_by_key(|failure| failure.subrequest_id);
+        }
+        Ok(PersistResponse {
+            ingester_id: self.self_node_id.to_string(),
+            successes: persist_successes,
+            failures: persist_failures,
+            routing_update: Some(routing_update),
+        })
+    }
+
+    fn state_mem_queue_usage_bytes(&self) -> u64 {
+        self.mem_queue_usage.num_bytes()
     }
 
     async fn open_fetch_stream_inner(
@@ -682,12 +1134,15 @@ impl Ingester {
         shard.is_advertisable = true;
 
         let shard_status_rx = shard.shard_status_rx.clone();
+        let mem_queue_opt = shard.mem_queue.clone();
         let mrecordlog = self.state.mrecordlog();
-        let (service_stream, _fetch_task_handle) = FetchStreamTask::spawn(
+        let (service_stream, _fetch_task_handle) = FetchStreamTask::spawn_with_options(
             open_fetch_stream_request,
             mrecordlog,
+            mem_queue_opt,
             shard_status_rx,
             get_batch_num_bytes(),
+            self.object_wal.is_some(),
         );
         Ok(service_stream)
     }
@@ -764,6 +1219,28 @@ impl Ingester {
                     shard_id: shard.shard_id.clone(),
                 };
                 failures.push(failure);
+            }
+        }
+        drop(state_guard);
+
+        // Ingest v3: the control plane must not learn about a shard before its queue marker is
+        // durable, otherwise a crash in between makes the shard exist for the control plane and
+        // for nobody else.
+        if let Some(object_wal) = &self.object_wal
+            && !successes.is_empty()
+            && let Err(error) = object_wal.flush().await
+        {
+            {
+                error!("failed to persist shard queue markers to the object WAL: {error}");
+                for success in successes.drain(..) {
+                    let shard = success.shard();
+                    failures.push(InitShardFailure {
+                        subrequest_id: success.subrequest_id,
+                        index_uid: shard.index_uid.clone(),
+                        source_id: shard.source_id.clone(),
+                        shard_id: shard.shard_id.clone(),
+                    });
+                }
             }
         }
         let response = InitShardsResponse {
@@ -1132,6 +1609,14 @@ struct PendingPersistSubrequest {
     parse_failures: Vec<ParseFailure>,
 }
 
+/// Ingest v3: a subrequest written to the local WAL and appended to the object WAL, waiting for
+/// the latter to be durable before it is acknowledged.
+struct PendingAck {
+    queue_id: QueueId,
+    position: Position,
+    persist_success: PersistSuccess,
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::mutable_key_type)]
@@ -1171,6 +1656,8 @@ mod tests {
         memory_capacity: ByteSize,
         rate_limiter_settings: RateLimiterSettings,
         idle_shard_timeout: Duration,
+        /// Ingest v3: object store backing the object WAL, if enabled for the test.
+        object_wal_storage: Option<Arc<dyn quickwit_storage::Storage>>,
     }
 
     impl Default for IngesterForTest {
@@ -1188,6 +1675,7 @@ mod tests {
                 memory_capacity: ByteSize::mb(1),
                 rate_limiter_settings: RateLimiterSettings::default(),
                 idle_shard_timeout: DEFAULT_IDLE_SHARD_TIMEOUT,
+                object_wal_storage: None,
             }
         }
     }
@@ -1221,6 +1709,15 @@ mod tests {
             self
         }
 
+        /// Enables ingest v3 with an object WAL on `storage`.
+        pub fn with_object_wal_storage(
+            mut self,
+            storage: Arc<dyn quickwit_storage::Storage>,
+        ) -> Self {
+            self.object_wal_storage = Some(storage);
+            self
+        }
+
         pub async fn build(self) -> (IngesterContext, Ingester) {
             static GOSSIP_ADVERTISE_PORT_SEQUENCE: AtomicU16 = AtomicU16::new(1u16);
 
@@ -1243,6 +1740,24 @@ mod tests {
             .await
             .unwrap();
 
+            let object_wal_opt = if let Some(storage) = &self.object_wal_storage {
+                let mut config = crate::ingest_v3::IngestV3Config::with_wal_uri(
+                    quickwit_common::uri::Uri::for_test("ram:///wal"),
+                );
+                // Fast flushes: tests should not wait.
+                config.flush_interval = Duration::from_millis(5);
+                let opened = ObjectWal::open(
+                    storage.clone(),
+                    self.node_id.as_str(),
+                    cluster.self_chitchat_id().generation_id,
+                    &config,
+                )
+                .await
+                .unwrap();
+                Some(opened)
+            } else {
+                None
+            };
             let ingester = Ingester::try_new(
                 cluster.clone(),
                 self.control_plane.clone(),
@@ -1251,6 +1766,7 @@ mod tests {
                 self.memory_capacity,
                 self.rate_limiter_settings,
                 self.idle_shard_timeout,
+                object_wal_opt,
             )
             .await
             .unwrap();
@@ -1348,6 +1864,7 @@ mod tests {
                 ByteSize::mb(256),
                 ByteSize::mb(1),
                 RateLimiterSettings::default(),
+                None,
             )
             .await;
 
@@ -3599,5 +4116,358 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ---- Ingest v3 (object-store WAL) ----
+
+    fn v3_init_shards_request(
+        node_id: &NodeId,
+        index_uid: &IndexUid,
+        source_id: &SourceId,
+    ) -> InitShardsRequest {
+        let doc_mapping_uid = DocMappingUid::random();
+        let doc_mapping_json = format!(r#"{{"doc_mapping_uid": "{doc_mapping_uid}"}}"#);
+        InitShardsRequest {
+            subrequests: vec![InitShardSubrequest {
+                subrequest_id: 0,
+                shard: Some(Shard {
+                    index_uid: Some(index_uid.clone()),
+                    source_id: source_id.clone(),
+                    shard_id: Some(ShardId::from(1)),
+                    shard_state: ShardState::Open as i32,
+                    ingester_id: node_id.to_string(),
+                    doc_mapping_uid: Some(doc_mapping_uid),
+                    ..Default::default()
+                }),
+                doc_mapping_json,
+                validate_docs: false,
+            }],
+        }
+    }
+
+    fn v3_persist_request(
+        node_id: &NodeId,
+        index_uid: &IndexUid,
+        source_id: &SourceId,
+        docs: &[&'static str],
+    ) -> PersistRequest {
+        PersistRequest {
+            ingester_id: node_id.to_string(),
+            commit_type: CommitTypeV2::Auto as i32,
+            subrequests: vec![PersistSubrequest {
+                subrequest_id: 0,
+                index_uid: Some(index_uid.clone()),
+                source_id: source_id.clone(),
+                doc_batch: Some(DocBatchV2::for_test(docs.iter().copied())),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ingester_v3_persist_is_durable_in_object_wal_and_fetchable() {
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+        let (ingester_ctx, ingester) = IngesterForTest::default()
+            .with_object_wal_storage(storage.clone())
+            .build()
+            .await;
+        let index_uid = IndexUid::for_test("test-index", 0);
+        let source_id = SourceId::from("test-source");
+        let queue_id = queue_id(&index_uid, &source_id, &ShardId::from(1));
+
+        ingester
+            .init_shards(v3_init_shards_request(
+                &ingester_ctx.node_id,
+                &index_uid,
+                &source_id,
+            ))
+            .await
+            .unwrap();
+
+        let persist_response = ingester
+            .persist(v3_persist_request(
+                &ingester_ctx.node_id,
+                &index_uid,
+                &source_id,
+                &[r#"{"doc": "a"}"#, r#"{"doc": "b"}"#],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(persist_response.failures.len(), 0);
+        assert_eq!(persist_response.successes.len(), 1);
+        assert_eq!(
+            persist_response.successes[0].replication_position_inclusive,
+            Some(Position::offset(1u64))
+        );
+
+        // The records are in the object WAL, under this node's log, right after the fence.
+        let reader = crate::ingest_v3::wal::reader::WalReader::new(
+            storage.clone(),
+            ingester_ctx.node_id.as_str(),
+        );
+        let objects = reader.list().await.unwrap();
+        assert_eq!(objects.len(), 3, "fence + queue marker + one data object");
+        let tail = objects.last().unwrap().wal_id;
+        let replayed = reader.replay_queue(&queue_id, 0, 1..=tail.0).await.unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].position, 0);
+        assert_eq!(&replayed[0].record[..], b"\0\0{\"doc\": \"a\"}");
+
+        // The shard's replication position was advanced after durability.
+        let state_guard = ingester.state.lock_fully("test").await.unwrap();
+        let shard = state_guard.shards.get(&queue_id).unwrap();
+        assert_eq!(shard.replication_position_inclusive, Position::offset(1u64));
+        drop(state_guard);
+
+        // Fetch serves the durable records.
+        let open_fetch_stream_request = OpenFetchStreamRequest {
+            client_id: "test-client".to_string(),
+            index_uid: Some(index_uid.clone()),
+            source_id: source_id.clone(),
+            shard_id: Some(ShardId::from(1)),
+            from_position_exclusive: Some(Position::Beginning),
+        };
+        let mut fetch_stream = ingester
+            .open_fetch_stream(open_fetch_stream_request)
+            .await
+            .unwrap();
+        let fetch_payload = into_fetch_payload(fetch_stream.next().await.unwrap().unwrap());
+        assert_eq!(
+            fetch_payload.to_position_inclusive(),
+            Position::offset(1u64)
+        );
+        assert_eq!(
+            fetch_payload.mrecord_batch.unwrap().mrecord_lengths.len(),
+            2
+        );
+
+        // Fetch does not serve records that are in the local WAL but not durable yet: append
+        // one behind the ingester's back without advancing the replication position.
+        let state_guard = ingester.state.lock_fully("test").await.unwrap();
+        state_guard
+            .shards
+            .get(&queue_id)
+            .unwrap()
+            .mem_queue
+            .as_ref()
+            .unwrap()
+            .append([MRecord::new_doc("not-durable").encode_to_bytes()]);
+        state_guard
+            .shards
+            .get(&queue_id)
+            .unwrap()
+            .notify_shard_status();
+        drop(state_guard);
+        timeout(Duration::from_millis(100), fetch_stream.next())
+            .await
+            .expect_err("record beyond the replication position must not be served");
+    }
+
+    #[tokio::test]
+    async fn test_ingester_v3_recovers_shards_from_object_wal_after_losing_local_wal() {
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+        let index_uid = IndexUid::for_test("test-index", 0);
+        let source_id = SourceId::from("test-source");
+        let queue_id = queue_id(&index_uid, &source_id, &ShardId::from(1));
+
+        // First incarnation: persist, then vanish (its local WAL tempdir is dropped).
+        {
+            let (ingester_ctx, ingester) = IngesterForTest::default()
+                .with_object_wal_storage(storage.clone())
+                .build()
+                .await;
+            ingester
+                .init_shards(v3_init_shards_request(
+                    &ingester_ctx.node_id,
+                    &index_uid,
+                    &source_id,
+                ))
+                .await
+                .unwrap();
+            let response = ingester
+                .persist(v3_persist_request(
+                    &ingester_ctx.node_id,
+                    &index_uid,
+                    &source_id,
+                    &[r#"{"doc": "a"}"#, r#"{"doc": "b"}"#],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.successes.len(), 1);
+            let response = ingester
+                .persist(v3_persist_request(
+                    &ingester_ctx.node_id,
+                    &index_uid,
+                    &source_id,
+                    &[r#"{"doc": "c"}"#],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.successes.len(), 1);
+        }
+
+        // Second incarnation, same node id, brand new local disk.
+        let (_ingester_ctx, ingester) = IngesterForTest::default()
+            .with_object_wal_storage(storage.clone())
+            .build()
+            .await;
+
+        let state_guard = ingester.state.lock_fully("test").await.unwrap();
+        let shard = state_guard
+            .shards
+            .get(&queue_id)
+            .expect("shard recovered from the object WAL");
+        // Recovered shards are closed, like shards recovered from the local WAL.
+        assert!(shard.is_closed());
+        assert_eq!(shard.replication_position_inclusive, Position::offset(2u64));
+        let records = shard.mem_queue.as_ref().unwrap().range(.., usize::MAX);
+        let docs: Vec<(u64, String)> = records
+            .iter()
+            .map(|(position, record)| {
+                (*position, String::from_utf8_lossy(&record[2..]).to_string())
+            })
+            .collect();
+        assert_eq!(
+            docs,
+            vec![
+                (0, r#"{"doc": "a"}"#.to_string()),
+                (1, r#"{"doc": "b"}"#.to_string()),
+                (2, r#"{"doc": "c"}"#.to_string()),
+            ]
+        );
+        drop(state_guard);
+
+        // An indexer can drain it.
+        let open_fetch_stream_request = OpenFetchStreamRequest {
+            client_id: "test-client".to_string(),
+            index_uid: Some(index_uid.clone()),
+            source_id: source_id.clone(),
+            shard_id: Some(ShardId::from(1)),
+            from_position_exclusive: Some(Position::offset(0u64)),
+        };
+        let mut fetch_stream = ingester
+            .open_fetch_stream(open_fetch_stream_request)
+            .await
+            .unwrap();
+        let fetch_payload = into_fetch_payload(fetch_stream.next().await.unwrap().unwrap());
+        assert_eq!(
+            fetch_payload.from_position_exclusive(),
+            Position::offset(0u64)
+        );
+        assert_eq!(
+            fetch_payload.to_position_inclusive(),
+            Position::offset(2u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingester_v3_recovers_empty_shard_after_restart() {
+        // A shard that never held a record (or whose records were all collected) must still
+        // exist after a restart: the control plane believes it does.
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+        let index_uid = IndexUid::for_test("test-index", 0);
+        let source_id = SourceId::from("test-source");
+        let queue_id = queue_id(&index_uid, &source_id, &ShardId::from(1));
+        {
+            let (ingester_ctx, ingester) = IngesterForTest::default()
+                .with_object_wal_storage(storage.clone())
+                .build()
+                .await;
+            let response = ingester
+                .init_shards(v3_init_shards_request(
+                    &ingester_ctx.node_id,
+                    &index_uid,
+                    &source_id,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.successes.len(), 1);
+            // The marker is durable by the time init_shards returns.
+            assert_eq!(
+                ingester
+                    .object_wal
+                    .as_ref()
+                    .unwrap()
+                    .status()
+                    .buffered_num_bytes,
+                0
+            );
+        }
+        let (_ingester_ctx, ingester) = IngesterForTest::default()
+            .with_object_wal_storage(storage.clone())
+            .build()
+            .await;
+        let state_guard = ingester.state.lock_fully("test").await.unwrap();
+        let shard = state_guard
+            .shards
+            .get(&queue_id)
+            .expect("empty shard recovered from its queue marker");
+        assert!(shard.is_closed());
+        assert_eq!(shard.replication_position_inclusive, Position::Beginning);
+        let mem_queue = shard.mem_queue.as_ref().expect("v3 shard has a mem queue");
+        assert!(mem_queue.is_empty());
+        assert!(!state_guard.mrecordlog.queue_exists(&queue_id));
+    }
+
+    #[tokio::test]
+    async fn test_ingester_v3_fenced_ingester_stops_accepting_writes() {
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+        let (ingester_ctx, ingester) = IngesterForTest::default()
+            .with_object_wal_storage(storage.clone())
+            .build()
+            .await;
+        let index_uid = IndexUid::for_test("test-index", 0);
+        let source_id = SourceId::from("test-source");
+        ingester
+            .init_shards(v3_init_shards_request(
+                &ingester_ctx.node_id,
+                &index_uid,
+                &source_id,
+            ))
+            .await
+            .unwrap();
+        let response = ingester
+            .persist(v3_persist_request(
+                &ingester_ctx.node_id,
+                &index_uid,
+                &source_id,
+                &[r#"{"doc": "a"}"#],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.successes.len(), 1);
+
+        // A newer incarnation of this node takes over the log.
+        let config = crate::ingest_v3::IngestV3Config::with_wal_uri(
+            quickwit_common::uri::Uri::for_test("ram:///wal"),
+        );
+        let newer = ObjectWal::open(storage.clone(), ingester_ctx.node_id.as_str(), 0, &config)
+            .await
+            .unwrap();
+        assert_eq!(newer.replay.len(), 1);
+
+        // The old incarnation's next write is refused and it marks itself failed.
+        let response = ingester
+            .persist(v3_persist_request(
+                &ingester_ctx.node_id,
+                &index_uid,
+                &source_id,
+                &[r#"{"doc": "b"}"#],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.successes.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(
+            response.failures[0].reason(),
+            PersistFailureReason::NodeUnavailable
+        );
+        wait_for_ingester_status(&ingester, IngesterStatus::Failed, Duration::from_secs(1))
+            .await
+            .unwrap();
+        newer.object_wal.close().await.unwrap();
     }
 }
