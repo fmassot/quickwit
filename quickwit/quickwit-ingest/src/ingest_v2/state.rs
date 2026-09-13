@@ -33,12 +33,14 @@ use quickwit_proto::ingest::ingester::IngesterStatus;
 use quickwit_proto::ingest::{IngestV2Error, IngestV2Result, ShardIds, ShardState};
 use quickwit_proto::types::{DocMappingUid, IndexUid, Position, QueueId, SourceId, split_queue_id};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockMappedWriteGuard, RwLockWriteGuard, watch};
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 use super::models::IngesterShard;
 use super::rate_meter::RateMeter;
 use super::wal_capacity_tracker::WalCapacityTracker;
 use crate::OpenShardCounts;
+use crate::ingest_v3::mem_queue::{MemQueue, MemQueueUsage};
+use crate::ingest_v3::{ObjectWal, OpenedObjectWal};
 use crate::mrecordlog_async::MultiRecordLogAsync;
 
 /// Stores the state of the ingester and attempts to prevent deadlocks by exposing an API that
@@ -52,6 +54,8 @@ pub(super) struct IngesterState {
     // `inner` is a mutex because it's almost always accessed mutably.
     inner: Arc<Mutex<InnerIngesterState>>,
     mrecordlog: Arc<RwLock<Option<MultiRecordLogAsync>>>,
+    /// Ingest v3: shared with `inner.mem_queue_usage`; readable without the lock.
+    mem_queue_usage: Arc<MemQueueUsage>,
     pub status_rx: watch::Receiver<IngesterStatus>,
 }
 
@@ -60,6 +64,11 @@ pub(super) struct InnerIngesterState {
     pub doc_mappers: HashMap<DocMappingUid, Weak<DocMapper>>,
     cluster: Cluster,
     pub wal_capacity_tracker: WalCapacityTracker,
+    /// Ingest v3: the object-store WAL, when enabled. Records are appended to it and to the
+    /// shards' in-memory queues; persist requests are acknowledged once they are durable in it.
+    pub object_wal: Option<ObjectWal>,
+    /// Ingest v3: node-wide accounting of the bytes buffered in the shards' in-memory queues.
+    pub mem_queue_usage: Arc<MemQueueUsage>,
     disk_capacity: ByteSize,
     memory_capacity: ByteSize,
     status_tx: watch::Sender<IngesterStatus>,
@@ -158,11 +167,14 @@ impl IngesterState {
     async fn create(cluster: Cluster, disk_capacity: ByteSize, memory_capacity: ByteSize) -> Self {
         let status = IngesterStatus::Initializing;
         let (status_tx, status_rx) = watch::channel(status);
+        let mem_queue_usage = Arc::new(MemQueueUsage::default());
         let mut inner = InnerIngesterState {
             shards: Default::default(),
             doc_mappers: Default::default(),
             cluster,
             wal_capacity_tracker: WalCapacityTracker::new(disk_capacity, memory_capacity),
+            object_wal: None,
+            mem_queue_usage: mem_queue_usage.clone(),
             disk_capacity,
             memory_capacity,
             status_tx,
@@ -177,6 +189,7 @@ impl IngesterState {
         Self {
             inner,
             mrecordlog,
+            mem_queue_usage,
             status_rx,
         }
     }
@@ -187,6 +200,7 @@ impl IngesterState {
         disk_capacity: ByteSize,
         memory_capacity: ByteSize,
         rate_limiter_settings: RateLimiterSettings,
+        object_wal_opt: Option<OpenedObjectWal>,
     ) -> Self {
         let state = Self::create(cluster, disk_capacity, memory_capacity).await;
         let state_clone = state.clone();
@@ -199,6 +213,7 @@ impl IngesterState {
                     disk_capacity,
                     memory_capacity,
                     rate_limiter_settings,
+                    object_wal_opt,
                 )
                 .await;
         };
@@ -224,6 +239,7 @@ impl IngesterState {
             disk_capacity,
             ByteSize::mb(256),
             RateLimiterSettings::default(),
+            None,
         )
         .await;
 
@@ -234,12 +250,17 @@ impl IngesterState {
 
     /// Initializes the internal state of the ingester. It loads the local WAL, then lists all its
     /// queues. Every queue is recovered as a closed shard, including empty ones.
+    ///
+    /// With ingest v3, records left in the object-store WAL by a previous incarnation of this
+    /// node are first re-inserted into the local WAL, so that the shards they belong to are
+    /// recovered like any other.
     pub async fn init(
         &self,
         wal_dir_path: &Path,
         disk_capacity: ByteSize,
         memory_capacity: ByteSize,
         rate_limiter_settings: RateLimiterSettings,
+        object_wal_opt: Option<OpenedObjectWal>,
     ) {
         // Acquire locks in the same order as `lock_fully` (mrecordlog first, then inner) to
         // prevent ABBA deadlocks with the broadcast capacity task.
@@ -248,16 +269,57 @@ impl IngesterState {
 
         let now = Instant::now();
 
-        info!("opening WAL located at `{}`", wal_dir_path.display());
-        let open_result = MultiRecordLogAsync::open_with_prefs(
-            wal_dir_path,
+        let mut local_queues: Vec<QueueId> = Vec::new();
+        let persist_policy = if object_wal_opt.is_some() {
+            // Ingest v3: the object WAL is the only source of durability and of recovery. The
+            // local WAL is a serving buffer for fetch streams. Whatever it holds from a previous
+            // run is either already in the object WAL (replayed below) or was never
+            // acknowledged nor served to an indexer (fetch is bounded by the durable position),
+            // so it is discarded. Not persisting it also removes the fsync/flush churn.
+            //
+            // The *names* of the local queues are kept: a queue with no marker in the object
+            // WAL (a node switched from ingest v2 without being drained first) is recovered
+            // empty and closed rather than forgotten while the control plane still routes to it.
+            // Its v2-era records are lost: drain a node before switching it to ingest v3.
+            info!(
+                "ingest v3: discarding local WAL located at `{}`",
+                wal_dir_path.display()
+            );
+            match MultiRecordLogAsync::open_with_prefs(
+                wal_dir_path,
+                mrecordlog::PersistPolicy::DoNothing,
+            )
+            .await
+            {
+                Ok(local_wal) => {
+                    local_queues = local_wal.list_queues().map(str::to_string).collect();
+                    if !local_queues.is_empty() {
+                        warn!(
+                            "ingest v3: {} queue(s) found in the local WAL, recovering them \
+                             empty; their records, if any, are discarded",
+                            local_queues.len()
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!("failed to open the local WAL before discarding it: {error}");
+                }
+            }
+            if let Err(error) = clear_dir(wal_dir_path).await {
+                error!("failed to clear local WAL directory: {error}");
+                inner_guard.set_status(IngesterStatus::Failed).await;
+                return;
+            }
+            mrecordlog::PersistPolicy::DoNothing
+        } else {
             mrecordlog::PersistPolicy::OnDelay {
                 interval: Duration::from_secs(5),
                 // TODO maybe we want to fsync too?
                 action: mrecordlog::PersistAction::Flush,
-            },
-        )
-        .await;
+            }
+        };
+        info!("opening WAL located at `{}`", wal_dir_path.display());
+        let open_result = MultiRecordLogAsync::open_with_prefs(wal_dir_path, persist_policy).await;
 
         let mrecordlog = match open_result {
             Ok(mrecordlog) => {
@@ -273,6 +335,17 @@ impl IngesterState {
                 return;
             }
         };
+        // Ingest v3: shards recovered from the object WAL, backed by in-memory queues.
+        let mut recovered_mem_queues: Vec<(QueueId, Arc<MemQueue>)> = Vec::new();
+        if let Some(mut opened_object_wal) = object_wal_opt {
+            opened_object_wal.queues.extend(local_queues);
+            recovered_mem_queues = replay_object_wal_into_mem_queues(
+                &inner_guard.mem_queue_usage,
+                opened_object_wal.queues,
+                opened_object_wal.replay,
+            );
+            inner_guard.object_wal = Some(opened_object_wal.object_wal);
+        }
         let queues_summary = mrecordlog.summary();
 
         if !queues_summary.queues.is_empty() {
@@ -318,6 +391,32 @@ impl IngesterState {
                     .build();
             inner_guard.shards.insert(queue_id.clone(), shard);
 
+            num_closed_shards += 1;
+        }
+        for (queue_id, mem_queue) in recovered_mem_queues {
+            let Some((index_uid, source_id, shard_id)) = split_queue_id(&queue_id) else {
+                continue;
+            };
+            let replication_position_inclusive = mem_queue
+                .last_position()
+                .map(Position::offset)
+                .unwrap_or(Position::Beginning);
+            let truncation_position_inclusive = mem_queue
+                .first_position()
+                .checked_sub(1)
+                .map(Position::offset)
+                .unwrap_or(Position::Beginning);
+            let shard = IngesterShard::builder(index_uid, source_id, shard_id)
+                .with_state(ShardState::Closed)
+                .with_replication_position_inclusive(replication_position_inclusive)
+                .with_truncation_position_inclusive(truncation_position_inclusive)
+                .with_rate_limiter(RateLimiter::from_settings(rate_limiter_settings))
+                .with_rate_meter(RateMeter::default())
+                .with_last_write(now)
+                .with_mem_queue(mem_queue)
+                .advertisable()
+                .build();
+            inner_guard.shards.insert(queue_id, shard);
             num_closed_shards += 1;
         }
         if num_closed_shards > 0 {
@@ -407,10 +506,16 @@ impl IngesterState {
         self.mrecordlog.clone()
     }
 
+    /// Ingest v3: the node-wide in-memory queue accounting. Cheap, no lock.
+    pub fn mem_queue_usage(&self) -> Arc<MemQueueUsage> {
+        self.mem_queue_usage.clone()
+    }
+
     pub fn weak(&self) -> WeakIngesterState {
         WeakIngesterState {
             inner: Arc::downgrade(&self.inner),
             mrecordlog: Arc::downgrade(&self.mrecordlog),
+            mem_queue_usage: self.mem_queue_usage.clone(),
             status_rx: self.status_rx.clone(),
         }
     }
@@ -573,8 +678,17 @@ impl FullyLockedIngesterState<'_> {
     /// mrecordlog queue first and then removes the associated in-memory shard and rate trackers.
     #[instrument(name = "ingester.delete_shard", skip_all, fields(queue_id, initiator))]
     pub async fn delete_shard(&mut self, queue_id: &QueueId, initiator: &'static str) {
+        if let Some(shard) = self.shards.get(queue_id)
+            && let Some(mem_queue) = &shard.mem_queue
+        {
+            // Ingest v3: the records live in memory; dropping the shard releases them.
+            mem_queue.clear();
+        }
         match self.mrecordlog.delete_queue(queue_id).await {
             Ok(_) | Err(DeleteQueueError::MissingQueue(_)) => {
+                if let Some(object_wal) = &self.inner.object_wal {
+                    object_wal.on_delete_queue(queue_id);
+                }
                 // Log only if the shard was actually removed.
                 if let Some(shard) = self.shards.remove(queue_id) {
                     info!("deleted shard `{queue_id}` initiated via `{initiator}`");
@@ -619,7 +733,14 @@ impl FullyLockedIngesterState<'_> {
         if shard.truncation_position_inclusive >= truncate_up_to_position_inclusive {
             return;
         }
-        if let Some(truncate_up_to_offset_inclusive) = truncate_up_to_position_inclusive.as_u64() {
+        if let (Some(mem_queue), Some(truncate_up_to_offset_inclusive)) =
+            (&shard.mem_queue, truncate_up_to_position_inclusive.as_u64())
+        {
+            // Ingest v3: in-memory queue.
+            mem_queue.truncate(truncate_up_to_offset_inclusive);
+        } else if let Some(truncate_up_to_offset_inclusive) =
+            truncate_up_to_position_inclusive.as_u64()
+        {
             match self
                 .mrecordlog
                 .truncate(queue_id, truncate_up_to_offset_inclusive)
@@ -642,7 +763,13 @@ impl FullyLockedIngesterState<'_> {
             "truncated shard `{queue_id}` at {truncate_up_to_position_inclusive} initiated via \
              `{initiator}`"
         );
-        shard.truncation_position_inclusive = truncate_up_to_position_inclusive;
+        shard.truncation_position_inclusive = truncate_up_to_position_inclusive.clone();
+        if let (Some(object_wal), Some(position)) = (
+            &self.inner.object_wal,
+            truncate_up_to_position_inclusive.as_u64(),
+        ) {
+            object_wal.on_truncate(queue_id, position);
+        }
         self.report_wal_usage();
     }
 
@@ -673,6 +800,7 @@ impl FullyLockedIngesterState<'_> {
 pub(super) struct WeakIngesterState {
     inner: Weak<Mutex<InnerIngesterState>>,
     mrecordlog: Weak<RwLock<Option<MultiRecordLogAsync>>>,
+    mem_queue_usage: Arc<MemQueueUsage>,
     status_rx: watch::Receiver<IngesterStatus>,
 }
 
@@ -684,10 +812,63 @@ impl WeakIngesterState {
         let state = IngesterState {
             inner,
             mrecordlog,
+            mem_queue_usage: self.mem_queue_usage.clone(),
             status_rx,
         };
         Some(state)
     }
+}
+
+/// Removes the contents of `dir` (creating it if needed). The directory itself is kept: it may
+/// be a symlink or a mount point.
+async fn clear_dir(dir: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if entry.file_type().await?.is_dir() {
+            tokio::fs::remove_dir_all(&path).await?;
+        } else {
+            tokio::fs::remove_file(&path).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds the in-memory queues of the shards recovered from the object-store WAL: one per queue
+/// name, holding the replayed records at their original positions.
+fn replay_object_wal_into_mem_queues(
+    usage: &Arc<MemQueueUsage>,
+    queues: Vec<QueueId>,
+    records: Vec<crate::ingest_v3::wal::reader::WalRecord>,
+) -> Vec<(QueueId, Arc<MemQueue>)> {
+    let mut mem_queues: HashMap<QueueId, Arc<MemQueue>> = HashMap::new();
+    // Queues first: a queue may exist without any record to replay.
+    for queue_id in queues {
+        mem_queues
+            .entry(queue_id)
+            .or_insert_with(|| Arc::new(MemQueue::new(usage.clone(), 0)));
+    }
+    let mut num_replayed = 0usize;
+    // `records` is sorted by (queue_id, position).
+    for record in records {
+        let mem_queue = mem_queues
+            .entry(record.queue_id)
+            .or_insert_with(|| Arc::new(MemQueue::new(usage.clone(), 0)));
+        if mem_queue.append_at(record.position, record.record) {
+            num_replayed += 1;
+        }
+    }
+    if num_replayed > 0 {
+        info!(
+            num_replayed,
+            num_bytes = usage.num_bytes(),
+            "replayed records from the object WAL into memory"
+        );
+    }
+    let mut recovered: Vec<(QueueId, Arc<MemQueue>)> = mem_queues.into_iter().collect();
+    recovered.sort_by(|left, right| left.0.cmp(&right.0));
+    recovered
 }
 
 #[cfg(test)]
@@ -747,6 +928,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ingester_state_init_v3_discards_local_wal_and_replays_object_wal() {
+        use std::sync::Arc;
+
+        use quickwit_common::uri::Uri;
+        use quickwit_storage::RamStorage;
+
+        use crate::ingest_v3::{IngestV3Config, ObjectWal};
+
+        let index_uid = IndexUid::for_test("test-index", 0);
+        let source_id = "test-source".to_string();
+        let queue_local = queue_id(&index_uid, &source_id, &ShardId::from(1));
+        let queue_remote = queue_id(&index_uid, &source_id, &ShardId::from(2));
+
+        // Leftovers on the local disk from a previous run: must be ignored.
+        let temp_dir = tempfile::tempdir().unwrap();
+        {
+            let mut mrecordlog = MultiRecordLogAsync::open(temp_dir.path()).await.unwrap();
+            mrecordlog.create_queue(&queue_local).await.unwrap();
+            mrecordlog
+                .append_records(&queue_local, None, [&b"stale"[..]].into_iter())
+                .await
+                .unwrap();
+        }
+
+        // The object WAL holds what a previous incarnation acknowledged.
+        let storage: Arc<dyn quickwit_storage::Storage> = Arc::new(RamStorage::default());
+        let mut config = IngestV3Config::with_wal_uri(Uri::for_test("ram:///wal"));
+        config.flush_interval = Duration::from_secs(3600);
+        let previous = ObjectWal::open(storage.clone(), "node", 0, &config)
+            .await
+            .unwrap()
+            .object_wal;
+        previous
+            .append(
+                &queue_remote,
+                0,
+                vec![crate::MRecord::new_doc("durable").encode_to_bytes()],
+            )
+            .unwrap();
+        previous.flush().await.unwrap();
+
+        let opened = ObjectWal::open(storage, "node", 0, &config).await.unwrap();
+        assert_eq!(opened.replay.len(), 1);
+
+        let cluster = test_cluster().await;
+        let mut state = IngesterState::create(cluster, ByteSize::mb(256), ByteSize::mb(256)).await;
+        state
+            .init(
+                temp_dir.path(),
+                ByteSize::mb(256),
+                ByteSize::mb(256),
+                RateLimiterSettings::default(),
+                Some(opened),
+            )
+            .await;
+        timeout(Duration::from_millis(100), state.wait_for_ready())
+            .await
+            .unwrap();
+
+        let state_guard = state.lock_fully("test").await.unwrap();
+        // The local queue is recovered by name, empty and closed: its records are discarded.
+        let local_shard = state_guard
+            .shards
+            .get(&queue_local)
+            .expect("local queue recovered empty");
+        assert!(local_shard.is_closed());
+        assert_eq!(
+            local_shard.replication_position_inclusive,
+            Position::Beginning
+        );
+        assert!(local_shard.mem_queue.as_ref().unwrap().is_empty());
+        let shard = state_guard.shards.get(&queue_remote).unwrap();
+        assert!(shard.is_closed());
+        assert_eq!(shard.replication_position_inclusive, Position::offset(0u64));
+        let records = shard.mem_queue.as_ref().unwrap().range(.., usize::MAX);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, 0);
+        assert_eq!(&records[0].1[2..], b"durable");
+        assert!(!state_guard.mrecordlog.queue_exists(&queue_remote));
+        assert_eq!(state_guard.mem_queue_usage.num_records(), 1);
+        assert!(state_guard.object_wal.is_some());
+    }
+
+    #[tokio::test]
     async fn test_ingester_state_init() {
         let index_uid = IndexUid::for_test("test-index", 0);
         let source_id = SourceId::from("test-source");
@@ -803,6 +1068,7 @@ mod tests {
                 ByteSize::mb(256),
                 ByteSize::mb(256),
                 RateLimiterSettings::default(),
+                None,
             )
             .await;
         timeout(Duration::from_millis(100), state.wait_for_ready())
@@ -1004,6 +1270,7 @@ mod tests {
                 ByteSize::mb(256),
                 ByteSize::mb(256),
                 RateLimiterSettings::default(),
+                None,
             )
             .await;
 

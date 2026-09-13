@@ -87,6 +87,7 @@ use quickwit_index_management::{IndexService as IndexManager, IndexServiceError}
 use quickwit_indexing::actors::{IndexingService, MergeSchedulerService};
 use quickwit_indexing::models::ShardPositionsService;
 use quickwit_indexing::{IndexingSplitCache, start_indexing_service};
+use quickwit_ingest::ingest_v3::{IngestV3Config, ObjectWal};
 use quickwit_ingest::{
     GetMemoryCapacity, IngestRequest, IngestRouter, IngestServiceClient, Ingester, IngesterPool,
     IngesterPoolEntry, LocalShardsUpdate, get_idle_shard_timeout, notify_ingester_decommission,
@@ -669,6 +670,7 @@ pub async fn serve_quickwit(
         &event_broker,
         control_plane_client.clone(),
         ingester_pool,
+        &storage_resolver,
     )
     .await
     .context("failed to start ingest v2 service")?;
@@ -1134,6 +1136,7 @@ async fn setup_ingest_v2(
     event_broker: &EventBroker,
     control_plane: ControlPlaneServiceClient,
     ingester_pool: IngesterPool,
+    storage_resolver: &StorageResolver,
 ) -> anyhow::Result<(IngestRouter, IngestRouterServiceClient, Option<Ingester>)> {
     // Instantiate ingest router.
     let self_node_id: NodeId = cluster.self_node_id().to_owned();
@@ -1173,6 +1176,31 @@ async fn setup_ingest_v2(
         fs::create_dir_all(&wal_dir_path)?;
 
         let idle_shard_timeout = get_idle_shard_timeout();
+
+        // Ingest v3: object-store WAL, enabled with `QW_ENABLE_INGEST_V3=true` and
+        // `QW_INGEST_WAL_URI=<uri>`. See `quickwit_ingest::ingest_v3`.
+        let object_wal_opt = if let Some(ingest_v3_config) = IngestV3Config::from_env()? {
+            info!(
+                wal_uri = %ingest_v3_config.wal_uri,
+                flush_interval = ?ingest_v3_config.flush_interval,
+                "ingest v3 enabled: opening object-store WAL"
+            );
+            let wal_storage = storage_resolver
+                .resolve(&ingest_v3_config.wal_uri)
+                .await
+                .context("failed to resolve the ingest v3 WAL storage")?;
+            let opened = ObjectWal::open(
+                wal_storage,
+                self_node_id.as_str(),
+                cluster.self_chitchat_id().generation_id,
+                &ingest_v3_config,
+            )
+            .await
+            .context("failed to open the ingest v3 object-store WAL")?;
+            Some(opened)
+        } else {
+            None
+        };
         let ingester = Ingester::try_new(
             cluster.clone(),
             control_plane,
@@ -1181,6 +1209,7 @@ async fn setup_ingest_v2(
             node_config.ingest_api_config.max_queue_memory_usage,
             rate_limiter_settings,
             idle_shard_timeout,
+            object_wal_opt,
         )
         .await?;
         ingester.subscribe(event_broker);

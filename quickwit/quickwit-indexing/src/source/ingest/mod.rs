@@ -24,8 +24,9 @@ use itertools::Itertools;
 use quickwit_actors::ActorExitStatus;
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::retry::RetryParams;
+use quickwit_ingest::ingest_v3::IngestV3Config;
 use quickwit_ingest::{
-    FetchStreamError, IngesterPool, MRecord, MultiFetchStream, decoded_mrecords,
+    FetchStreamError, IngesterPool, MRecord, MultiFetchStream, ObjectWalFallback, decoded_mrecords,
 };
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::ingest::ingester::{
@@ -163,8 +164,21 @@ impl IngestSource {
         let metastore = source_runtime.metastore.clone();
         let ingester_pool = source_runtime.ingester_pool.clone();
         let assigned_shards = FnvHashMap::default();
-        let fetch_stream =
+        let mut fetch_stream =
             MultiFetchStream::new(client_id.to_string(), ingester_pool.clone(), retry_params);
+        // Ingest v3: shards of an ingester that left the cluster are drained from its
+        // object-store WAL.
+        if let Some(ingest_v3_config) = IngestV3Config::from_env()? {
+            let storage = source_runtime
+                .storage_resolver
+                .resolve(&ingest_v3_config.wal_uri)
+                .await
+                .context("failed to resolve the ingest v3 WAL storage")?;
+            fetch_stream = fetch_stream.with_object_wal_fallback(ObjectWalFallback {
+                storage,
+                grace: ingest_v3_config.fetch_fallback_grace,
+            });
+        }
         // We start as dead. The first reset with a non-empty list of shards will create an alive
         // publish lock. The publish token is left empty until then: the first reset adopts the
         // indexing plan id carried by the assignment.

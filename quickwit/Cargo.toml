@@ -112,6 +112,7 @@ base64 = "0.23"
 binggan = { version = "0.17" }
 bitpacking = "0.9"
 bytes = { version = "1", features = ["serde"] }
+crc32fast = "1"
 bytesize = { version = "2.4", features = ["serde"] }
 bytestring = "1.5"
 chitchat = "0.13.0"

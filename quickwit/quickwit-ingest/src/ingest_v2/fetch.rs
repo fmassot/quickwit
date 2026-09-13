@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
 use bytesize::ByteSize;
@@ -33,12 +34,43 @@ use quickwit_proto::ingest::{IngestV2Error, IngestV2Result, MRecordBatch};
 use quickwit_proto::types::{IndexUid, NodeId, Position, QueueId, ShardId, SourceId, queue_id};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::models::ShardStatus;
 use super::state::{track_acquire_lock, warn_on_long_lock_hold};
+use crate::ingest_v3::mem_queue::MemQueue;
+use crate::ingest_v3::metrics as v3_metrics;
+use crate::ingest_v3::wal::fence::fence_log;
+use crate::ingest_v3::wal::reader::WalReader;
+use crate::ingest_v3::wal::{WalError, WalId};
 use crate::mrecordlog_async::MultiRecordLogAsync;
 use crate::{ClientId, IngesterPool};
+
+/// Ingest v3: how a fetch stream drains a shard whose ingester is gone.
+///
+/// Once the ingester hosting a shard has been absent from the ingester pool for `grace`, the
+/// fetch stream fences the ingester's object-store log and serves the shard's remaining records
+/// straight from it, then reports EOF. The metastore checkpoint makes this safe even if the
+/// ingester comes back and serves the same records again: overlapping positions are rejected at
+/// publish time.
+#[derive(Clone)]
+pub struct ObjectWalFallback {
+    /// Storage holding the ingest WAL (`QW_INGEST_WAL_URI`).
+    pub storage: Arc<dyn quickwit_storage::Storage>,
+    /// How long an ingester must be missing before its log is fenced and drained.
+    pub grace: Duration,
+}
+
+impl fmt::Debug for ObjectWalFallback {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("ObjectWalFallback")
+            .field("grace", &self.grace)
+            .finish()
+    }
+}
+
+/// Upper bound on the size of a fetch payload built from the object WAL.
+const OBJECT_WAL_FETCH_BATCH_NUM_BYTES: usize = 8 * 1024 * 1024;
 
 /// A fetch stream task is responsible for waiting and pushing new records written to a shard's
 /// record log into a channel named `fetch_message_tx`.
@@ -52,11 +84,17 @@ pub(super) struct FetchStreamTask {
     /// The position of the next record fetched.
     from_position_inclusive: u64,
     mrecordlog: Arc<RwLock<Option<MultiRecordLogAsync>>>,
+    /// Ingest v3: the shard's in-memory queue, read instead of the mrecordlog.
+    mem_queue_opt: Option<Arc<MemQueue>>,
     fetch_message_tx: TrackedSender<IngestV2Result<FetchMessage>>,
     /// This channel notifies the fetch task when new records are available. This way the fetch
     /// task does not need to grab the lock and poll the mrecordlog queue unnecessarily.
     shard_status_rx: watch::Receiver<ShardStatus>,
     batch_num_bytes: usize,
+    /// Ingest v3: only serve records up to the shard's replication position, which the
+    /// ingester advances once records are durable in the object-store WAL. Without this bound,
+    /// an indexer could read (and publish) records that a crash would erase from the log.
+    bound_by_replication_position: bool,
 }
 
 impl fmt::Debug for FetchStreamTask {
@@ -71,11 +109,30 @@ impl fmt::Debug for FetchStreamTask {
 }
 
 impl FetchStreamTask {
+    #[cfg(test)]
     pub fn spawn(
         open_fetch_stream_request: OpenFetchStreamRequest,
         mrecordlog: Arc<RwLock<Option<MultiRecordLogAsync>>>,
         shard_status_rx: watch::Receiver<ShardStatus>,
         batch_num_bytes: usize,
+    ) -> (ServiceStream<IngestV2Result<FetchMessage>>, JoinHandle<()>) {
+        Self::spawn_with_options(
+            open_fetch_stream_request,
+            mrecordlog,
+            None,
+            shard_status_rx,
+            batch_num_bytes,
+            false,
+        )
+    }
+
+    pub fn spawn_with_options(
+        open_fetch_stream_request: OpenFetchStreamRequest,
+        mrecordlog: Arc<RwLock<Option<MultiRecordLogAsync>>>,
+        mem_queue_opt: Option<Arc<MemQueue>>,
+        shard_status_rx: watch::Receiver<ShardStatus>,
+        batch_num_bytes: usize,
+        bound_by_replication_position: bool,
     ) -> (ServiceStream<IngestV2Result<FetchMessage>>, JoinHandle<()>) {
         let from_position_inclusive = open_fetch_stream_request
             .from_position_exclusive()
@@ -92,9 +149,11 @@ impl FetchStreamTask {
             source_id: open_fetch_stream_request.source_id,
             from_position_inclusive,
             mrecordlog,
+            mem_queue_opt,
             fetch_message_tx,
             shard_status_rx,
             batch_num_bytes,
+            bound_by_replication_position,
         };
         let future = async move { fetch_task.run().await };
         let fetch_task_handle: JoinHandle<()> = spawn_named_task(future, "fetch_task");
@@ -129,32 +188,64 @@ impl FetchStreamTask {
             let mut mrecord_buffer = BytesMut::with_capacity(self.batch_num_bytes);
             let mut mrecord_lengths = Vec::new();
 
-            let (mrecordlog_guard, acquired_at) =
-                track_acquire_lock("fetch_stream", "partial", self.mrecordlog.read()).await;
-
-            let Ok(mrecords) = mrecordlog_guard
-                .as_ref()
-                .expect("mrecordlog should be initialized")
-                .range(&self.queue_id, self.from_position_inclusive..)
-            else {
-                // The queue was dropped.
-                break;
+            // Exclusive upper bound of the records we may serve.
+            let to_position_exclusive: u64 = if self.bound_by_replication_position {
+                self.shard_status_rx
+                    .borrow()
+                    .1
+                    .as_u64()
+                    .map(|position| position + 1)
+                    .unwrap_or(0)
+            } else {
+                u64::MAX
             };
-            for Record { payload, .. } in mrecords {
-                // Accept at least one message
-                if !mrecord_buffer.is_empty()
-                    && (mrecord_buffer.len() + payload.len() > mrecord_buffer.capacity())
-                {
-                    has_drained_queue = false;
-                    break;
-                }
-                mrecord_buffer.put(payload.borrow());
-                mrecord_lengths.push(payload.len() as u32);
-            }
-            // Drop the lock while we send the message.
-            drop(mrecordlog_guard);
 
-            warn_on_long_lock_hold("fetch_stream", "partial", acquired_at);
+            if let Some(mem_queue) = &self.mem_queue_opt {
+                // Ingest v3: per-queue mutex, no node-wide lock.
+                let range = self.from_position_inclusive
+                    ..to_position_exclusive.max(self.from_position_inclusive);
+                let records = mem_queue.range(range.clone(), self.batch_num_bytes);
+                let num_available = range.end - range.start;
+                for (_position, payload) in &records {
+                    mrecord_buffer.put_slice(payload);
+                    mrecord_lengths.push(payload.len() as u32);
+                }
+                if (records.len() as u64) < num_available {
+                    // More records are available than fit in one batch (or gaps).
+                    has_drained_queue = false;
+                }
+            } else {
+                let (mrecordlog_guard, acquired_at) =
+                    track_acquire_lock("fetch_stream", "partial", self.mrecordlog.read()).await;
+
+                let Ok(mrecords) = mrecordlog_guard
+                    .as_ref()
+                    .expect("mrecordlog should be initialized")
+                    .range(
+                        &self.queue_id,
+                        self.from_position_inclusive
+                            ..to_position_exclusive.max(self.from_position_inclusive),
+                    )
+                else {
+                    // The queue was dropped.
+                    break;
+                };
+                for Record { payload, .. } in mrecords {
+                    // Accept at least one message
+                    if !mrecord_buffer.is_empty()
+                        && (mrecord_buffer.len() + payload.len() > mrecord_buffer.capacity())
+                    {
+                        has_drained_queue = false;
+                        break;
+                    }
+                    mrecord_buffer.put(payload.borrow());
+                    mrecord_lengths.push(payload.len() as u32);
+                }
+                // Drop the lock while we send the message.
+                drop(mrecordlog_guard);
+
+                warn_on_long_lock_hold("fetch_stream", "partial", acquired_at);
+            }
 
             if !mrecord_lengths.is_empty() {
                 let from_position_exclusive = if self.from_position_inclusive == 0 {
@@ -259,6 +350,7 @@ pub struct MultiFetchStream {
     client_id: ClientId,
     ingester_pool: IngesterPool,
     retry_params: RetryParams,
+    object_wal_fallback: Option<ObjectWalFallback>,
     fetch_task_handles: HashMap<QueueId, JoinHandle<()>>,
     fetch_message_rx: mpsc::Receiver<Result<InFlightValue<FetchMessage>, FetchStreamError>>,
     fetch_message_tx: mpsc::Sender<Result<InFlightValue<FetchMessage>, FetchStreamError>>,
@@ -275,10 +367,17 @@ impl MultiFetchStream {
             client_id,
             ingester_pool,
             retry_params,
+            object_wal_fallback: None,
             fetch_task_handles: HashMap::new(),
             fetch_message_rx,
             fetch_message_tx,
         }
+    }
+
+    /// Enables draining shards of absent ingesters from the object-store WAL (ingest v3).
+    pub fn with_object_wal_fallback(mut self, fallback: ObjectWalFallback) -> Self {
+        self.object_wal_fallback = Some(fallback);
+        self
     }
 
     #[cfg(any(test, feature = "testsuite"))]
@@ -315,6 +414,7 @@ impl MultiFetchStream {
             ingester_id,
             self.ingester_pool.clone(),
             self.retry_params,
+            self.object_wal_fallback.clone(),
             self.fetch_message_tx.clone(),
         );
         let fetch_task_handle = spawn_named_task(fetch_stream_future, "fetch_stream");
@@ -383,9 +483,39 @@ async fn retrying_fetch_stream(
     ingester_id: NodeId,
     ingester_pool: IngesterPool,
     retry_params: RetryParams,
+    object_wal_fallback: Option<ObjectWalFallback>,
     fetch_message_tx: mpsc::Sender<Result<InFlightValue<FetchMessage>, FetchStreamError>>,
 ) {
+    // Ingest v3: since when the ingester has been continuously missing from the pool.
+    let mut ingester_absent_since: Option<Instant> = None;
+
     for num_attempts in 1..=retry_params.max_attempts {
+        if let Some(fallback) = &object_wal_fallback {
+            if ingester_pool.contains_key(&ingester_id) {
+                ingester_absent_since = None;
+            } else {
+                let absent_since = *ingester_absent_since.get_or_insert_with(Instant::now);
+                if absent_since.elapsed() >= fallback.grace {
+                    object_wal_fetch_stream(
+                        fallback,
+                        client_id.clone(),
+                        index_uid.clone(),
+                        source_id.clone(),
+                        shard_id.clone(),
+                        &mut from_position_exclusive,
+                        &ingester_id,
+                        fetch_message_tx.clone(),
+                    )
+                    .await;
+                    if from_position_exclusive.is_eof() {
+                        break;
+                    }
+                    let delay = retry_params.compute_delay(num_attempts);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+        }
         fetch_stream_once(
             client_id.clone(),
             index_uid.clone(),
@@ -404,6 +534,256 @@ async fn retrying_fetch_stream(
         let delay = retry_params.compute_delay(num_attempts);
         tokio::time::sleep(delay).await;
     }
+}
+
+/// Ingest v3: fences the object-store log of `ingester_id` and streams the shard's records
+/// from it, from `from_position_exclusive` to the end of the log, then EOF.
+///
+/// On a storage error, sends an `Unavailable` fetch stream error and leaves
+/// `from_position_exclusive` where it got to; the caller retries later and the replay resumes
+/// from there (the fence is idempotent: a second call finds the log already closed).
+#[allow(clippy::too_many_arguments)]
+async fn object_wal_fetch_stream(
+    fallback: &ObjectWalFallback,
+    client_id: String,
+    index_uid: IndexUid,
+    source_id: SourceId,
+    shard_id: ShardId,
+    from_position_exclusive: &mut Position,
+    ingester_id: &NodeId,
+    fetch_message_tx: mpsc::Sender<Result<InFlightValue<FetchMessage>, FetchStreamError>>,
+) {
+    let queue_id = queue_id(&index_uid, &source_id, &shard_id);
+    info!(
+        client_id=%client_id,
+        queue_id=%queue_id,
+        from_position_exclusive=%from_position_exclusive,
+        "ingester `{ingester_id}` is absent: draining shard from its object WAL"
+    );
+    let send_error = |ingest_error: IngestV2Error| {
+        let fetch_stream_error = FetchStreamError {
+            index_uid: index_uid.clone(),
+            source_id: source_id.clone(),
+            shard_id: shard_id.clone(),
+            ingest_error,
+        };
+        let fetch_message_tx = fetch_message_tx.clone();
+        async move {
+            let _ = fetch_message_tx.send(Err(fetch_stream_error)).await;
+        }
+    };
+    match object_wal_replay(
+        fallback,
+        &index_uid,
+        &source_id,
+        &shard_id,
+        &queue_id,
+        from_position_exclusive,
+        ingester_id,
+        &fetch_message_tx,
+    )
+    .await
+    {
+        Ok(()) => {
+            v3_metrics::WAL_OBJECT_FALLBACK_DRAINS_SUCCESS.inc();
+        }
+        Err(error) => {
+            v3_metrics::WAL_OBJECT_FALLBACK_DRAINS_ERROR.inc();
+            error!(
+                client_id=%client_id,
+                queue_id=%queue_id,
+                %error,
+                "failed to drain shard from the object WAL of ingester `{ingester_id}`"
+            );
+            send_error(IngestV2Error::Unavailable(format!(
+                "failed to drain shard from the object WAL of ingester `{ingester_id}`: {error}"
+            )))
+            .await;
+        }
+    }
+}
+
+/// Does the work of [`object_wal_fetch_stream`]. Returns `Ok(())` once EOF has been sent, or if
+/// the consumer went away.
+#[allow(clippy::too_many_arguments)]
+async fn object_wal_replay(
+    fallback: &ObjectWalFallback,
+    index_uid: &IndexUid,
+    source_id: &SourceId,
+    shard_id: &ShardId,
+    queue_id: &QueueId,
+    from_position_exclusive: &mut Position,
+    ingester_id: &NodeId,
+    fetch_message_tx: &mpsc::Sender<Result<InFlightValue<FetchMessage>, FetchStreamError>>,
+) -> Result<(), WalError> {
+    let storage = fallback.storage.clone();
+    let reader = WalReader::new(storage.clone(), ingester_id.as_str());
+
+    // Close the log so that the tail is final, then scan everything up to the fence.
+    let existing = reader.list().await?;
+    let listed_tail = existing
+        .last()
+        .map(|object| object.wal_id)
+        .unwrap_or(WalId::ZERO);
+    let fence = match fence_log(storage, ingester_id.as_str(), 0, listed_tail).await {
+        Ok(fence) => fence,
+        // Someone else (another indexer, or the ingester itself restarting) fenced with a
+        // higher epoch in the meantime. The log is closed either way: the objects we need
+        // are all at or below the current tail.
+        Err(WalError::Fenced) => {
+            let tail = reader
+                .list()
+                .await?
+                .last()
+                .map(|o| o.wal_id)
+                .unwrap_or(listed_tail);
+            crate::ingest_v3::wal::fence::Fence {
+                wal_id: tail,
+                epoch: 0,
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let wal_ids: Vec<(WalId, Option<u64>)> = existing
+        .iter()
+        .map(|object| (object.wal_id, Some(object.num_bytes)))
+        .chain((listed_tail.0 + 1..=fence.wal_id.0).map(|wal_id| (WalId(wal_id), None)))
+        .collect();
+
+    let mut from_position_inclusive: u64 = from_position_exclusive
+        .as_u64()
+        .map(|position| position + 1)
+        .unwrap_or(0);
+
+    let mut mrecord_buffer = BytesMut::with_capacity(OBJECT_WAL_FETCH_BATCH_NUM_BYTES);
+    let mut mrecord_lengths: Vec<u32> = Vec::new();
+    let mut batch_to_position_inclusive: u64 = 0;
+
+    for (wal_id, num_bytes) in wal_ids {
+        let footer = match reader.read_footer(wal_id, num_bytes).await {
+            Ok(footer) => footer,
+            Err(WalError::Storage(error))
+                if error.kind() == quickwit_storage::StorageErrorKind::NotFound =>
+            {
+                // Garbage collected: every record it held was below the publish position,
+                // hence below `from_position_inclusive`.
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        for block_meta in &footer.blocks {
+            if block_meta.queue_id != *queue_id
+                || block_meta.is_queue_marker()
+                || block_meta.last_position() < from_position_inclusive
+            {
+                continue;
+            }
+            let records = reader.read_block(wal_id, block_meta).await?;
+            for (i, record) in records.into_iter().enumerate() {
+                let position = block_meta.first_position + i as u64;
+                if position < from_position_inclusive {
+                    continue;
+                }
+                let batch_is_full = !mrecord_lengths.is_empty()
+                    && mrecord_buffer.len() + record.len() > OBJECT_WAL_FETCH_BATCH_NUM_BYTES;
+                if batch_is_full
+                    && !send_object_wal_payload(
+                        index_uid,
+                        source_id,
+                        shard_id,
+                        from_position_exclusive,
+                        batch_to_position_inclusive,
+                        std::mem::replace(
+                            &mut mrecord_buffer,
+                            BytesMut::with_capacity(OBJECT_WAL_FETCH_BATCH_NUM_BYTES),
+                        ),
+                        std::mem::take(&mut mrecord_lengths),
+                        fetch_message_tx,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+                mrecord_buffer.put_slice(&record);
+                mrecord_lengths.push(record.len() as u32);
+                batch_to_position_inclusive = position;
+                from_position_inclusive = position + 1;
+                v3_metrics::WAL_OBJECT_FALLBACK_DRAINED_RECORDS_TOTAL.inc();
+            }
+        }
+    }
+    if !mrecord_lengths.is_empty()
+        && !send_object_wal_payload(
+            index_uid,
+            source_id,
+            shard_id,
+            from_position_exclusive,
+            batch_to_position_inclusive,
+            mrecord_buffer,
+            mrecord_lengths,
+            fetch_message_tx,
+        )
+        .await
+    {
+        return Ok(());
+    }
+    let eof_position = from_position_exclusive.as_eof();
+    let fetch_eof = FetchEof {
+        index_uid: Some(index_uid.clone()),
+        source_id: source_id.clone(),
+        shard_id: Some(shard_id.clone()),
+        eof_position: Some(eof_position.clone()),
+    };
+    let fetch_message = FetchMessage::new_eof(fetch_eof);
+    let in_flight_value =
+        InFlightValue::new(fetch_message, ByteSize(0), &IN_FLIGHT_MULTI_FETCH_STREAM);
+    let _ = fetch_message_tx.send(Ok(in_flight_value)).await;
+    *from_position_exclusive = eof_position;
+    info!(
+        queue_id=%queue_id,
+        fence_wal_id=fence.wal_id.0,
+        "drained shard from the object WAL of ingester `{ingester_id}`"
+    );
+    Ok(())
+}
+
+/// Sends one payload built from object WAL records and advances `from_position_exclusive`.
+/// Returns `false` if the consumer went away.
+#[allow(clippy::too_many_arguments)]
+async fn send_object_wal_payload(
+    index_uid: &IndexUid,
+    source_id: &SourceId,
+    shard_id: &ShardId,
+    from_position_exclusive: &mut Position,
+    to_position_inclusive: u64,
+    mrecord_buffer: BytesMut,
+    mrecord_lengths: Vec<u32>,
+    fetch_message_tx: &mpsc::Sender<Result<InFlightValue<FetchMessage>, FetchStreamError>>,
+) -> bool {
+    let to_position_inclusive = Position::offset(to_position_inclusive);
+    let mrecord_batch = MRecordBatch {
+        mrecord_buffer: mrecord_buffer.freeze(),
+        mrecord_lengths,
+    };
+    let fetch_payload = FetchPayload {
+        index_uid: Some(index_uid.clone()),
+        source_id: source_id.clone(),
+        shard_id: Some(shard_id.clone()),
+        mrecord_batch: Some(mrecord_batch),
+        // Always continue from what the consumer last saw, so its checkpoint delta chains
+        // even if the log has a gap.
+        from_position_exclusive: Some(from_position_exclusive.clone()),
+        to_position_inclusive: Some(to_position_inclusive.clone()),
+    };
+    let batch_size = fetch_payload.estimate_size();
+    let fetch_message = FetchMessage::new_payload(fetch_payload);
+    let in_flight_value =
+        InFlightValue::new(fetch_message, batch_size, &IN_FLIGHT_MULTI_FETCH_STREAM);
+    if fetch_message_tx.send(Ok(in_flight_value)).await.is_err() {
+        return false;
+    }
+    *from_position_exclusive = to_position_inclusive;
+    true
 }
 
 /// Streams records from an ingester until the stream ends or fails.
@@ -1357,6 +1737,7 @@ pub(super) mod tests {
             ingester_id,
             ingester_pool,
             retry_params,
+            None,
             fetch_message_tx,
         )
         .await;
@@ -1438,5 +1819,164 @@ pub(super) mod tests {
         let retry_params = RetryParams::for_test();
         let _multi_fetch_stream = MultiFetchStream::new(client_id, ingester_pool, retry_params);
         // TODO: Backport from original branch.
+    }
+
+    // ---- Ingest v3: draining an absent ingester's shard from its object WAL ----
+
+    async fn write_dead_ingester_log(
+        storage: &Arc<dyn quickwit_storage::Storage>,
+        queue_id: &str,
+        num_records: u64,
+    ) {
+        use crate::ingest_v3::wal::writer::{WalWriter, WalWriterConfig};
+        let writer = WalWriter::spawn(
+            storage.clone(),
+            "dead-ingester",
+            1,
+            0,
+            WalId(1),
+            WalWriterConfig {
+                flush_interval: Duration::from_secs(3600),
+                ..Default::default()
+            },
+        );
+        // Spread the records over several objects.
+        for position in 0..num_records {
+            writer
+                .append(
+                    queue_id,
+                    position,
+                    vec![MRecord::new_doc(format!("doc-{position}")).encode_to_bytes()],
+                )
+                .unwrap();
+            if position % 2 == 1 {
+                writer.flush().await.unwrap();
+            }
+        }
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multi_fetch_stream_drains_absent_ingester_from_object_wal() {
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
+        let source_id = "test-source".to_string();
+        let shard_id = ShardId::from(1);
+        let queue_id = queue_id(&index_uid, &source_id, &shard_id);
+        write_dead_ingester_log(&storage, &queue_id, 5).await;
+
+        // Nobody in the pool: the ingester is gone.
+        let ingester_pool = IngesterPool::default();
+        let fallback = ObjectWalFallback {
+            storage: storage.clone(),
+            grace: Duration::ZERO,
+        };
+        let mut fetch_stream = MultiFetchStream::new(
+            "test-client".to_string(),
+            ingester_pool,
+            RetryParams::for_test(),
+        )
+        .with_object_wal_fallback(fallback);
+
+        // Resume from position 1: records 0 and 1 were already published.
+        fetch_stream
+            .subscribe(
+                NodeId::from_str("dead-ingester"),
+                index_uid.clone(),
+                source_id.clone(),
+                shard_id.clone(),
+                Position::offset(1u64),
+            )
+            .await
+            .unwrap();
+
+        let mut positions = Vec::new();
+        let mut docs = Vec::new();
+        let mut last_from_position_exclusive = Position::offset(1u64);
+        loop {
+            let fetch_message = timeout(Duration::from_secs(5), fetch_stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+            match fetch_message.message.unwrap() {
+                fetch_message::Message::Payload(payload) => {
+                    assert_eq!(
+                        payload.from_position_exclusive(),
+                        last_from_position_exclusive
+                    );
+                    last_from_position_exclusive = payload.to_position_inclusive();
+                    positions.push(payload.to_position_inclusive());
+                    for mrecord in crate::decoded_mrecords(payload.mrecord_batch.as_ref().unwrap())
+                    {
+                        if let MRecord::Doc(doc) = mrecord {
+                            docs.push(String::from_utf8(doc.to_vec()).unwrap());
+                        }
+                    }
+                }
+                fetch_message::Message::Eof(eof) => {
+                    assert_eq!(eof.eof_position(), Position::eof(4u64));
+                    break;
+                }
+            }
+        }
+        assert_eq!(docs, vec!["doc-2", "doc-3", "doc-4"]);
+        assert_eq!(positions.last(), Some(&Position::offset(4u64)));
+
+        // The log is fenced: the dead ingester cannot append anymore.
+        let reader = WalReader::new(storage.clone(), "dead-ingester");
+        let tail = reader.last_wal_id(WalId::ZERO).await.unwrap();
+        let footer = reader.read_footer(tail, None).await.unwrap();
+        assert!(footer.header.is_fence);
+        assert_eq!(footer.header.epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_fetch_stream_object_wal_fallback_waits_for_grace() {
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
+        let source_id = "test-source".to_string();
+        let shard_id = ShardId::from(1);
+        let queue_id = queue_id(&index_uid, &source_id, &shard_id);
+        write_dead_ingester_log(&storage, &queue_id, 1).await;
+
+        let fallback = ObjectWalFallback {
+            storage: storage.clone(),
+            grace: Duration::from_secs(3600),
+        };
+        let mut fetch_stream = MultiFetchStream::new(
+            "test-client".to_string(),
+            IngesterPool::default(),
+            RetryParams::for_test(),
+        )
+        .with_object_wal_fallback(fallback);
+        fetch_stream
+            .subscribe(
+                NodeId::from_str("dead-ingester"),
+                index_uid,
+                source_id,
+                shard_id,
+                Position::Beginning,
+            )
+            .await
+            .unwrap();
+        // Within the grace period, the stream keeps reporting the ingester as unavailable.
+        let error = timeout(Duration::from_secs(1), fetch_stream.next())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error.ingest_error, IngestV2Error::Unavailable(_)));
+        // ... and the log has not been fenced.
+        let reader = WalReader::new(storage, "dead-ingester");
+        let tail = reader.last_wal_id(WalId::ZERO).await.unwrap();
+        assert!(
+            !reader
+                .read_footer(tail, None)
+                .await
+                .unwrap()
+                .header
+                .is_fence
+        );
     }
 }

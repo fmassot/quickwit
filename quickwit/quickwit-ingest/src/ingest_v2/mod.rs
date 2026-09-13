@@ -23,6 +23,7 @@ pub(crate) mod metrics;
 mod models;
 mod mrecord;
 mod mrecordlog_utils;
+mod object_wal_acks;
 mod publish_tracker;
 mod rate_meter;
 mod router;
@@ -55,7 +56,7 @@ use serde::Serialize;
 use tracing::{error, info};
 use workbench::pending_subrequests;
 
-pub use self::fetch::{FetchStreamError, MultiFetchStream};
+pub use self::fetch::{FetchStreamError, MultiFetchStream, ObjectWalFallback};
 pub use self::helpers::{
     notify_ingester_decommission, try_get_ingester_status, wait_for_ingester_decommission,
     wait_for_ingester_status,
