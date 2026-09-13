@@ -559,13 +559,25 @@ mod tests {
         use quickwit_storage::RamStorage;
 
         use crate::actors::parquet_pipeline::{ParquetIndexer, ParquetPackager, ParquetUploader};
-        use crate::actors::{Publisher, UploaderType};
+        use crate::actors::{ParquetPublisher as Publisher, UploaderType};
 
         let universe = Universe::with_accelerated_time();
         let temp_dir = tempfile::tempdir().unwrap();
 
-        // Create ParquetUploader
-        let mock_metastore = MockMetastoreService::new();
+        // Create ParquetUploader with a real staging contract: spawned work is joined,
+        // so an unconfigured background mock is an error, not disposable test work.
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_stage_metrics_splits()
+            .times(1)
+            .returning(|request| {
+                assert_eq!(request.index_uid, Some(IndexUid::for_test("test-index", 0)));
+                assert_eq!(request.splits_metadata_json.len(), 1);
+                let split: quickwit_parquet_engine::split::ParquetSplitMetadata =
+                    serde_json::from_str(&request.splits_metadata_json[0]).unwrap();
+                assert_eq!(split.num_rows, 5);
+                Ok(quickwit_proto::metastore::EmptyResponse {})
+            });
         let ram_storage = StdArc::new(RamStorage::default());
         let (publisher_mailbox, _publisher_inbox) = universe.create_test_mailbox::<Publisher>();
         let sequencer_mailbox =
@@ -580,7 +592,7 @@ mod tests {
                 &quickwit_config::IndexingSettings::default(),
             ),
         );
-        let (uploader_mailbox, _uploader_handle) = universe.spawn_builder().spawn(uploader);
+        let (uploader_mailbox, uploader_handle) = universe.spawn_builder().spawn(uploader);
 
         // Create ParquetPackager
         let writer_config = ParquetWriterConfig::default();
@@ -650,6 +662,15 @@ mod tests {
         let packager_counters = packager_handle.process_pending_and_observe().await.state;
         assert_eq!(packager_counters.splits_produced.load(Ordering::Relaxed), 1);
 
+        uploader_handle.process_pending_and_observe().await;
+        uploader_handle
+            .mailbox()
+            .send_message_with_high_priority(quickwit_actors::Command::ExitWithSuccess)
+            .unwrap();
+        let (status, counters) = uploader_handle.join().await;
+        assert!(status.is_success(), "{status:?}");
+        assert_eq!(counters.num_staged_splits.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.num_uploaded_splits.load(Ordering::Relaxed), 1);
         universe.assert_quit().await;
     }
 }

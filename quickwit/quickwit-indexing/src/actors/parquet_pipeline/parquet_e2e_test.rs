@@ -41,7 +41,8 @@ use quickwit_storage::RamStorage;
 
 use crate::actors::sequencer::Sequencer;
 use crate::actors::{
-    ParquetDocProcessor, ParquetIndexer, ParquetPackager, ParquetUploader, Publisher, UploaderType,
+    ParquetDocProcessor, ParquetIndexer, ParquetPackager, ParquetPublisher as Publisher,
+    ParquetUploader, UploaderType,
 };
 use crate::models::{RawDocBatch, SharedPublishToken};
 

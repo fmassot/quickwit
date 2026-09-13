@@ -43,7 +43,7 @@ use crate::actors::pipeline_supervisor::{
     INDEXING_SPAWN_SEMAPHORE, Pipeline, PipelineActors, PipelineSupervisor, SourcePipeline,
     SourceState,
 };
-use crate::actors::{Publisher, Sequencer, UploaderType};
+use crate::actors::{ParquetPublisher as Publisher, Sequencer, UploaderType};
 use crate::models::IndexingStatistics;
 use crate::source::{SourceActor, SourceRuntime};
 
@@ -114,7 +114,7 @@ impl Pipeline for ParquetIndexing {
             self.source.publish_token.clone(),
         );
         if let Some(planner) = &self.params.parquet_merge_planner_mailbox_opt {
-            publisher = publisher.set_parquet_merge_planner_mailbox(planner.clone());
+            publisher = publisher.with_merge_planner(planner.clone());
         }
         let (publisher_mailbox, publisher) = actors.spawn(ctx.spawn_actor(), publisher);
         let (sequencer_mailbox, _) =

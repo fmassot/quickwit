@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use quickwit_parquet_engine::split::ParquetSplitMetadata;
-
-use super::parquet_merge_messages::ParquetMergeTask;
-use crate::models::SplitUpdate;
-
-/// Publication for Parquet metrics/sketch splits. It cannot be sent to a Tantivy publisher.
-pub type ParquetSplitsUpdate = SplitUpdate<ParquetSplitMetadata, ParquetMergeTask>;
+pub(crate) mod publisher;
+mod uploader;
+pub use publisher::TantivyPublisher;
+pub use uploader::{SplitsUpdateMailbox, TantivyUploader};

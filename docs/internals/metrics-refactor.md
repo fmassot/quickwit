@@ -76,6 +76,49 @@ the engine's `Running` state are only for observations and commands.
 owner waits for termination. `SpawnBuilder` is now nameable so the generation owner
 can install supervision around ordinary configured actor builders.
 
+## Typed publication and upload actors
+
+The common stages are generic actors, not Tantivy actors with extra Parquet handlers:
+
+| Shared actor | Engine-specific implementation |
+| --- | --- |
+| `Publisher<E: PublicationEngine>` | `tantivy/publisher.rs` and `parquet_pipeline/publisher.rs` |
+| `Uploader<E: UploadEngine>` | `tantivy/uploader.rs` and `parquet_pipeline/parquet_uploader.rs` |
+| `Sequencer<A>` | Orders delivery to the engine's typed publisher. |
+
+`PublicationEngine` associates split metadata, merge-task ownership, planner messages,
+and planner actor types. `SplitUpdate<Split, Task>` is the shared envelope. A Tantivy
+publisher cannot accept Parquet updates or connect to a Parquet planner; there is no
+alternate-engine mailbox or runtime engine flag inside the common publisher. Existing
+Tantivy `Publisher`/`Uploader` exports remain concrete aliases; Parquet pipelines use
+`ParquetPublisher`/`ParquetUploader`.
+
+The publisher owns locking, revoked-token retries with token refresh, source truncation,
+feedback, counters, and drain-time disconnection. Engines own validation, metastore
+operations, and storage-specific metrics/events. Merge tasks remain alive through both
+publication and feedback, including checkpoint-only updates.
+
+The uploader owns ordered-slot reservation, semaphore acquisition, counters, task
+ownership, and failure propagation. Engines prepare, stage, and store their artifacts:
+Tantivy retains its split bundle, recovery footer and cache behavior; Parquet retains
+its maturity policy, file layout and lifecycle events. Existing per-engine ingest/merge
+budgets and queue capacities are retained. Storage formats and wire protocols do not change.
+
+Upload workers are owned in a `JoinSet`: successful exit drains them, failure/cancellation
+aborts and joins them before final observations. Unstarted templates remain cloneable for
+the Tantivy delete-task supervisor; cloning outstanding worker sets is an invariant violation.
+A worker panic faults the generation,
+including direct-to-publisher pipelines. A failure during successful draining cannot
+become a successful actor exit. Closed publication edges now fail rather than warning
+and dropping a Parquet checkpoint. Only a deliberately revoked publish lock discards
+its reserved slot without publication. I/O already submitted to the OS or storage backend
+is not rolled back by local task cancellation; staged/orphan cleanup remains necessary.
+
+Document processing, indexing, packaging and merge algorithms remain separate concrete
+engine implementations. This extracts actual shared lifecycle behavior rather than
+forcing unlike algorithms into an abstract actor or introducing a graph DSL. Pipeline
+construction parameters and source/storage setup still need separate consolidation.
+
 ## One Parquet split lifecycle API
 
 `quickwit-metastore::ParquetSplits` binds a metastore client to an index incarnation
@@ -170,6 +213,33 @@ Uploader, merge and retention fixtures now use matching index incarnations and o
 list responses. The crash test now reseeds only committed splits (not failed staged
 outputs) and checks that every original input is replaced and visible row count is
 conserved. Trace/model invariants were not relaxed.
+
+The actor-separation follow-up passed **310 metrics-enabled indexing tests and five
+doctests**, **246 default indexing tests**, **181 janitor/serve tests**, and **11 failpoint
+tests**. One indexing unit test and one existing doctest remain ignored. Default CLI test
+compilation, formatting, and metrics/failpoints-enabled Clippy with warnings denied passed:
+
+```sh
+cargo test -p quickwit-indexing --features metrics --no-fail-fast
+cargo test -p quickwit-indexing
+cargo test -p quickwit-janitor -p quickwit-serve --features metrics
+cargo test -p quickwit-indexing --features metrics,fail/failpoints \
+  --test failpoints -- --test-threads=1
+cargo clippy -p quickwit-cli -p quickwit-indexing \
+  --features metrics,fail/failpoints --tests -- -D warnings
+```
+
+New coverage checks direct-upload faults/panics, ordered cancellation, resource release
+before actor termination, successful draining, failure during draining, and configuration-only
+cloning. Positive and compile-fail doctests verify engine-specific publication, upload and
+feedback edges. The worker-panic failpoint checks document conservation across restart;
+the existing post-spawn panic test now targets an actual failpoint and checks it fired.
+The downstream staging fixture now validates its five-row output instead of leaving an
+unconfigured mock in background work. One partitioning fixture uses real time to prevent
+a simulated timeout from splitting its explicit commit; timeout tests remain accelerated.
+The previously observed generation-count flakiness recurred in an intermediate full run;
+isolated and subsequent full runs passed. No fix for that flakiness is claimed, and generation
+and row-conservation assertions were not relaxed.
 
 No new EC2 run, PostgreSQL migration test, mixed-version cluster test, or network-level
 OTLP-to-SQL smoke test has been performed for this refactor. Live PostgreSQL tests were

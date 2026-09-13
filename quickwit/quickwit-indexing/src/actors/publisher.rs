@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Engine-independent publication actor. Engine implementations supply metastore
+//! operations and typed merge feedback, not another handler or lifecycle loop.
+
+use std::fmt::Debug;
 use std::time::Duration;
 
-use anyhow::Context;
 use async_trait::async_trait;
-use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Mailbox, QueueCapacity};
-use quickwit_metastore::checkpoint::IndexCheckpointDelta;
-use quickwit_proto::metastore::{MetastoreError, MetastoreResult, MetastoreServiceClient};
+use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
+use quickwit_proto::metastore::{MetastoreError, MetastoreResult};
 use serde::Serialize;
-use tracing::{error, warn};
+use tracing::{error, info, instrument, warn};
 
-use crate::actors::MergePlanner;
-use crate::models::{PublishLock, SharedPublishToken};
+use crate::models::{SharedPublishToken, SplitUpdate};
 use crate::source::{SourceActor, SuggestTruncate};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -33,195 +34,231 @@ pub struct PublisherCounters {
     pub num_empty_splits: u64,
 }
 
-/// Disconnect the merge planner loop back.
-/// This message is used to cut the merge pipeline loop, and let it terminate.
+/// The storage-specific part of publication. Split and feedback types are associated
+/// with the engine: a publisher cannot accidentally handle another engine's message.
+#[async_trait]
+pub trait PublicationEngine: Clone + Send + Sync + 'static {
+    type Split: Send + Sync + 'static;
+    type MergeTask: Send + Sync + 'static;
+    type NewSplits: Debug + Send + Sync + 'static;
+    type Planner: Actor + Handler<Self::NewSplits>;
+
+    fn split_id(split: &Self::Split) -> &str;
+    fn validate(&self, update: &Publication<Self>) -> anyhow::Result<()>;
+    async fn publish(
+        &self,
+        update: &Publication<Self>,
+        token: Option<String>,
+    ) -> MetastoreResult<()>;
+    fn record_published(&self, update: &Publication<Self>);
+    fn new_splits(splits: Vec<Self::Split>) -> Self::NewSplits;
+
+    // Engine-local failpoints; ordinary engines need no lifecycle hooks here.
+    fn before_publish(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn after_publish(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+pub type Publication<E> =
+    SplitUpdate<<E as PublicationEngine>::Split, <E as PublicationEngine>::MergeTask>;
+
+/// Cut the typed feedback edge so a merge pipeline can finish draining.
 #[derive(Debug)]
 pub(crate) struct DisconnectMergePlanner;
 
-#[derive(Clone)]
-pub struct Publisher {
-    pub(crate) name: &'static str,
-    pub(crate) queue_capacity: QueueCapacity,
-    pub(crate) metastore: MetastoreServiceClient,
-    pub(crate) merge_planner_mailbox_opt: Option<Mailbox<MergePlanner>>,
-    #[cfg(feature = "metrics")]
-    pub(crate) parquet_merge_planner_mailbox_opt:
-        Option<Mailbox<super::parquet_pipeline::ParquetMergePlanner>>,
-    #[cfg(feature = "metrics")]
-    pub(crate) parquet_split_kind_opt: Option<quickwit_parquet_engine::split::ParquetSplitKind>,
-    pub(crate) source_mailbox_opt: Option<Mailbox<SourceActor>>,
-    pub(crate) publish_token: SharedPublishToken,
-    pub(crate) counters: PublisherCounters,
+pub struct Publisher<E: PublicationEngine> {
+    engine: E,
+    name: &'static str,
+    queue_capacity: QueueCapacity,
+    merge_planner: Option<Mailbox<E::Planner>>,
+    source: Option<Mailbox<SourceActor>>,
+    publish_token: SharedPublishToken,
+    counters: PublisherCounters,
 }
 
-impl Publisher {
-    pub fn new(
+impl<E: PublicationEngine> Clone for Publisher<E> {
+    fn clone(&self) -> Self {
+        // Mailboxes are cloneable independently of their actor types.
+        Self {
+            engine: self.engine.clone(),
+            name: self.name,
+            queue_capacity: self.queue_capacity,
+            merge_planner: self.merge_planner.clone(),
+            source: self.source.clone(),
+            publish_token: self.publish_token.clone(),
+            counters: self.counters.clone(),
+        }
+    }
+}
+
+impl<E: PublicationEngine> Publisher<E> {
+    pub fn for_engine(
+        engine: E,
         name: &'static str,
         queue_capacity: QueueCapacity,
-        metastore: MetastoreServiceClient,
-        merge_planner_mailbox_opt: Option<Mailbox<MergePlanner>>,
-        source_mailbox_opt: Option<Mailbox<SourceActor>>,
+        merge_planner: Option<Mailbox<E::Planner>>,
+        source: Option<Mailbox<SourceActor>>,
         publish_token: SharedPublishToken,
-    ) -> Publisher {
-        Publisher {
+    ) -> Self {
+        Self {
+            engine,
             name,
             queue_capacity,
-            metastore,
-            merge_planner_mailbox_opt,
-            #[cfg(feature = "metrics")]
-            parquet_merge_planner_mailbox_opt: None,
-            #[cfg(feature = "metrics")]
-            parquet_split_kind_opt: None,
-            source_mailbox_opt,
+            merge_planner,
+            source,
             publish_token,
             counters: PublisherCounters::default(),
         }
     }
 
-    /// A Parquet publisher uses the configured kind even for checkpoint-only updates.
-    #[cfg(feature = "metrics")]
-    pub fn new_parquet(
-        split_kind: quickwit_parquet_engine::split::ParquetSplitKind,
-        queue_capacity: QueueCapacity,
-        metastore: MetastoreServiceClient,
-        source_mailbox_opt: Option<Mailbox<SourceActor>>,
-        publish_token: SharedPublishToken,
-    ) -> Publisher {
-        let mut publisher = Self::new(
-            super::parquet_pipeline::METRICS_PUBLISHER_NAME,
-            queue_capacity,
-            metastore,
-            None,
-            source_mailbox_opt,
-            publish_token,
-        );
-        publisher.parquet_split_kind_opt = Some(split_kind);
-        publisher
-    }
-
-    /// Sets the Parquet merge planner mailbox for merge feedback.
-    /// Post-construction setter because the Publisher is created before the
-    /// planner mailbox is available (bottom-up actor spawn order).
-    #[cfg(feature = "metrics")]
-    pub fn set_parquet_merge_planner_mailbox(
-        mut self,
-        mailbox: Mailbox<super::parquet_pipeline::ParquetMergePlanner>,
-    ) -> Self {
-        self.parquet_merge_planner_mailbox_opt = Some(mailbox);
+    /// Install the engine's typed feedback mailbox; no alternate-engine slot exists.
+    pub fn with_merge_planner(mut self, mailbox: Mailbox<E::Planner>) -> Self {
+        self.merge_planner = Some(mailbox);
         self
     }
 
-    /// Ends the pipeline this publisher belongs to. We do this by signaling the source to exit,
-    /// which will propagate the message downstream to the other actors.
-    pub(crate) async fn terminate_pipeline(
+    async fn publish_with_retry(
         &self,
-        ctx: &ActorContext<Publisher>,
-        publish_error: ActorExitStatus,
-        publish_lock: &PublishLock,
-        split_ids: &[String],
+        update: &Publication<E>,
+        ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
-        let Some(source_mailbox) = self.source_mailbox_opt.as_ref() else {
-            return Err(publish_error);
-        };
-        error!(
-            error=?publish_error,
-            split_ids=?split_ids,
-            "failed to publish splits, terminating the pipeline"
-        );
-        // The actor kill signal will propagate and eventually end up back here, and will try
-        // to publish before exiting, so we kill the publish lock to prevent one final flush.
-        publish_lock.kill().await;
-        let _ = ctx.send_exit_with_success(source_mailbox).await;
+        for (attempt, delay) in [
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(3)),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Assignment updates can refresh the token while an earlier attempt is in flight.
+            let token = self
+                .publish_token
+                .load()
+                .as_deref()
+                .map(|token| token.to_string());
+            let Err(error) = ctx.protect_future(self.engine.publish(update, token)).await else {
+                return Ok(());
+            };
+            if let Some(delay) = delay
+                && matches!(error, MetastoreError::InvalidPublishToken { .. })
+            {
+                warn!(%error, attempt = attempt + 1, "metastore publish failed, retrying");
+                ctx.protect_future(ctx.sleep(delay)).await;
+            } else {
+                return Err(anyhow::Error::from(error)
+                    .context("failed to publish splits")
+                    .into());
+            }
+        }
+        unreachable!("last publish attempt always returns")
+    }
+}
+
+#[async_trait]
+impl<E: PublicationEngine> Actor for Publisher<E> {
+    type ObservableState = PublisherCounters;
+    fn observable_state(&self) -> Self::ObservableState {
+        self.counters.clone()
+    }
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+    fn queue_capacity(&self) -> QueueCapacity {
+        self.queue_capacity
+    }
+}
+
+#[async_trait]
+impl<E: PublicationEngine> Handler<DisconnectMergePlanner> for Publisher<E> {
+    type Reply = ();
+    async fn handle(
+        &mut self,
+        _: DisconnectMergePlanner,
+        _: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        self.merge_planner = None;
         Ok(())
     }
 }
 
-pub(crate) fn is_invalid_publish_token(publish_error: &ActorExitStatus) -> bool {
-    let ActorExitStatus::Failure(error) = publish_error else {
-        return false;
-    };
-    matches!(
-        error.downcast_ref::<MetastoreError>(),
-        Some(MetastoreError::InvalidPublishToken { .. })
-    )
-}
+#[async_trait]
+impl<E: PublicationEngine> Handler<Publication<E>> for Publisher<E> {
+    type Reply = ();
 
-pub(crate) fn serialize_checkpoint_delta(
-    checkpoint_delta_opt: &Option<IndexCheckpointDelta>,
-) -> anyhow::Result<Option<String>> {
-    checkpoint_delta_opt
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .context("failed to serialize `IndexCheckpointDelta`")
-}
-
-pub(crate) async fn suggest_truncate(
-    ctx: &ActorContext<Publisher>,
-    source_mailbox_opt: &Option<Mailbox<SourceActor>>,
-    checkpoint_delta_opt: Option<IndexCheckpointDelta>,
-) {
-    if let Some(source_mailbox) = source_mailbox_opt.as_ref()
-        && let Some(checkpoint) = checkpoint_delta_opt
-    {
-        let _ = ctx
-            .send_message(
-                source_mailbox,
-                SuggestTruncate(checkpoint.source_delta.get_source_checkpoint()),
-            )
-            .await;
-    }
-}
-
-// This is used primarily for publisher-specific metastore retry logic, specifically to have a
-// handle on an invalid publish token, which will cause the pipeline to be terminated and not
-pub(crate) async fn publish_with_retry<T, F, Fut>(
-    ctx: &ActorContext<Publisher>,
-    operation_name: &str,
-    mut publish: F,
-) -> Result<(), ActorExitStatus>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = MetastoreResult<T>>,
-{
-    for retry_delay in [
-        Some(Duration::from_secs(1)),
-        Some(Duration::from_secs(3)),
-        None,
-    ] {
-        let Err(error) = ctx.protect_future(publish()).await else {
+    #[instrument(name = "publisher", parent = update.parent_span.id(), skip_all)]
+    async fn handle(
+        &mut self,
+        update: Publication<E>,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        self.engine.before_publish()?;
+        let split_ids: Vec<&str> = update.new_splits.iter().map(E::split_id).collect();
+        let Some(guard) = update.publish_lock.acquire().await else {
+            info!(?split_ids, "splits' publish lock is dead");
             return Ok(());
         };
-        let retryable = matches!(error, MetastoreError::InvalidPublishToken { .. });
-        match retry_delay {
-            Some(retry_delay) if retryable => {
-                warn!(%error, operation = operation_name, "metastore publish failed, retrying");
-                ctx.protect_future(ctx.sleep(retry_delay)).await;
+        self.engine.validate(&update)?;
+        let result = self.publish_with_retry(&update, ctx).await;
+        drop(guard);
+        if let Err(publish_error) = result {
+            if is_invalid_publish_token(&publish_error)
+                && let Some(source) = &self.source
+            {
+                error!(
+                    ?publish_error,
+                    ?split_ids,
+                    "failed to publish splits, terminating source pipeline"
+                );
+                // Prevent the terminating source from publishing its final flush on a revoked
+                // token.
+                update.publish_lock.kill().await;
+                let _ = ctx.send_exit_with_success(source).await;
+                return Ok(());
             }
-            _ => {
-                warn!(%error, operation = operation_name, retryable, "metastore publish failed, giving up after 3 tries");
-                return Err(anyhow::Error::from(error)
-                    .context(format!("failed to {operation_name}"))
-                    .into());
-            }
+            return Err(publish_error);
         }
+        self.engine.record_published(&update);
+        let empty = update.new_splits.is_empty();
+        let replacement = !update.replaced_split_ids.is_empty();
+        let SplitUpdate {
+            new_splits,
+            checkpoint_delta_opt,
+            merge_task,
+            ..
+        } = update;
+        // Commit is already durable. These notifications are advisory: a recipient
+        // may be shutting down, and its successor reloads checkpoints/published splits.
+        if let Some(source) = &self.source
+            && let Some(checkpoint) = checkpoint_delta_opt
+        {
+            let _ = ctx
+                .send_message(
+                    source,
+                    SuggestTruncate(checkpoint.source_delta.get_source_checkpoint()),
+                )
+                .await;
+        }
+        if !empty && let Some(planner) = &self.merge_planner {
+            let _ = ctx.send_message(planner, E::new_splits(new_splits)).await;
+        }
+        if empty {
+            self.counters.num_empty_splits += 1;
+        } else if replacement {
+            self.counters.num_replace_operations += 1;
+        } else {
+            self.counters.num_published_splits += 1;
+        }
+        self.engine.after_publish()?;
+        // The inventory guard and merge permit outlive both commit and feedback.
+        drop(merge_task);
+        Ok(())
     }
-    unreachable!("retry loop returns on the final attempt")
 }
 
-#[async_trait]
-impl Actor for Publisher {
-    type ObservableState = PublisherCounters;
-
-    fn observable_state(&self) -> Self::ObservableState {
-        self.counters.clone()
-    }
-
-    fn name(&self) -> String {
-        self.name.to_string()
-    }
-
-    fn queue_capacity(&self) -> QueueCapacity {
-        self.queue_capacity
-    }
+fn is_invalid_publish_token(error: &ActorExitStatus) -> bool {
+    matches!(error, ActorExitStatus::Failure(error)
+        if matches!(error.downcast_ref::<MetastoreError>(), Some(MetastoreError::InvalidPublishToken { .. })))
 }

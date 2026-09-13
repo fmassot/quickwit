@@ -44,7 +44,9 @@ use crate::actors::pipeline_supervisor::{
     DrainablePipeline, MERGE_SPAWN_SEMAPHORE, Pipeline, PipelineActors, PipelineSupervisor,
 };
 use crate::actors::publisher::DisconnectMergePlanner;
-use crate::actors::{MergeSchedulerService, Publisher, Sequencer, UploaderType};
+use crate::actors::{
+    MergeSchedulerService, ParquetPublisher as Publisher, Sequencer, UploaderType,
+};
 use crate::metrics::ONGOING_MERGE_OPERATIONS;
 use crate::models::{MergeStatistics, SharedPublishToken};
 pub const PARQUET_MERGE_SKIP_INITIAL_SEED_ENV_KEY: &str = "QW_PARQUET_MERGE_SKIP_INITIAL_SEED";
@@ -125,7 +127,7 @@ impl Pipeline for ParquetMerge {
             None,
             SharedPublishToken::default(),
         )
-        .set_parquet_merge_planner_mailbox(self.merge_planner_mailbox.clone());
+        .with_merge_planner(self.merge_planner_mailbox.clone());
         let (publisher_mailbox, publisher) = actors.spawn(ctx.spawn_actor(), publisher);
         let (sequencer_mailbox, _) =
             actors.spawn(ctx.spawn_actor(), Sequencer::new(publisher_mailbox));
