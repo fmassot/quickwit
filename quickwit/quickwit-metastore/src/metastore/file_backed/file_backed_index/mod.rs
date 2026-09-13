@@ -962,6 +962,20 @@ fn publish_parquet_splits(
         }
     }
 
+    // A merge must replace published inputs, just as in the PostgreSQL backend.
+    // Validate before mutating either set; missing inputs are not a successful merge.
+    for split_id in replaced_split_ids {
+        if !matches!(splits_map.get(split_id), Some(split) if split.state == SplitState::Published)
+        {
+            return Err(MetastoreError::FailedPrecondition {
+                entity: EntityKind::Splits {
+                    split_ids: vec![split_id.clone()],
+                },
+                message: format!("replacement input {split_id} is missing or not Published"),
+            });
+        }
+    }
+
     // Transition staged splits to Published
     for split_id in staged_split_ids {
         if let Some(split) = splits_map.get_mut(split_id) {

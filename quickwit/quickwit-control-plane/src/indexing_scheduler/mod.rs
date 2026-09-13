@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 
 use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Itertools;
-use quickwit_common::is_parquet_pipeline_index;
 use quickwit_common::pretty::PrettySample;
 use quickwit_config::{
     FileSourceParams, SourceParams, disable_ingest_v1, indexing_pipeline_params_fingerprint,
@@ -214,12 +213,15 @@ fn get_sources_to_schedule(
         if !source_config.enabled {
             continue;
         }
-        let params_fingerprint = model
-            .index_metadata(&source_uid.index_uid)
+        let index_metadata_opt = model.index_metadata(&source_uid.index_uid);
+        let params_fingerprint = index_metadata_opt
             .map(|index_meta| {
                 indexing_pipeline_params_fingerprint(&index_meta.index_config, source_config)
             })
             .unwrap_or_default();
+        let is_parquet_index = index_metadata_opt
+            .map(|index_meta| index_meta.index_config.index_type.is_parquet())
+            .unwrap_or(false);
         match source_config.source_params {
             SourceParams::File(FileSourceParams::Filepath(_))
             | SourceParams::IngestCli
@@ -232,9 +234,9 @@ fn get_sources_to_schedule(
                 if disable_ingest_v1 {
                     continue;
                 }
-                // Metrics indexes should use IngestV2 only, not IngestV1.
-                // The ParquetSourceLoader doesn't support IngestV1.
-                if is_parquet_pipeline_index(&source_uid.index_uid.index_id) {
+                // Parquet (metrics) indexes use ingest v2 only; the parquet source loader
+                // does not support ingest v1.
+                if is_parquet_index {
                     continue;
                 }
                 // TODO ingest v1 is scheduled differently

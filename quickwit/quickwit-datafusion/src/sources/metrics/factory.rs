@@ -88,10 +88,18 @@ impl TableProviderFactory for MetricsTableProviderFactory {
             cmd.location.clone()
         };
 
-        let (split_provider, index_uri) = self
-            .index_resolver
-            .resolve(&index_name, self.split_kind)
-            .await?;
+        let Some(resolved) = self.index_resolver.resolve(&index_name).await? else {
+            return Err(DataFusionError::Plan(format!(
+                "index '{index_name}' does not exist or is not a Parquet (metrics) index"
+            )));
+        };
+        if resolved.split_kind != self.split_kind {
+            return Err(DataFusionError::Plan(format!(
+                "index '{index_name}' holds {:?} splits, not {:?}",
+                resolved.split_kind, self.split_kind
+            )));
+        }
+        let (split_provider, index_uri) = (resolved.split_provider, resolved.index_uri);
 
         let arrow_schema: SchemaRef = Arc::new(cmd.schema.as_arrow().clone());
 

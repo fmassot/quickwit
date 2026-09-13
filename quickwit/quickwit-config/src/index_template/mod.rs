@@ -22,7 +22,7 @@ pub use serialize::{IndexTemplateV0_8, VersionedIndexTemplate};
 
 use crate::index_config::{IngestSettings, validate_index_config};
 use crate::{
-    DocMapping, IndexConfig, IndexingSettings, RetentionPolicy, SearchSettings,
+    DocMapping, IndexConfig, IndexType, IndexingSettings, RetentionPolicy, SearchSettings,
     validate_identifier, validate_index_id_pattern,
 };
 
@@ -35,6 +35,8 @@ pub type IndexIdPattern = String;
 pub struct IndexTemplate {
     pub template_id: IndexTemplateId,
     pub index_id_patterns: Vec<IndexIdPattern>,
+    /// Engine of all indexes created by this template, independent of their names.
+    pub index_type: IndexType,
     #[serde(default)]
     pub index_root_uri: Option<Uri>,
     #[serde(default)]
@@ -71,6 +73,7 @@ impl IndexTemplate {
 
         let index_config = IndexConfig {
             index_id,
+            index_type: self.index_type,
             index_uri,
             doc_mapping,
             indexing_settings: self.indexing_settings.clone(),
@@ -127,6 +130,7 @@ impl IndexTemplate {
             template_id: template_id.to_string(),
             index_root_uri: Some(Uri::for_test("ram:///indexes")),
             index_id_patterns,
+            index_type: IndexType::Tantivy,
             priority,
             description: Some("Test description.".to_string()),
             doc_mapping,
@@ -168,6 +172,7 @@ impl crate::TestableForRegression for IndexTemplate {
             template_id: template_id.to_string(),
             index_root_uri: Some(Uri::for_test("ram:///indexes")),
             index_id_patterns,
+            index_type: IndexType::Tantivy,
             priority: 100,
             description: Some("Test description.".to_string()),
             doc_mapping,
@@ -273,6 +278,32 @@ mod tests {
             index_config_foo.doc_mapping.doc_mapping_uid,
             index_config_bar.doc_mapping.doc_mapping_uid
         );
+    }
+
+    #[test]
+    fn test_index_template_type_is_independent_of_name() {
+        let root = Uri::for_test("ram:///indexes");
+        for explicit_type in [
+            None,
+            Some(IndexType::Tantivy),
+            Some(IndexType::Metrics),
+            Some(IndexType::Sketches),
+        ] {
+            let mut template = IndexTemplate::for_test("test-template", &["*"], 0);
+            template.index_type = explicit_type.unwrap_or_default();
+            let mut serialized = serde_json::to_value(&template).unwrap();
+            if explicit_type.is_none() {
+                serialized.as_object_mut().unwrap().remove("index_type");
+            }
+            let restored: IndexTemplate = serde_json::from_value(serialized).unwrap();
+            assert_eq!(restored, template);
+            for index_id in ["cpu", "metrics-cpu", "sketches-cpu"] {
+                let config = restored
+                    .apply_template(index_id.to_string(), &root)
+                    .unwrap();
+                assert_eq!(config.index_type, explicit_type.unwrap_or_default());
+            }
+        }
     }
 
     #[test]

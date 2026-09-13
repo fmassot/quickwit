@@ -514,6 +514,11 @@ PUT api/v1/indexes/<index id>/clear
 
 Clears index of ID `index id`: all splits will be deleted (metastore + storage) and all source checkpoints will be reset.
 
+For `metrics` and `sketches` indexes, this deletes Parquet splits in every state,
+including interrupted cleanup. Split cleanup failures return an error without resetting
+checkpoints; retry after resolving the failure. Quiesce writers before clearing: this
+operation does not fence ingestion or provide a snapshot.
+
 It returns an empty body.
 
 
@@ -525,9 +530,15 @@ DELETE api/v1/indexes/<index id>
 
 Delete index of ID `index id`.
 
+For `metrics` and `sketches` indexes, Parquet files and split records are cleaned up
+before deleting index metadata. Cleanup failures return an error and retain the index
+for retry. Quiesce writers before deletion.
+
 #### Response
 
 The response is the list of deleted split files; the content type is `application/json; charset=UTF-8.`
+For Parquet splits, `num_docs` is the row count, `file_name` ends in `.parquet`, and
+`uncompressed_docs_size_bytes` is `0` (unknown: original JSON size is not recorded).
 
 ```json
 [

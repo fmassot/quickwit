@@ -18,16 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use quickwit_common::{Progress, is_sketches_index};
-use quickwit_metastore::{
-    ListParquetSplitsQuery, PARQUET_SPLITS_PAGE_SIZE, ParquetSplitRecord, SplitState,
-    list_parquet_splits_page, list_parquet_splits_paginated,
-};
+use quickwit_common::Progress;
+use quickwit_metastore::{PARQUET_SPLITS_PAGE_SIZE, ParquetSplitRecord, ParquetSplits, SplitState};
 use quickwit_parquet_engine::split::ParquetSplitKind;
-use quickwit_proto::metastore::{
-    DeleteMetricsSplitsRequest, DeleteSketchSplitsRequest, MarkMetricsSplitsForDeletionRequest,
-    MarkSketchSplitsForDeletionRequest, MetastoreService, MetastoreServiceClient,
-};
+use quickwit_proto::metastore::MetastoreServiceClient;
 use quickwit_proto::types::IndexUid;
 use quickwit_storage::Storage;
 use time::OffsetDateTime;
@@ -69,10 +63,26 @@ impl ParquetSplitRemovalInfo {
     }
 }
 
+/// A Parquet index to garbage collect: its storage and which split table its splits live in.
+#[derive(Clone)]
+pub struct ParquetGcTarget {
+    pub storage: Arc<dyn Storage>,
+    pub split_kind: ParquetSplitKind,
+}
+
+impl ParquetGcTarget {
+    pub fn new(storage: Arc<dyn Storage>, split_kind: ParquetSplitKind) -> Self {
+        Self {
+            storage,
+            split_kind,
+        }
+    }
+}
+
 /// Runs garbage collection for parquet splits.
 #[instrument(skip_all, fields(num_indexes=%indexes.len()))]
 pub async fn run_parquet_garbage_collect(
-    indexes: HashMap<IndexUid, Arc<dyn Storage>>,
+    indexes: HashMap<IndexUid, ParquetGcTarget>,
     metastore: MetastoreServiceClient,
     staged_grace_period: Duration,
     deletion_grace_period: Duration,
@@ -87,10 +97,11 @@ pub async fn run_parquet_garbage_collect(
         OffsetDateTime::now_utc().unix_timestamp() - staged_grace_period.as_secs() as i64;
 
     let mut deletable_staged_splits = Vec::new();
-    for index_uid in indexes.keys() {
+    for (index_uid, target) in &indexes {
         let splits = list_parquet_splits(
             &metastore,
             index_uid,
+            target.split_kind,
             vec![SplitState::Staged],
             staged_cutoff,
             progress_opt,
@@ -104,10 +115,11 @@ pub async fn run_parquet_garbage_collect(
             OffsetDateTime::now_utc().unix_timestamp() - deletion_grace_period.as_secs() as i64;
 
         let mut splits_marked_for_deletion = Vec::new();
-        for index_uid in indexes.keys() {
+        for (index_uid, target) in &indexes {
             let splits = list_parquet_splits(
                 &metastore,
                 index_uid,
+                target.split_kind,
                 vec![SplitState::MarkedForDeletion],
                 deletion_cutoff,
                 progress_opt,
@@ -137,11 +149,12 @@ pub async fn run_parquet_garbage_collect(
     let deletion_cutoff =
         OffsetDateTime::now_utc().unix_timestamp() - deletion_grace_period.as_secs() as i64;
 
-    for (index_uid, storage) in &indexes {
+    for (index_uid, target) in &indexes {
         let batch_info = delete_marked_parquet_splits(
             &metastore,
             index_uid,
-            storage.clone(),
+            target.split_kind,
+            target.storage.clone(),
             deletion_cutoff,
             progress_opt,
         )
@@ -167,20 +180,19 @@ pub async fn run_parquet_garbage_collect(
 async fn list_parquet_splits(
     metastore: &MetastoreServiceClient,
     index_uid: &IndexUid,
+    kind: ParquetSplitKind,
     states: Vec<SplitState>,
     cutoff: i64,
     progress_opt: Option<&Progress>,
 ) -> anyhow::Result<Vec<ParquetSplitRecord>> {
-    let query = ListParquetSplitsQuery::for_index(index_uid.clone())
+    let catalog = ParquetSplits::new(metastore.clone(), index_uid.clone(), kind);
+    let query = catalog
+        .query()
         .with_split_states(states)
         .with_update_timestamp_lte(cutoff);
-    let kind = parquet_split_kind_for_index(index_uid);
-    protect_future(
-        progress_opt,
-        list_parquet_splits_paginated(metastore, kind, query),
-    )
-    .await
-    .context("failed to list parquet splits")
+    protect_future(progress_opt, catalog.list_all(query))
+        .await
+        .context("failed to list parquet splits")
 }
 
 /// Marks the given splits for deletion in the metastore, grouped by index.
@@ -193,43 +205,21 @@ async fn mark_splits_for_deletion(
         return Ok(());
     }
 
-    // Group split IDs by index_uid string, then resolve to IndexUid for the request.
-    let mut splits_by_index: HashMap<String, Vec<String>> = HashMap::new();
+    // Group by both index and kind; never infer the split table from an index name.
+    let mut splits_by_index: HashMap<(String, ParquetSplitKind), Vec<String>> = HashMap::new();
     for split in splits {
         splits_by_index
-            .entry(split.metadata.index_uid.clone())
+            .entry((split.metadata.index_uid.clone(), split.metadata.kind))
             .or_default()
             .push(split.metadata.split_id.to_string());
     }
 
-    for (index_uid_str, split_ids) in splits_by_index {
+    for ((index_uid_str, kind), split_ids) in splits_by_index {
         let index_uid: IndexUid = index_uid_str.parse()?;
-        let is_sketch = is_sketches_index(&index_uid.index_id);
+        let catalog = ParquetSplits::new(metastore.clone(), index_uid.clone(), kind);
         for split_ids_chunk in split_ids.chunks(PARQUET_SPLITS_PAGE_SIZE) {
-            let split_ids = split_ids_chunk.to_vec();
-            info!(index_uid=%index_uid, count=%split_ids.len(), "marking stale staged parquet splits for deletion");
-
-            if is_sketch {
-                protect_future(
-                    progress_opt,
-                    metastore.mark_sketch_splits_for_deletion(MarkSketchSplitsForDeletionRequest {
-                        index_uid: Some(index_uid.clone()),
-                        split_ids,
-                    }),
-                )
-                .await?;
-            } else {
-                protect_future(
-                    progress_opt,
-                    metastore.mark_metrics_splits_for_deletion(
-                        MarkMetricsSplitsForDeletionRequest {
-                            index_uid: Some(index_uid.clone()),
-                            split_ids,
-                        },
-                    ),
-                )
-                .await?;
-            }
+            info!(index_uid=%index_uid, count=%split_ids_chunk.len(), "marking stale staged parquet splits for deletion");
+            protect_future(progress_opt, catalog.mark_for_deletion(split_ids_chunk)).await?;
         }
     }
 
@@ -241,17 +231,18 @@ async fn mark_splits_for_deletion(
 async fn delete_marked_parquet_splits(
     metastore: &MetastoreServiceClient,
     index_uid: &IndexUid,
+    kind: ParquetSplitKind,
     storage: Arc<dyn Storage>,
     deletion_cutoff: i64,
     progress_opt: Option<&Progress>,
 ) -> anyhow::Result<ParquetSplitRemovalInfo> {
     let mut removal_info = ParquetSplitRemovalInfo::default();
 
-    let mut query = ListParquetSplitsQuery::for_index(index_uid.clone())
+    let catalog = ParquetSplits::new(metastore.clone(), index_uid.clone(), kind);
+    let mut query = catalog
+        .query()
         .with_split_states(vec![SplitState::MarkedForDeletion])
         .with_update_timestamp_lte(deletion_cutoff);
-
-    let kind = parquet_split_kind_for_index(index_uid);
 
     loop {
         let sleep_duration = if let Some(max_rate) = get_maximum_split_deletion_rate_per_sec() {
@@ -261,18 +252,7 @@ async fn delete_marked_parquet_splits(
         };
         let sleep_future = tokio::time::sleep(sleep_duration);
 
-        let page = match protect_future(
-            progress_opt,
-            list_parquet_splits_page(metastore, kind, &mut query),
-        )
-        .await
-        {
-            Ok(page) => page,
-            Err(err) => {
-                error!(index_uid=%index_uid, error=?err, "failed to list parquet splits");
-                break;
-            }
-        };
+        let page = protect_future(progress_opt, catalog.list_page(&mut query)).await?;
         let splits = page.splits;
 
         // The metastore helper advanced the cursor when the page was full.
@@ -286,6 +266,7 @@ async fn delete_marked_parquet_splits(
         let (batch_succeeded, batch_failed) = delete_parquet_splits_from_storage_and_metastore(
             metastore,
             index_uid,
+            kind,
             storage.as_ref(),
             &splits,
             progress_opt,
@@ -308,19 +289,12 @@ async fn delete_marked_parquet_splits(
     Ok(removal_info)
 }
 
-fn parquet_split_kind_for_index(index_uid: &IndexUid) -> ParquetSplitKind {
-    if is_sketches_index(&index_uid.index_id) {
-        ParquetSplitKind::Sketches
-    } else {
-        ParquetSplitKind::Metrics
-    }
-}
-
 /// Deletes a single batch of parquet splits from storage and metastore.
 /// Returns (succeeded, failed).
-async fn delete_parquet_splits_from_storage_and_metastore(
+pub(crate) async fn delete_parquet_splits_from_storage_and_metastore(
     metastore: &MetastoreServiceClient,
     index_uid: &IndexUid,
+    kind: ParquetSplitKind,
     storage: &dyn Storage,
     splits: &[ParquetSplitRecord],
     progress_opt: Option<&Progress>,
@@ -361,23 +335,8 @@ async fn delete_parquet_splits_from_storage_and_metastore(
 
     let batch_len = succeeded_stds.len();
     let ids_to_delete: Vec<String> = succeeded_stds.iter().map(|s| s.split_id.clone()).collect();
-    let metastore_result = if is_sketches_index(&index_uid.index_id) {
-        let delete_request = DeleteSketchSplitsRequest {
-            index_uid: Some(index_uid.clone()),
-            split_ids: ids_to_delete,
-        };
-        protect_future(progress_opt, metastore.delete_sketch_splits(delete_request)).await
-    } else {
-        let delete_request = DeleteMetricsSplitsRequest {
-            index_uid: Some(index_uid.clone()),
-            split_ids: ids_to_delete,
-        };
-        protect_future(
-            progress_opt,
-            metastore.delete_metrics_splits(delete_request),
-        )
-        .await
-    };
+    let catalog = ParquetSplits::new(metastore.clone(), index_uid.clone(), kind);
+    let metastore_result = protect_future(progress_opt, catalog.delete(&ids_to_delete)).await;
 
     if let Some(progress) = progress_opt {
         progress.record_progress();
@@ -423,7 +382,7 @@ mod tests {
 
     use super::*;
 
-    const TEST_INDEX: &str = "otel-metrics-v0_9";
+    const TEST_INDEX: &str = "cpu";
 
     fn test_index_uid() -> IndexUid {
         IndexUid::for_test(TEST_INDEX, 0)
@@ -447,8 +406,11 @@ mod tests {
         ListMetricsSplitsResponse::try_from_splits(splits).unwrap()
     }
 
-    fn test_indexes(storage: Arc<dyn Storage>) -> HashMap<IndexUid, Arc<dyn Storage>> {
-        HashMap::from([(test_index_uid(), storage)])
+    fn test_indexes(storage: Arc<dyn Storage>) -> HashMap<IndexUid, ParquetGcTarget> {
+        HashMap::from([(
+            test_index_uid(),
+            ParquetGcTarget::new(storage, ParquetSplitKind::Metrics),
+        )])
     }
 
     #[tokio::test]
@@ -538,6 +500,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sketch_gc_without_index_name_prefix() {
+        use quickwit_proto::metastore::ListSketchSplitsResponse;
+
+        let mut mock = MockMetastoreService::new();
+        mock.expect_list_metrics_splits().never();
+        mock.expect_mark_metrics_splits_for_deletion().never();
+        mock.expect_delete_metrics_splits().never();
+        let mut staged = make_split("staged", SplitState::Staged);
+        staged.metadata.kind = ParquetSplitKind::Sketches;
+        let response = ListSketchSplitsResponse::try_from_splits(&[staged.clone()]).unwrap();
+        mock.expect_list_sketch_splits()
+            .times(1)
+            .returning(move |_| Ok(response.clone()));
+        mock.expect_mark_sketch_splits_for_deletion()
+            .times(1)
+            .returning(|request| {
+                assert_eq!(request.index_uid().index_id, TEST_INDEX);
+                assert_eq!(request.split_ids, ["staged"]);
+                Ok(EmptyResponse {})
+            });
+        staged.state = SplitState::MarkedForDeletion;
+        let response = ListSketchSplitsResponse::try_from_splits(&[staged]).unwrap();
+        mock.expect_list_sketch_splits()
+            .times(1)
+            .returning(move |_| Ok(response.clone()));
+        mock.expect_delete_sketch_splits()
+            .times(1)
+            .returning(|request| {
+                assert_eq!(request.index_uid().index_id, TEST_INDEX);
+                assert_eq!(request.split_ids, ["staged"]);
+                Ok(EmptyResponse {})
+            });
+        let mut storage = MockStorage::new();
+        storage.expect_bulk_delete().times(1).returning(|paths| {
+            assert_eq!(paths, &[PathBuf::from("staged.parquet")]);
+            Ok(())
+        });
+        let result = run_parquet_garbage_collect(
+            HashMap::from([(
+                test_index_uid(),
+                ParquetGcTarget::new(Arc::new(storage), ParquetSplitKind::Sketches),
+            )]),
+            MetastoreServiceClient::from_mock(mock),
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.removed_split_count(), 1);
+        assert_eq!(result.failed_split_count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_parquet_gc_handles_partial_storage_failure() {
         let mut mock = MockMetastoreService::new();
 
@@ -546,8 +564,8 @@ mod tests {
             .returning(|_| Ok(ListMetricsSplitsResponse::empty()));
 
         let marked = vec![
-            make_split("ok-split", SplitState::MarkedForDeletion),
             make_split("fail-split", SplitState::MarkedForDeletion),
+            make_split("ok-split", SplitState::MarkedForDeletion),
         ];
         let resp = list_response(&marked);
         mock.expect_list_metrics_splits()
@@ -594,6 +612,34 @@ mod tests {
         assert_eq!(result.removed_split_count(), 1);
         assert_eq!(result.removed_bytes(), 1024);
         assert_eq!(result.failed_split_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_gc_listing_failure_is_not_success() {
+        use quickwit_proto::metastore::MetastoreError;
+
+        let mut mock = MockMetastoreService::new();
+        mock.expect_list_metrics_splits()
+            .times(1)
+            .return_once(|_| Ok(ListMetricsSplitsResponse::empty()));
+        mock.expect_list_metrics_splits()
+            .times(1)
+            .return_once(|_| Err(MetastoreError::Unavailable("offline".to_string())));
+        let error = run_parquet_garbage_collect(
+            test_indexes(Arc::new(MockStorage::new())),
+            MetastoreServiceClient::from_mock(mock),
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<MetastoreError>(),
+            Some(MetastoreError::Unavailable(_))
+        ));
     }
 
     #[tokio::test]

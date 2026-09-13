@@ -335,7 +335,7 @@ impl SourceActor {
 #[derive(Debug)]
 struct Loop;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Assignment {
     pub shard_ids: BTreeSet<ShardId>,
     /// ULID of the originating indexing plan, used as the publish token when (re)acquiring shards.

@@ -47,6 +47,8 @@ pub struct Publisher {
     #[cfg(feature = "metrics")]
     pub(crate) parquet_merge_planner_mailbox_opt:
         Option<Mailbox<super::parquet_pipeline::ParquetMergePlanner>>,
+    #[cfg(feature = "metrics")]
+    pub(crate) parquet_split_kind_opt: Option<quickwit_parquet_engine::split::ParquetSplitKind>,
     pub(crate) source_mailbox_opt: Option<Mailbox<SourceActor>>,
     pub(crate) publish_token: SharedPublishToken,
     pub(crate) counters: PublisherCounters,
@@ -68,10 +70,33 @@ impl Publisher {
             merge_planner_mailbox_opt,
             #[cfg(feature = "metrics")]
             parquet_merge_planner_mailbox_opt: None,
+            #[cfg(feature = "metrics")]
+            parquet_split_kind_opt: None,
             source_mailbox_opt,
             publish_token,
             counters: PublisherCounters::default(),
         }
+    }
+
+    /// A Parquet publisher uses the configured kind even for checkpoint-only updates.
+    #[cfg(feature = "metrics")]
+    pub fn new_parquet(
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind,
+        queue_capacity: QueueCapacity,
+        metastore: MetastoreServiceClient,
+        source_mailbox_opt: Option<Mailbox<SourceActor>>,
+        publish_token: SharedPublishToken,
+    ) -> Publisher {
+        let mut publisher = Self::new(
+            super::parquet_pipeline::METRICS_PUBLISHER_NAME,
+            queue_capacity,
+            metastore,
+            None,
+            source_mailbox_opt,
+            publish_token,
+        );
+        publisher.parquet_split_kind_opt = Some(split_kind);
+        publisher
     }
 
     /// Sets the Parquet merge planner mailbox for merge feedback.

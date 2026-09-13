@@ -27,11 +27,11 @@ use async_trait::async_trait;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
 use quickwit_common::spawn_named_task;
 use quickwit_dst::events::merge_pipeline::{MergePipelineEvent, record_merge_pipeline_event};
-use quickwit_metastore::StageParquetSplitsRequestExt;
+use quickwit_metastore::ParquetSplits;
 use quickwit_metrics::{gauge, label_values};
 use quickwit_parquet_engine::merge::policy::ParquetMergePolicy;
-use quickwit_parquet_engine::split::{ParquetSplitKind, ParquetSplitMetadata};
-use quickwit_proto::metastore::{MetastoreService, MetastoreServiceClient};
+use quickwit_parquet_engine::split::ParquetSplitMetadata;
+use quickwit_proto::metastore::MetastoreServiceClient;
 use quickwit_storage::Storage;
 use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
 use tracing::{Instrument, Span, debug, info, instrument, warn};
@@ -52,35 +52,12 @@ async fn stage_splits(
     index_uid: quickwit_proto::types::IndexUid,
     splits: &[ParquetSplitMetadata],
 ) -> anyhow::Result<()> {
-    if splits.is_empty() {
+    let Some(first) = splits.first() else {
         return Ok(());
-    }
-
-    // All splits in a batch must be the same kind (metrics or sketches).
-    // The pipeline guarantees this since each index uses a single SplitWriterKind.
-    let kind = splits[0].kind;
-    debug_assert!(
-        splits.iter().all(|s| s.kind == kind),
-        "mixed split types in a single batch"
-    );
-
-    match kind {
-        ParquetSplitKind::Sketches => {
-            let stage_request =
-                quickwit_proto::metastore::StageSketchSplitsRequest::try_from_splits_metadata(
-                    index_uid, splits,
-                )?;
-            metastore.stage_sketch_splits(stage_request).await?;
-        }
-        ParquetSplitKind::Metrics => {
-            let stage_request =
-                quickwit_proto::metastore::StageMetricsSplitsRequest::try_from_splits_metadata(
-                    index_uid, splits,
-                )?;
-            metastore.stage_metrics_splits(stage_request).await?;
-        }
-    }
-
+    };
+    ParquetSplits::new(metastore, index_uid, first.kind)
+        .stage(splits)
+        .await?;
     Ok(())
 }
 
@@ -399,6 +376,7 @@ impl Handler<ParquetSplitBatch> for ParquetUploader {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use quickwit_actors::{ObservationType, Universe};
+    use quickwit_metastore::StageParquetSplitsRequestExt;
     use quickwit_metastore::checkpoint::{IndexCheckpointDelta, SourceCheckpointDelta};
     use quickwit_parquet_engine::split::{ParquetSplitMetadata, TimeRange};
     use quickwit_proto::metastore::{EmptyResponse, MockMetastoreService};
@@ -409,9 +387,9 @@ mod tests {
     use crate::actors::{Publisher, Sequencer};
     use crate::models::PublishLock;
 
-    fn create_test_metrics_split(index_uid: &str, split_id: &str) -> ParquetSplitMetadata {
+    fn create_test_metrics_split(index_id: &str, split_id: &str) -> ParquetSplitMetadata {
         ParquetSplitMetadata::metrics_builder()
-            .index_uid(index_uid)
+            .index_uid(IndexUid::for_test(index_id, 0).to_string())
             .split_id(quickwit_parquet_engine::split::ParquetSplitId::new(
                 split_id,
             ))
@@ -489,7 +467,7 @@ mod tests {
             source_delta: SourceCheckpointDelta::from_range(0..10),
         };
         let batch = ParquetSplitBatch {
-            index_uid: IndexUid::new_with_random_ulid("test-index"),
+            index_uid: IndexUid::for_test("test-index", 0),
             splits,
             output_dir: temp_dir.path().to_path_buf(),
             checkpoint_delta_opt: Some(checkpoint_delta),
@@ -587,7 +565,7 @@ mod tests {
             source_delta: SourceCheckpointDelta::from_range(0..10),
         };
         let batch = ParquetSplitBatch {
-            index_uid: IndexUid::new_with_random_ulid("test-index"),
+            index_uid: IndexUid::for_test("test-index", 0),
             splits,
             output_dir: temp_dir.path().to_path_buf(),
             checkpoint_delta_opt: Some(checkpoint_delta),
@@ -741,7 +719,7 @@ mod tests {
                 source_delta: SourceCheckpointDelta::from_range((i * 10)..(i * 10 + 10)),
             };
             let batch = ParquetSplitBatch {
-                index_uid: IndexUid::new_with_random_ulid("test-index"),
+                index_uid: IndexUid::for_test("test-index", 0),
                 splits,
                 output_dir: temp_dir.path().to_path_buf(),
                 checkpoint_delta_opt: Some(checkpoint_delta),

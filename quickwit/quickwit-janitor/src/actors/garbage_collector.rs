@@ -19,9 +19,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use quickwit_actors::{Actor, ActorContext, Handler};
-use quickwit_common::is_parquet_pipeline_index;
 use quickwit_common::shared_consts::split_deletion_grace_period;
-use quickwit_index_management::{GcMetrics, run_garbage_collect, run_parquet_garbage_collect};
+use quickwit_index_management::{
+    GcMetrics, ParquetGcTarget, run_garbage_collect, run_parquet_garbage_collect,
+};
 use quickwit_metastore::ListIndexesMetadataResponseExt;
 use quickwit_metrics::{counter, label_names, label_values};
 use quickwit_proto::metastore::{
@@ -158,12 +159,13 @@ impl GarbageCollector {
 
         // Resolve storages and split into tantivy vs parquet indexes.
         let mut tantivy_storages: HashMap<IndexUid, Arc<dyn Storage>> = HashMap::new();
-        let mut parquet_storages: HashMap<IndexUid, Arc<dyn Storage>> = HashMap::new();
+        let mut parquet_storages: HashMap<IndexUid, ParquetGcTarget> = HashMap::new();
 
         let resolved: Vec<_> = stream::iter(indexes).filter_map(|index| {
             let storage_resolver = self.storage_resolver.clone();
             async move {
                 let index_uid = index.index_uid.clone();
+                let index_type = index.index_config.index_type;
                 let index_uri = index.index_uri();
                 let storage = match storage_resolver.resolve(index_uri).await {
                     Ok(storage) => storage,
@@ -172,15 +174,20 @@ impl GarbageCollector {
                         return None;
                     }
                 };
-                Some((index_uid, storage))
+                Some((index_uid, index_type, storage))
             }}).collect()
             .await;
 
         self.counters.num_failed_storage_resolution += expected_count - resolved.len();
 
-        for (index_uid, storage) in resolved {
-            if is_parquet_pipeline_index(&index_uid.index_id) {
-                parquet_storages.insert(index_uid, storage);
+        for (index_uid, index_type, storage) in resolved {
+            if index_type.is_parquet() {
+                let split_kind = if index_type.is_sketches() {
+                    quickwit_parquet_engine::split::ParquetSplitKind::Sketches
+                } else {
+                    quickwit_parquet_engine::split::ParquetSplitKind::Metrics
+                };
+                parquet_storages.insert(index_uid, ParquetGcTarget::new(storage, split_kind));
             } else {
                 tantivy_storages.insert(index_uid, storage);
             }
@@ -886,11 +893,9 @@ mod tests {
         let mut mock = MockMetastoreService::new();
 
         mock.expect_list_indexes_metadata().times(1).returning(|_| {
-            let indexes = vec![IndexMetadata::for_test(
-                "otel-metrics-v0_1",
-                "ram://indexes/otel-metrics-v0_1",
-            )];
-            Ok(ListIndexesMetadataResponse::for_test(indexes))
+            let mut index = IndexMetadata::for_test("cpu", "ram://indexes/cpu");
+            index.index_config.index_type = quickwit_config::IndexType::Metrics;
+            Ok(ListIndexesMetadataResponse::for_test(vec![index]))
         });
 
         let marked_split = ParquetSplitRecord {
@@ -898,7 +903,7 @@ mod tests {
             update_timestamp: 0,
             metadata: ParquetSplitMetadata::metrics_builder()
                 .split_id(ParquetSplitId::new("metrics_aaa"))
-                .index_uid("otel-metrics-v0_1:00000000000000000000000000")
+                .index_uid("cpu:00000000000000000000000000")
                 .time_range(TimeRange::new(1000, 2000))
                 .num_rows(10)
                 .size_bytes(512)

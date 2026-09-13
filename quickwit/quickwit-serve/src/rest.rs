@@ -999,6 +999,7 @@ mod tests {
             ingester_opt: None,
             janitor_service_opt: None,
             otlp_logs_service_opt: None,
+            otlp_metrics_service_opt: None,
             otlp_traces_service_opt: None,
             metastore_client,
             metastore_server_opt: None,

@@ -410,12 +410,44 @@ fn prepend_at_char(schedule: &str) -> String {
     trimmed_schedule.to_string()
 }
 
+/// Which storage engine and indexing pipeline an index uses.
+///
+/// `tantivy` (the default) is the inverted-index engine used for logs and traces. `metrics`
+/// and `sketches` use the Parquet/DataFusion pipeline (`quickwit-parquet-engine`), the latter
+/// with sketch-specific processors and writers.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexType {
+    #[default]
+    Tantivy,
+    Metrics,
+    Sketches,
+}
+
+impl IndexType {
+    pub fn is_tantivy(&self) -> bool {
+        matches!(self, IndexType::Tantivy)
+    }
+
+    /// Whether the index is stored as Parquet and indexed by the Parquet pipeline.
+    pub fn is_parquet(&self) -> bool {
+        !self.is_tantivy()
+    }
+
+    pub fn is_sketches(&self) -> bool {
+        matches!(self, IndexType::Sketches)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[serde(into = "VersionedIndexConfig")]
 #[serde(try_from = "VersionedIndexConfig")]
 pub struct IndexConfig {
     pub index_id: IndexId,
+    pub index_type: IndexType,
     pub index_uri: Uri,
     pub doc_mapping: DocMapping,
     pub indexing_settings: IndexingSettings,
@@ -525,6 +557,7 @@ impl IndexConfig {
         };
         IndexConfig {
             index_id: index_id.to_string(),
+            index_type: IndexType::default(),
             index_uri,
             doc_mapping,
             indexing_settings,
@@ -636,6 +669,7 @@ impl crate::TestableForRegression for IndexConfig {
         });
         IndexConfig {
             index_id: "my-index".to_string(),
+            index_type: IndexType::default(),
             index_uri: Uri::for_test("s3://quickwit-indexes/my-index"),
             doc_mapping,
             indexing_settings,

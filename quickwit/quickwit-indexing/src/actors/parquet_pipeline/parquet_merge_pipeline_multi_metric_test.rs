@@ -118,7 +118,9 @@ fn make_multi_metric_split_metadata(
     let table_config = TableConfig::default();
     let mut builder = ParquetSplitMetadata::metrics_builder()
         .split_id(ParquetSplitId::new(split_id))
-        .index_uid("test-merge-index-multi:00000000000000000000000001")
+        .index_uid(
+            quickwit_proto::types::IndexUid::for_test("test-merge-index-multi", 0).to_string(),
+        )
         .partition_id(0)
         .time_range(TimeRange::new(ts_start, ts_end))
         .num_rows(num_rows)
@@ -463,6 +465,7 @@ fn make_pipeline_params(
 
     ParquetMergePipelineParams {
         index_uid: quickwit_proto::types::IndexUid::for_test("test-merge-index-multi", 0),
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage,

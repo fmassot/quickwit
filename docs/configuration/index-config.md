@@ -69,6 +69,27 @@ retention:
 
 The index ID is a string that uniquely identifies the index within the metastore. It may only contain uppercase or lowercase ASCII letters, digits, hyphens (`-`), and underscores (`_`). Finally, it must start with a letter and contain at least 3 characters but no more than 255.
 
+## Index type
+
+`index_type` selects the storage engine independently of the index ID:
+
+- `tantivy`: inverted-index storage for logs and traces (default).
+- `metrics`: Parquet storage for metric samples, queried with DataFusion.
+- `sketches`: Parquet storage for DDSketch distributions, queried with DataFusion.
+
+Parquet ingestion requires a binary built with the `metrics` Cargo feature. For example,
+`index_id: cpu` with `index_type: metrics` uses the metrics pipeline without a special name.
+Index templates also accept `index_type`. An existing index's type cannot be changed;
+create a new index to switch engines.
+
+Index names have **no engine-selection semantics**. Omitting `index_type` always means
+`tantivy`, even for names such as `otel-metrics-*` or `sketches-*`.
+
+This intentionally breaks the metrics POC's prefix-based configuration. Recreate POC
+metrics/sketch indexes with an explicit type and reingest their data; no automatic
+metadata migration or mixed-version compatibility is provided. Existing Tantivy
+configuration defaults are unchanged.
+
 ## Index uri
 
 The index-uri defines where the index files (also called splits) should be stored.

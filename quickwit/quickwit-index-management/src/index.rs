@@ -45,7 +45,10 @@ use crate::garbage_collection::{
     DeleteSplitsError, SplitRemovalInfo, delete_splits_from_storage_and_metastore,
     run_garbage_collect,
 };
-use crate::parquet_garbage_collection::{ParquetSplitRemovalInfo, run_parquet_garbage_collect};
+use crate::parquet_garbage_collection::{
+    ParquetGcTarget, ParquetSplitRemovalInfo, run_parquet_garbage_collect,
+};
+use crate::parquet_index::delete_parquet_index_splits;
 
 #[derive(Error, Debug)]
 pub enum IndexServiceError {
@@ -210,8 +213,27 @@ impl IndexService {
             .await?
             .deserialize_index_metadata()?;
         let index_uid = index_metadata.index_uid.clone();
-        let index_uri = index_metadata.into_index_config().index_uri.clone();
-        let storage = self.storage_resolver.resolve(&index_uri).await?;
+        let storage = self
+            .storage_resolver
+            .resolve(index_metadata.index_uri())
+            .await?;
+        if index_metadata.index_config.index_type.is_parquet() {
+            let deleted_splits = delete_parquet_index_splits(
+                self.metastore.clone(),
+                &index_metadata,
+                storage.as_ref(),
+                dry_run,
+            )
+            .await?;
+            if !dry_run {
+                self.metastore
+                    .delete_index(DeleteIndexRequest {
+                        index_uid: Some(index_uid),
+                    })
+                    .await?;
+            }
+            return Ok(deleted_splits);
+        }
 
         if dry_run {
             let list_splits_request = ListSplitsRequest::try_from_index_uid(index_uid)?;
@@ -431,8 +453,17 @@ impl IndexService {
             .resolve(&index_config.index_uri)
             .await?;
 
+        anyhow::ensure!(
+            index_config.index_type.is_parquet(),
+            "index `{index_id}` is not a Parquet index"
+        );
+        let split_kind = if index_config.index_type.is_sketches() {
+            quickwit_parquet_engine::split::ParquetSplitKind::Sketches
+        } else {
+            quickwit_parquet_engine::split::ParquetSplitKind::Metrics
+        };
         let deleted_entries = run_parquet_garbage_collect(
-            HashMap::from([(index_uid, storage)]),
+            HashMap::from([(index_uid, ParquetGcTarget::new(storage, split_kind))]),
             self.metastore.clone(),
             grace_period,
             // deletion_grace_period of zero, so that a cli call directly deletes splits after
@@ -468,33 +499,43 @@ impl IndexService {
             .storage_resolver
             .resolve(index_metadata.index_uri())
             .await?;
-        let list_splits_request = ListSplitsRequest::try_from_index_uid(index_uid.clone())?;
-        let splits_metadata: Vec<SplitMetadata> = self
-            .metastore
-            .list_splits(list_splits_request)
-            .await?
-            .collect_splits_metadata()
+        if index_metadata.index_config.index_type.is_parquet() {
+            delete_parquet_index_splits(
+                self.metastore.clone(),
+                &index_metadata,
+                storage.as_ref(),
+                false,
+            )
             .await?;
-        let split_ids: Vec<SplitId> = splits_metadata
-            .iter()
-            .map(|split| split.split_id.clone())
-            .collect();
-        let mark_splits_for_deletion_request =
-            MarkSplitsForDeletionRequest::new(index_uid.clone(), split_ids.clone());
-        self.metastore
-            .mark_splits_for_deletion(mark_splits_for_deletion_request)
-            .await?;
-        // FIXME: return an error.
-        if let Err(err) = delete_splits_from_storage_and_metastore(
-            index_uid.clone(),
-            storage,
-            self.metastore.clone(),
-            splits_metadata,
-            None,
-        )
-        .await
-        {
-            error!(metastore_endpoints=?self.metastore.endpoints(), index_id=%index_id, error=?err, "failed to delete all the split files during garbage collection");
+        } else {
+            let list_splits_request = ListSplitsRequest::try_from_index_uid(index_uid.clone())?;
+            let splits_metadata: Vec<SplitMetadata> = self
+                .metastore
+                .list_splits(list_splits_request)
+                .await?
+                .collect_splits_metadata()
+                .await?;
+            let split_ids: Vec<SplitId> = splits_metadata
+                .iter()
+                .map(|split| split.split_id.clone())
+                .collect();
+            let mark_splits_for_deletion_request =
+                MarkSplitsForDeletionRequest::new(index_uid.clone(), split_ids.clone());
+            self.metastore
+                .mark_splits_for_deletion(mark_splits_for_deletion_request)
+                .await?;
+            // FIXME: return an error.
+            if let Err(err) = delete_splits_from_storage_and_metastore(
+                index_uid.clone(),
+                storage,
+                self.metastore.clone(),
+                splits_metadata,
+                None,
+            )
+            .await
+            {
+                error!(metastore_endpoints=?self.metastore.endpoints(), index_id=%index_id, error=?err, "failed to delete all the split files during garbage collection");
+            }
         }
         for source_id in index_metadata.sources.keys() {
             let reset_source_checkpoint_request = ResetSourceCheckpointRequest {

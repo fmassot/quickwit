@@ -40,33 +40,17 @@ use datafusion::arrow;
 use datafusion::catalog::{MemorySchemaProvider, SchemaProvider, TableProviderFactory};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use quickwit_common::{is_metrics_index, is_parquet_pipeline_index, is_sketches_index};
 use quickwit_df_core::{
     QuickwitRuntimePlugin, QuickwitRuntimeRegistration, QuickwitSubstraitConsumerExt,
 };
 use quickwit_parquet_engine::split::ParquetSplitKind;
-use quickwit_proto::metastore::{MetastoreError, MetastoreServiceClient};
+use quickwit_proto::metastore::MetastoreServiceClient;
 
 use self::factory::{METRICS_FILE_TYPE, MetricsTableProviderFactory, SKETCHES_FILE_TYPE};
 use self::index_resolver::{MetastoreIndexResolver, MetricsIndexResolver};
 use self::optimizer::SortedSeriesStreamingAggregateRule;
 use self::sketch_udf::{create_dd_quantile_udf, create_dd_sketch_udaf};
 use self::table_provider::MetricsTableProvider;
-
-/// Returns `true` when `err` wraps a [`MetastoreError::NotFound`].
-///
-/// Used to distinguish "this data source does not own that index" (caller
-/// should try the next source) from a genuine metastore failure that should
-/// be surfaced to the user.
-fn is_index_not_found(err: &datafusion::error::DataFusionError) -> bool {
-    match err {
-        datafusion::error::DataFusionError::External(boxed) => boxed
-            .downcast_ref::<MetastoreError>()
-            .map(|me| matches!(me, MetastoreError::NotFound(_)))
-            .unwrap_or(false),
-        _ => false,
-    }
-}
 
 /// Runtime/Substrait integration for OSS parquet metrics.
 ///
@@ -100,42 +84,19 @@ impl MetricsDataSource {
     }
 }
 
+/// Resolves `index_name` through the metastore; `None` if it is not a Parquet index. The
+/// table schema is `schema_hint` if given, else the minimal schema of the index's split kind.
 async fn resolve_metrics_table_provider(
     index_resolver: &dyn MetricsIndexResolver,
     index_name: &str,
-    schema: SchemaRef,
-    split_kind: ParquetSplitKind,
+    schema_hint: Option<SchemaRef>,
 ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-    // Only claim indexes backed by the parquet pipeline. This
-    // remains a naming-prefix check today so sibling sources can coexist
-    // without racing to claim every index.
-    if !is_parquet_pipeline_index(index_name) {
+    let Some(resolved) = index_resolver.resolve(index_name).await? else {
         return Ok(None);
-    }
-
-    match index_resolver.resolve(index_name, split_kind).await {
-        Ok((split_provider, index_uri)) => {
-            let provider = MetricsTableProvider::new(schema, split_provider, index_uri)?;
-            Ok(Some(Arc::new(provider)))
-        }
-        Err(err) => {
-            if is_index_not_found(&err) {
-                Ok(None)
-            } else {
-                Err(err)
-            }
-        }
-    }
-}
-
-fn split_kind_from_index_name(index_name: &str) -> Option<ParquetSplitKind> {
-    if is_metrics_index(index_name) {
-        Some(ParquetSplitKind::Metrics)
-    } else if is_sketches_index(index_name) {
-        Some(ParquetSplitKind::Sketches)
-    } else {
-        None
-    }
+    };
+    let schema = schema_hint.unwrap_or_else(|| minimal_schema_for_kind(resolved.split_kind));
+    let provider = MetricsTableProvider::new(schema, resolved.split_provider, resolved.index_uri)?;
+    Ok(Some(Arc::new(provider)))
 }
 
 /// Minimal 4-column schema — always present in every OSS metrics parquet file.
@@ -200,8 +161,7 @@ impl SchemaProvider for MetricsSchemaProvider {
         let mut names = self.ddl_tables.table_names();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                if let Ok(mut resolved_names) = resolver.list_index_names().await {
-                    resolved_names.retain(|id| is_parquet_pipeline_index(id));
+                if let Ok(mut resolved_names) = resolver.list_parquet_index_names().await {
                     names.append(&mut resolved_names);
                 }
             })
@@ -216,16 +176,7 @@ impl SchemaProvider for MetricsSchemaProvider {
             return Ok(Some(provider));
         }
 
-        let Some(split_kind) = split_kind_from_index_name(name) else {
-            return Ok(None);
-        };
-        resolve_metrics_table_provider(
-            self.index_resolver.as_ref(),
-            name,
-            minimal_schema_for_kind(split_kind),
-            split_kind,
-        )
-        .await
+        resolve_metrics_table_provider(self.index_resolver.as_ref(), name, None).await
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -319,20 +270,11 @@ impl QuickwitSubstraitConsumerExt for MetricsDataSource {
         };
         let index_name = index_name.as_str();
 
-        let Some(split_kind) = split_kind_from_index_name(index_name) else {
-            return Ok(None);
-        };
-
         // Use the producer-declared schema if available; fall back to the
         // minimal schema for the index family.
-        let schema = schema_hint.unwrap_or_else(|| minimal_schema_for_kind(split_kind));
-        let provider = resolve_metrics_table_provider(
-            self.index_resolver.as_ref(),
-            index_name,
-            schema,
-            split_kind,
-        )
-        .await?;
+        let provider =
+            resolve_metrics_table_provider(self.index_resolver.as_ref(), index_name, schema_hint)
+                .await?;
         Ok(provider.map(|provider| (index_name.to_string(), provider)))
     }
 }

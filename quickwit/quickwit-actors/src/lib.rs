@@ -53,7 +53,7 @@ pub use actor_handle::{ActorHandle, Health, Healthz, Supervisable};
 pub use command::{Command, Observe};
 pub use observation::{Observation, ObservationType};
 use quickwit_common::KillSwitch;
-pub use spawn_builder::SpawnContext;
+pub use spawn_builder::{SpawnBuilder, SpawnContext};
 use thiserror::Error;
 use tracing::{info, warn};
 pub use universe::Universe;

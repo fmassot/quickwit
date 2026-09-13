@@ -29,6 +29,7 @@ mod error;
 mod metastore;
 mod metastore_factory;
 mod metastore_resolver;
+mod parquet;
 mod split_metadata;
 mod split_metadata_version;
 #[cfg(test)]
@@ -47,13 +48,13 @@ pub use metastore::{
     IndexMetadataResponseExt, IndexesMetadataResponseExt, ListIndexesMetadataResponseExt,
     ListParquetSplitsQuery, ListParquetSplitsRequestExt, ListParquetSplitsResponseExt,
     ListSplitsQuery, ListSplitsRequestExt, ListSplitsResponseExt, MetastoreServiceExt,
-    MetastoreServiceStreamSplitsExt, PARQUET_SPLITS_PAGE_SIZE, ParquetSplitRecord,
-    ParquetSplitsPage, PublishParquetSplitsRequestExt, PublishSplitsRequestExt, SortBy,
-    StageParquetSplitsRequestExt, StageSplitsRequestExt, UpdateIndexRequestExt,
-    UpdateSourceRequestExt, file_backed, list_parquet_splits_page, list_parquet_splits_paginated,
+    MetastoreServiceStreamSplitsExt, ParquetSplitRecord, PublishParquetSplitsRequestExt,
+    PublishSplitsRequestExt, SortBy, StageParquetSplitsRequestExt, StageSplitsRequestExt,
+    UpdateIndexRequestExt, UpdateSourceRequestExt, file_backed,
 };
 pub use metastore_factory::{MetastoreFactory, MetastoreFactoryOptions, UnsupportedMetastore};
 pub use metastore_resolver::MetastoreResolver;
+pub use parquet::{PARQUET_SPLITS_PAGE_SIZE, ParquetPublication, ParquetSplits, ParquetSplitsPage};
 use quickwit_common::is_disjoint;
 use quickwit_doc_mapper::tag_pruning::TagFilterAst;
 pub use split_metadata::{Split, SplitInfo, SplitMaturity, SplitMetadata, SplitState};

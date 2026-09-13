@@ -27,7 +27,8 @@ mod merge_split_downloader;
 mod packager;
 #[cfg(feature = "metrics")]
 pub(crate) mod parquet_pipeline;
-pub(crate) mod pipeline_shared;
+mod pipeline_handle;
+pub(crate) mod pipeline_supervisor;
 mod publisher;
 mod sequencer;
 mod uploader;

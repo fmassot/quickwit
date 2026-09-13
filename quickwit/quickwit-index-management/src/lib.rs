@@ -15,9 +15,10 @@
 mod garbage_collection;
 mod index;
 mod parquet_garbage_collection;
+mod parquet_index;
 
 pub use garbage_collection::{GcMetrics, SplitRemovalInfo, run_garbage_collect};
 pub use index::{IndexService, IndexServiceError, clear_cache_directory, validate_storage_uri};
 pub use parquet_garbage_collection::{
-    ParquetSplitInfo, ParquetSplitRemovalInfo, run_parquet_garbage_collect,
+    ParquetGcTarget, ParquetSplitInfo, ParquetSplitRemovalInfo, run_parquet_garbage_collect,
 };

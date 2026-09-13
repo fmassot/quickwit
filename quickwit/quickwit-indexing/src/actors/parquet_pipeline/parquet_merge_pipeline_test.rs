@@ -157,7 +157,7 @@ pub(super) fn make_test_split_metadata(
     let table_config = TableConfig::default();
     ParquetSplitMetadata::metrics_builder()
         .split_id(ParquetSplitId::new(split_id))
-        .index_uid("test-merge-index:00000000000000000000000001")
+        .index_uid(quickwit_proto::types::IndexUid::for_test("test-merge-index", 0).to_string())
         .partition_id(0)
         .time_range(TimeRange::new(ts_start, ts_start + num_rows))
         .num_rows(num_rows)
@@ -403,6 +403,7 @@ async fn test_merge_pipeline_end_to_end() {
 
     let params = ParquetMergePipelineParams {
         index_uid: quickwit_proto::types::IndexUid::for_test("test-merge-index", 0),
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage.clone(),
@@ -829,7 +830,8 @@ async fn test_merge_pipeline_end_to_end_with_streaming_engine_flag() {
     ));
 
     let params = ParquetMergePipelineParams {
-        index_uid: quickwit_proto::types::IndexUid::for_test("test-merge-index-streaming", 0),
+        index_uid: meta_a.index_uid.parse().unwrap(),
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage.clone(),

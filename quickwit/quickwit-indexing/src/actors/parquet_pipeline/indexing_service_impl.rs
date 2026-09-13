@@ -12,31 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This file is meant to "override" some behavior of the indexing service when
-// the metrics feature flag is enabled.
-//
-// In that case, metrics index will be started as a metrics pipeline.
+//! Construction of the Parquet indexing graph from explicit index configuration.
 
 use quickwit_actors::ActorContext;
-use quickwit_common::{is_parquet_pipeline_index, is_sketches_index, temp_dir};
+use quickwit_common::temp_dir;
 use quickwit_config::{IndexConfig, SourceConfig};
 use quickwit_doc_mapper::RoutingExpr;
-use quickwit_metastore::SplitMetadata;
 use quickwit_proto::indexing::{IndexingError, IndexingPipelineId};
 
-use crate::actors::pipeline_shared::ActorPipeline;
-use crate::actors::{MetricsPipeline, MetricsPipelineParams};
+use crate::actors::pipeline_handle::ActorPipeline;
+use crate::actors::{ParquetIndexingPipeline, ParquetIndexingPipelineParams};
 use crate::{BoxedPipelineHandle, IndexingService};
 
 impl IndexingService {
-    async fn spawn_metrics_pipeline(
+    pub(crate) async fn spawn_parquet_pipeline(
         &mut self,
         ctx: &ActorContext<Self>,
         indexing_pipeline_id: IndexingPipelineId,
         index_config: IndexConfig,
         source_config: SourceConfig,
         params_fingerprint: u64,
-        use_sketch_processors: bool,
     ) -> Result<BoxedPipelineHandle, IndexingError> {
         let pipeline_uid_str = indexing_pipeline_id.pipeline_uid.to_string();
         let indexing_directory = temp_dir::Builder::default()
@@ -71,7 +66,7 @@ impl IndexingService {
         );
 
         // Spawn the Parquet merge pipeline (or reuse an existing one for this
-        // index). The planner mailbox is wired into the MetricsPipeline's
+        // index). The planner mailbox is wired into the ParquetIndexingPipeline's
         // Publisher so newly ingested splits are fed back for merging.
         // Returns `None` when there is no local merge scheduler — the metrics
         // pipeline then runs without local merging (mirrors the log path).
@@ -86,7 +81,7 @@ impl IndexingService {
             ctx,
         )?;
 
-        let pipeline_params = MetricsPipelineParams {
+        let pipeline_params = ParquetIndexingPipelineParams {
             pipeline_id: indexing_pipeline_id.clone(),
             metastore: self.metastore.clone(),
             storage,
@@ -99,52 +94,20 @@ impl IndexingService {
             source_storage_resolver: self.storage_resolver.clone(),
             params_fingerprint,
             event_broker: self.event_broker.clone(),
-            use_sketch_processors,
+            split_kind: super::parquet_split_kind(index_config.index_type),
             partition_key,
             max_num_partitions: index_config.doc_mapping.max_num_partitions,
             parquet_merge_policy,
             parquet_merge_planner_mailbox_opt: merge_planner_mailbox_opt,
         };
-        let pipeline = MetricsPipeline::new(pipeline_params);
+        let index_type = index_config.index_type;
+        let pipeline = ParquetIndexingPipeline::new(pipeline_params);
         let (mailbox, handle) = ctx.spawn_actor().spawn(pipeline);
         Ok(Box::new(ActorPipeline {
             pipeline_id: indexing_pipeline_id,
+            index_type,
             mailbox,
             handle,
         }))
-    }
-
-    pub(crate) async fn spawn_log_or_metrics_pipeline(
-        &mut self,
-        ctx: &ActorContext<Self>,
-        indexing_pipeline_id: IndexingPipelineId,
-        index_config: IndexConfig,
-        source_config: SourceConfig,
-        immature_splits_opt: Option<Vec<SplitMetadata>>,
-        params_fingerprint: u64,
-    ) -> Result<BoxedPipelineHandle, IndexingError> {
-        let index_id = &indexing_pipeline_id.index_uid.index_id;
-        if is_parquet_pipeline_index(index_id) {
-            let use_sketch_processors = is_sketches_index(index_id);
-            self.spawn_metrics_pipeline(
-                ctx,
-                indexing_pipeline_id.clone(),
-                index_config,
-                source_config,
-                params_fingerprint,
-                use_sketch_processors,
-            )
-            .await
-        } else {
-            self.spawn_log_pipeline(
-                ctx,
-                indexing_pipeline_id.clone(),
-                index_config,
-                source_config,
-                immature_splits_opt,
-                params_fingerprint,
-            )
-            .await
-        }
     }
 }

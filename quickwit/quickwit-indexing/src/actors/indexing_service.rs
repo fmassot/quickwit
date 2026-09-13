@@ -58,7 +58,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use super::merge_pipeline::{MergePipeline, MergePipelineParams};
-use super::pipeline_shared::{ActorPipeline, PipelineHandle};
+use super::pipeline_handle::{ActorPipeline, PipelineHandle};
 use super::{FinishPendingMergesAndShutdownPipeline, MergePlanner, MergeSchedulerService};
 use crate::docs_clustering::Fingerprinter;
 use crate::models::{DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnPipeline};
@@ -295,7 +295,7 @@ impl IndexingService {
         }
 
         let pipeline_handle: BoxedPipelineHandle = self
-            .spawn_log_or_metrics_pipeline(
+            .spawn_engine_pipeline(
                 ctx,
                 indexing_pipeline_id.clone(),
                 index_config,
@@ -311,8 +311,7 @@ impl IndexingService {
         Ok(())
     }
 
-    #[cfg(not(feature = "metrics"))]
-    async fn spawn_log_or_metrics_pipeline(
+    async fn spawn_engine_pipeline(
         &mut self,
         ctx: &ActorContext<Self>,
         indexing_pipeline_id: IndexingPipelineId,
@@ -321,18 +320,39 @@ impl IndexingService {
         immature_splits_opt: Option<Vec<SplitMetadata>>,
         params_fingerprint: u64,
     ) -> Result<BoxedPipelineHandle, IndexingError> {
-        self.spawn_log_pipeline(
-            ctx,
-            indexing_pipeline_id.clone(),
-            index_config,
-            source_config,
-            immature_splits_opt,
-            params_fingerprint,
-        )
-        .await
+        match index_config.index_type {
+            quickwit_config::IndexType::Tantivy => {
+                self.spawn_tantivy_pipeline(
+                    ctx,
+                    indexing_pipeline_id,
+                    index_config,
+                    source_config,
+                    immature_splits_opt,
+                    params_fingerprint,
+                )
+                .await
+            }
+            #[cfg(feature = "metrics")]
+            quickwit_config::IndexType::Metrics | quickwit_config::IndexType::Sketches => {
+                self.spawn_parquet_pipeline(
+                    ctx,
+                    indexing_pipeline_id,
+                    index_config,
+                    source_config,
+                    params_fingerprint,
+                )
+                .await
+            }
+            #[cfg(not(feature = "metrics"))]
+            quickwit_config::IndexType::Metrics | quickwit_config::IndexType::Sketches => {
+                Err(IndexingError::Unavailable(
+                    "Parquet indexes require a build with the `metrics` feature".to_string(),
+                ))
+            }
+        }
     }
 
-    pub(crate) async fn spawn_log_pipeline(
+    async fn spawn_tantivy_pipeline(
         &mut self,
         ctx: &ActorContext<Self>,
         indexing_pipeline_id: IndexingPipelineId,
@@ -435,6 +455,7 @@ impl IndexingService {
         let (mailbox, handle) = ctx.spawn_actor().spawn(pipeline);
         Ok(Box::new(ActorPipeline {
             pipeline_id: indexing_pipeline_id,
+            index_type: quickwit_config::IndexType::Tantivy,
             mailbox,
             handle,
         }))
@@ -618,11 +639,7 @@ impl IndexingService {
             let parquet_index_uids_to_retain: HashSet<IndexUid> = self
                 .indexing_pipelines
                 .values()
-                .filter(|h| {
-                    quickwit_common::is_parquet_pipeline_index(
-                        &h.indexing_pipeline_id().index_uid.index_id,
-                    )
-                })
+                .filter(|h| h.index_type().is_parquet())
                 .map(|h| h.indexing_pipeline_id().index_uid.clone())
                 .collect();
 
@@ -745,6 +762,7 @@ impl IndexingService {
 
         let params = super::parquet_pipeline::ParquetMergePipelineParams {
             index_uid: index_uid.clone(),
+            split_kind: super::parquet_pipeline::parquet_split_kind(index_config.index_type),
             indexing_directory,
             metastore: self.metastore.clone(),
             storage,
@@ -1235,7 +1253,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::actors::merge_pipeline::SUPERVISE_LOOP_INTERVAL;
 
     async fn spawn_indexing_service_for_test(
         data_dir_path: &Path,
@@ -1354,7 +1371,14 @@ mod tests {
         assert_eq!(observation.generation, 1);
         assert_eq!(observation.num_spawn_attempts, 1);
 
-        // Test detach.
+        // Detach the merge pipeline first, as the CLI does. Once the indexing pipeline is
+        // detached, normal supervision is allowed to reap its orphaned merge pipeline.
+        let _merge_pipeline = indexing_service
+            .ask_for_res(DetachMergePipeline {
+                pipeline_id: pipeline_id.merge_pipeline_id(),
+            })
+            .await
+            .unwrap();
         let pipeline_handle = indexing_service
             .ask_for_res(DetachIndexingPipeline {
                 pipeline_id: pipeline_id.clone(),
@@ -1362,12 +1386,6 @@ mod tests {
             .await
             .unwrap();
         pipeline_handle.kill().await;
-        let _merge_pipeline = indexing_service
-            .ask_for_res(DetachMergePipeline {
-                pipeline_id: pipeline_id.merge_pipeline_id(),
-            })
-            .await
-            .unwrap();
         let observation = indexing_service_handle.process_pending_and_observe().await;
         assert_eq!(observation.num_running_pipelines, 0);
         assert_eq!(observation.num_running_merge_pipelines, 0);
@@ -1932,10 +1950,15 @@ mod tests {
         let observation = indexing_server_handle.process_pending_and_observe().await;
         assert_eq!(observation.num_running_pipelines, 0);
         assert_eq!(observation.num_running_merge_pipelines, 0);
-        universe.sleep(SUPERVISE_LOOP_INTERVAL).await;
-        // Check that the merge pipeline is also shut down as they are no more indexing pipeilne on
-        // the index.
-        assert!(universe.get_one::<MergePipeline>().is_none());
+        // Removal from the service's map precedes asynchronous draining of the actor graph.
+        // Assert actual termination rather than assuming a single supervision tick is enough.
+        quickwit_common::test_utils::wait_until_predicate(
+            || async { universe.get_one::<MergePipeline>().is_none() },
+            Duration::from_secs(10),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("orphaned merge pipeline must finish draining");
         // It may or may not panic
         universe.quit().await;
     }
