@@ -1,0 +1,16 @@
+[package]
+name = "tsbs_otlp"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+opentelemetry-proto = { version = "0.31", features = ["gen-tonic", "metrics"] }
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.14"
+
+[profile.release]
+opt-level = 3

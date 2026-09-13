@@ -99,7 +99,9 @@ use quickwit_janitor::{JanitorService, start_janitor_service};
 use quickwit_metastore::{
     ControlPlaneMetastore, ListIndexesMetadataResponseExt, MetastoreResolver,
 };
-use quickwit_opentelemetry::otlp::{OtlpGrpcLogsService, OtlpGrpcTracesService};
+use quickwit_opentelemetry::otlp::{
+    OtlpGrpcLogsService, OtlpGrpcMetricsService, OtlpGrpcTracesService,
+};
 use quickwit_proto::compaction::CompactionPlannerServiceClient;
 use quickwit_proto::control_plane::ControlPlaneServiceClient;
 use quickwit_proto::indexing::{IndexingServiceClient, ShardPositionsUpdate};
@@ -197,6 +199,7 @@ struct QuickwitServices {
     pub janitor_service_opt: Option<Mailbox<JanitorService>>,
     pub jaeger_service_opt: Option<JaegerService>,
     pub otlp_logs_service_opt: Option<OtlpGrpcLogsService>,
+    pub otlp_metrics_service_opt: Option<OtlpGrpcMetricsService>,
 
     pub otlp_traces_service_opt: Option<OtlpGrpcTracesService>,
     /// We do have a search service even on nodes that are not running `search`.
@@ -701,9 +704,13 @@ pub async fn serve_quickwit(
             let otel_traces_index_config =
                 OtlpGrpcTracesService::index_config(&node_config.default_index_root_uri)
                     .context("failed to load OTEL traces index config")?;
+            let otel_metrics_index_config =
+                OtlpGrpcMetricsService::index_config(&node_config.default_index_root_uri)
+                    .context("failed to load OTEL metrics index config")?;
             for (index_name, index_config) in [
                 ("OTEL logs", otel_logs_index_config),
                 ("OTEL traces", otel_traces_index_config),
+                ("OTEL metrics", otel_metrics_index_config),
             ] {
                 match index_manager.create_index(index_config, false).await {
                     Ok(_)
@@ -907,6 +914,13 @@ pub async fn serve_quickwit(
     } else {
         None
     };
+    let otlp_metrics_service_opt = if node_config.is_service_enabled(QuickwitService::Indexer)
+        && node_config.indexer_config.enable_otlp_endpoint
+    {
+        Some(OtlpGrpcMetricsService::new(ingest_router_service.clone()))
+    } else {
+        None
+    };
 
     let grpc_listen_addr = node_config.grpc_listen_addr;
     let rest_listen_addr = node_config.rest_config.listen_addr;
@@ -932,6 +946,7 @@ pub async fn serve_quickwit(
         janitor_service_opt,
         jaeger_service_opt,
         otlp_logs_service_opt,
+        otlp_metrics_service_opt,
         otlp_traces_service_opt,
         search_service,
         env_filter_reload_fn,
