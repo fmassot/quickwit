@@ -18,7 +18,7 @@ use std::ops::Bound;
 
 use async_trait::async_trait;
 use datafusion::error::Result as DFResult;
-use quickwit_metastore::{ListParquetSplitsQuery, list_parquet_splits_paginated};
+use quickwit_metastore::{ListParquetSplitsQuery, ParquetSplits};
 use quickwit_parquet_engine::split::{ParquetSplitKind, ParquetSplitMetadata};
 use quickwit_proto::metastore::MetastoreServiceClient;
 use quickwit_proto::types::IndexUid;
@@ -30,9 +30,7 @@ use super::table_provider::MetricsSplitProvider;
 /// `MetricsSplitProvider` backed by the Quickwit metastore RPC.
 #[derive(Debug, Clone)]
 pub struct MetastoreSplitProvider {
-    metastore: MetastoreServiceClient,
-    index_uid: IndexUid,
-    split_kind: ParquetSplitKind,
+    catalog: ParquetSplits,
 }
 
 impl MetastoreSplitProvider {
@@ -42,9 +40,7 @@ impl MetastoreSplitProvider {
         split_kind: ParquetSplitKind,
     ) -> Self {
         Self {
-            metastore,
-            index_uid,
-            split_kind,
+            catalog: ParquetSplits::new(metastore, index_uid, split_kind),
         }
     }
 }
@@ -54,20 +50,21 @@ impl MetricsSplitProvider for MetastoreSplitProvider {
     #[instrument(
         skip(self, query),
         fields(
-            index_uid = %self.index_uid,
+            index_uid = %self.catalog.index_uid(),
             metric_names = ?query.metric_names,
             time_range_start = ?query.time_range_start,
             time_range_end = ?query.time_range_end,
-            split_kind = ?self.split_kind,
+            split_kind = ?self.catalog.kind(),
             num_splits,
         )
     )]
     async fn list_splits(&self, query: &MetricsSplitQuery) -> DFResult<Vec<ParquetSplitMetadata>> {
-        let metastore_query = to_metastore_query(&self.index_uid, query);
-        let records =
-            list_parquet_splits_paginated(&self.metastore, self.split_kind, metastore_query)
-                .await
-                .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?;
+        let metastore_query = to_metastore_query(self.catalog.index_uid(), query);
+        let records = self
+            .catalog
+            .list_all(metastore_query)
+            .await
+            .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?;
         let splits: Vec<ParquetSplitMetadata> =
             records.into_iter().map(|record| record.metadata).collect();
 

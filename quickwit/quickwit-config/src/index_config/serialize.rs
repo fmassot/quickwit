@@ -20,8 +20,8 @@ use tracing::info;
 
 use super::{IngestSettings, validate_index_config};
 use crate::{
-    ConfigFormat, DocMapping, IndexConfig, IndexingSettings, RetentionPolicy, SearchSettings,
-    prepare_doc_mapping_update, validate_identifier,
+    ConfigFormat, DocMapping, IndexConfig, IndexType, IndexingSettings, RetentionPolicy,
+    SearchSettings, prepare_doc_mapping_update, validate_identifier,
 };
 
 /// Alias for the latest serialization format.
@@ -89,6 +89,10 @@ pub fn load_index_config_update(
         current_index_config.index_uri,
         new_index_config.index_uri
     );
+    ensure!(
+        current_index_config.index_type == new_index_config.index_type,
+        "`index_type` cannot be updated; create a new index to change storage engines"
+    );
     let (updated_doc_mapping, _mutation_occurred) = prepare_doc_mapping_update(
         new_index_config.doc_mapping,
         &current_index_config.doc_mapping,
@@ -128,6 +132,7 @@ impl IndexConfigForSerialization {
 
         let index_config = IndexConfig {
             index_id: self.index_id,
+            index_type: self.index_type,
             index_uri,
             doc_mapping: self.doc_mapping,
             indexing_settings: self.indexing_settings,
@@ -171,6 +176,9 @@ impl TryFrom<VersionedIndexConfig> for IndexConfig {
 pub struct IndexConfigV0_8 {
     #[schema(value_type = String)]
     pub index_id: IndexId,
+    /// Storage engine. Names have no routing semantics; absent means `tantivy`.
+    #[serde(default, skip_serializing_if = "IndexType::is_tantivy")]
+    pub index_type: IndexType,
     #[schema(value_type = String)]
     #[serde(default)]
     pub index_uri: Option<Uri>,
@@ -190,6 +198,7 @@ impl From<IndexConfig> for IndexConfigV0_8 {
     fn from(index_config: IndexConfig) -> Self {
         IndexConfigV0_8 {
             index_id: index_config.index_id,
+            index_type: index_config.index_type,
             index_uri: Some(index_config.index_uri),
             doc_mapping: index_config.doc_mapping,
             indexing_settings: index_config.indexing_settings,
@@ -223,6 +232,74 @@ mod test {
         "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_index_type_is_independent_of_name_and_roundtrips() {
+        for index_id in [
+            "ordinary",
+            "datadog-metrics",
+            "metrics-cpu",
+            "otel-metrics-v0_9",
+            "datadog-sketches",
+            "sketches-cpu",
+        ] {
+            for explicit_type in [
+                None,
+                Some(IndexType::Tantivy),
+                Some(IndexType::Metrics),
+                Some(IndexType::Sketches),
+            ] {
+                let mut config = minimal_index_config_for_serialization();
+                config.index_id = index_id.to_string();
+                let mut json = serde_json::to_value(config).unwrap();
+                if let Some(index_type) = explicit_type {
+                    json["index_type"] = serde_json::to_value(index_type).unwrap();
+                } else {
+                    json.as_object_mut().unwrap().remove("index_type");
+                }
+                let config: IndexConfigForSerialization = serde_json::from_value(json).unwrap();
+                let config = config.build_and_validate(None).unwrap();
+                assert_eq!(config.index_type, explicit_type.unwrap_or_default());
+                let json = serde_json::to_value(&config).unwrap();
+                let restored: IndexConfig = serde_json::from_value(json).unwrap();
+                assert_eq!(restored, config);
+            }
+        }
+    }
+
+    #[test]
+    fn test_index_type_cannot_be_updated() {
+        let mut config = minimal_index_config_for_serialization();
+        config.index_type = IndexType::Metrics;
+        let current = config.build_and_validate(None).unwrap();
+        let root = Uri::for_test("s3://quickwit-indexes");
+        let mut updated = serde_json::to_value(&current).unwrap();
+        load_index_config_update(
+            ConfigFormat::Json,
+            &serde_json::to_vec(&updated).unwrap(),
+            &root,
+            &current,
+        )
+        .unwrap();
+        for index_type in ["tantivy", "sketches"] {
+            updated["index_type"] = index_type.into();
+            let error = load_index_config_update(
+                ConfigFormat::Json,
+                &serde_json::to_vec(&updated).unwrap(),
+                &root,
+                &current,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("`index_type` cannot be updated"));
+        }
+    }
+
+    #[test]
+    fn test_unknown_index_type_is_rejected() {
+        let mut json = serde_json::to_value(minimal_index_config_for_serialization()).unwrap();
+        json["index_type"] = "parqet".into();
+        assert!(serde_json::from_value::<IndexConfigForSerialization>(json).is_err());
     }
 
     #[test]

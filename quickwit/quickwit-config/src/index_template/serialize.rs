@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{IndexIdPattern, IndexTemplate, IndexTemplateId};
 use crate::index_config::IngestSettings;
-use crate::{DocMapping, IndexingSettings, RetentionPolicy, SearchSettings};
+use crate::{DocMapping, IndexType, IndexingSettings, RetentionPolicy, SearchSettings};
 
 #[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "version")]
@@ -36,6 +36,9 @@ pub struct IndexTemplateV0_8 {
     /// Glob patterns (e.g., `logs-foo*`) with negation by prepending `-` (e.g `-logs-fool`).
     #[schema(value_type = Vec<String>)]
     pub index_id_patterns: Vec<IndexIdPattern>,
+    /// Storage engine for generated indexes. Absent means `tantivy`.
+    #[serde(default, skip_serializing_if = "IndexType::is_tantivy")]
+    pub index_type: IndexType,
     /// The actual index URI is the concatenation of this with the index id.
     #[schema(value_type = String)]
     #[serde(default)]
@@ -76,6 +79,7 @@ impl From<IndexTemplateV0_8> for IndexTemplate {
         IndexTemplate {
             template_id: index_template_v0_8.template_id,
             index_id_patterns: index_template_v0_8.index_id_patterns,
+            index_type: index_template_v0_8.index_type,
             index_root_uri: index_template_v0_8.index_root_uri,
             priority: index_template_v0_8.priority,
             description: index_template_v0_8.description,
@@ -93,6 +97,7 @@ impl From<IndexTemplate> for IndexTemplateV0_8 {
         IndexTemplateV0_8 {
             template_id: index_template.template_id,
             index_id_patterns: index_template.index_id_patterns,
+            index_type: index_template.index_type,
             index_root_uri: index_template.index_root_uri,
             priority: index_template.priority,
             description: index_template.description,

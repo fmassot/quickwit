@@ -148,7 +148,7 @@ async fn create_metrics_index(
 ) -> IndexUid {
     let index_uri = format!("file://{}", data_dir.display());
     let config: quickwit_config::IndexConfig = serde_json::from_value(serde_json::json!({
-        "version": "0.8", "index_id": index_id, "index_uri": index_uri,
+        "version": "0.8", "index_id": index_id, "index_type": "metrics", "index_uri": index_uri,
         "doc_mapping": {"field_mappings": []}, "indexing_settings": {}, "search_settings": {}
     }))
     .unwrap();

@@ -249,6 +249,12 @@ impl<A: Actor> ActorHandle<A> {
 
     /// Waits until the actor exits by itself. This is the equivalent of `Thread::join`.
     pub async fn join(self) -> (ActorExitStatus, A::ObservableState) {
+        self.wait().await
+    }
+
+    /// Waits for termination without consuming the handle. Multiple waiters observe the same
+    /// exit status, and can still inspect the final observation afterwards.
+    pub async fn wait(&self) -> (ActorExitStatus, A::ObservableState) {
         let exit_status = self.join_handle.join().await;
         let observation = self.last_state.borrow().clone();
         (exit_status, observation)

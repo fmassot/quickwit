@@ -161,9 +161,10 @@ async fn test_merge_pipeline_end_to_end_sketches() {
         },
     ));
 
-    // Use a sketches index name so is_sketches_index() returns true.
+    // Split routing is determined by the explicit kind, not the index name.
     let params = ParquetMergePipelineParams {
-        index_uid: quickwit_proto::types::IndexUid::for_test("datadog-sketches-test", 0),
+        index_uid: quickwit_proto::types::IndexUid::for_test("cpu-distributions", 0),
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Sketches,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage.clone(),

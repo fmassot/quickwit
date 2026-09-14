@@ -17,5 +17,6 @@
 pub mod index;
 pub mod sandbox;
 
+#[allow(unused_imports)] // The sketches test uses create_parquet_index directly.
 pub use index::create_metrics_index;
 pub use sandbox::TestSandbox;

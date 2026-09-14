@@ -741,7 +741,7 @@ mod tests {
 
     use super::*;
     use crate::actors::parquet_pipeline::{ParquetPackager, ParquetUploader};
-    use crate::actors::{Publisher, UploaderType};
+    use crate::actors::{ParquetPublisher as Publisher, UploaderType};
 
     fn create_test_batch_with_service_values(service_values: &[&str]) -> RecordBatch {
         let num_rows = service_values.len();
@@ -1341,7 +1341,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_indexer_exceeding_max_num_partitions_routes_to_other() {
-        let universe = Universe::with_accelerated_time();
+        // These three messages belong to one explicit commit. Accelerated idle time
+        // may legitimately fire the 60-second commit timer between observations.
+        let universe = Universe::new();
         let (packager_mailbox, packager_inbox) = universe.create_test_mailbox::<ParquetPackager>();
 
         let partition_key = RoutingExpr::new("service").unwrap();

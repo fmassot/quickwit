@@ -31,6 +31,7 @@
 //! Below we test panics at different steps in the indexing pipeline.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
@@ -150,10 +151,44 @@ async fn test_failpoint_uploader_panics_after_one_success() -> anyhow::Result<()
 #[tokio::test]
 async fn test_failpoint_uploader_after_panics_right_away() -> anyhow::Result<()> {
     let scenario = FailScenario::setup();
-    fail::cfg_callback("uploader:after", deterministic_panic_sequence(vec![true])).unwrap();
+    let (callback, calls) = counted_panic_once();
+    // The old `uploader:after` name did not correspond to an actual failpoint.
+    fail::cfg_callback("uploader:intask:after", callback).unwrap();
     aux_test_failpoints().await?;
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "must inject a panic and then retry"
+    );
     scenario.teardown();
     Ok(())
+}
+
+#[tokio::test]
+async fn test_failpoint_upload_worker_panic_restarts_without_losing_documents() -> anyhow::Result<()>
+{
+    let scenario = FailScenario::setup();
+    let (callback, calls) = counted_panic_once();
+    fail::cfg_callback("uploader:intask:before", callback).unwrap();
+    aux_test_failpoints().await?;
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "must inject a worker panic and then retry"
+    );
+    scenario.teardown();
+    Ok(())
+}
+
+fn counted_panic_once() -> (impl Fn() + Send + Sync, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let callback = move || {
+        assert_ne!(
+            counter.fetch_add(1, Ordering::SeqCst),
+            0,
+            "injected upload panic"
+        );
+    };
+    (callback, calls)
 }
 
 async fn aux_test_failpoints() -> anyhow::Result<()> {

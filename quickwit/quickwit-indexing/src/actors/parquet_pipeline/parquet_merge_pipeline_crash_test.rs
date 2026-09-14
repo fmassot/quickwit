@@ -14,6 +14,7 @@
 
 //! Crash/restart and multi-round merge tests for the Parquet merge pipeline.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -109,6 +110,16 @@ async fn test_merge_pipeline_crash_and_restart() {
     let ram_storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
 
     let initial_splits = create_and_upload_splits(temp_dir.path(), &ram_storage, 4).await;
+    let total_input_rows: u64 = initial_splits.iter().map(|split| split.num_rows).sum();
+    let published_ids = Arc::new(std::sync::Mutex::new(
+        initial_splits
+            .iter()
+            .map(|split| split.split_id.to_string())
+            .collect::<HashSet<_>>(),
+    ));
+    let published_ids_for_publish = published_ids.clone();
+    let published_ids_for_list = published_ids.clone();
+    let initial_splits_for_list = initial_splits.clone();
 
     // --- Stateful mock metastore ---
 
@@ -151,6 +162,21 @@ async fn test_merge_pipeline_crash_and_restart() {
                     cause: "test".to_string(),
                 });
             }
+            // Commit the visible set only on successful publication. Staged outputs
+            // from the failed attempt must not become visible during restart.
+            let mut published = published_ids_for_publish.lock().unwrap();
+            for id in &request.replaced_split_ids {
+                assert!(
+                    published.remove(id),
+                    "merge replaced an unpublished input: {id}"
+                );
+            }
+            for id in &request.staged_split_ids {
+                assert!(
+                    published.insert(id.clone()),
+                    "split was already published: {id}"
+                );
+            }
             replaced_clone
                 .lock()
                 .unwrap()
@@ -163,7 +189,7 @@ async fn test_merge_pipeline_crash_and_restart() {
         });
 
     // list_metrics_splits: called on respawn to re-seed the planner.
-    // Return whatever splits are currently published (tracked by staged).
+    // Return the committed snapshot, including original inputs not yet replaced.
     let list_call_count = Arc::new(AtomicUsize::new(0));
     let list_call_clone = list_call_count.clone();
     let staged_for_list = staged_metadata.clone();
@@ -172,8 +198,11 @@ async fn test_merge_pipeline_crash_and_restart() {
         .expect_list_metrics_splits()
         .returning(move |_request| {
             list_call_clone.fetch_add(1, Ordering::SeqCst);
-            // Return all staged splits as "published" records for re-seeding.
-            let splits = staged_for_list.lock().unwrap().clone();
+            let published = published_ids_for_list.lock().unwrap().clone();
+            let mut splits = initial_splits_for_list.clone();
+            splits.extend(staged_for_list.lock().unwrap().iter().cloned());
+            splits.retain(|split| published.contains(split.split_id.as_str()));
+            splits.sort_by(|left, right| left.split_id.as_str().cmp(right.split_id.as_str()));
             let records: Vec<ParquetSplitRecord> = splits
                 .into_iter()
                 .map(|metadata| ParquetSplitRecord {
@@ -182,13 +211,7 @@ async fn test_merge_pipeline_crash_and_restart() {
                     metadata,
                 })
                 .collect();
-            let response =
-                ListMetricsSplitsResponse::try_from_splits(&records).unwrap_or_else(|_| {
-                    ListMetricsSplitsResponse {
-                        splits_serialized_json: Vec::new(),
-                    }
-                });
-            Ok(response)
+            ListMetricsSplitsResponse::try_from_splits(&records)
         });
 
     let metastore = MetastoreServiceClient::from_mock(mock_metastore);
@@ -197,6 +220,7 @@ async fn test_merge_pipeline_crash_and_restart() {
 
     let params = ParquetMergePipelineParams {
         index_uid: quickwit_proto::types::IndexUid::for_test("test-merge-index", 0),
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage.clone(),
@@ -251,12 +275,21 @@ async fn test_merge_pipeline_crash_and_restart() {
         .collect();
     original_ids_replaced.sort();
     original_ids_replaced.dedup();
-    // At least some of the original splits should have been replaced.
-    // (Due to the crash, not all 4 may be replaced in a single test run,
-    // but the first successful merge should have replaced 2.)
-    assert!(
-        !original_ids_replaced.is_empty(),
-        "at least some original splits must be replaced after restart"
+    assert_eq!(
+        original_ids_replaced,
+        ["split-0", "split-1", "split-2", "split-3"]
+    );
+    let published = published_ids.lock().unwrap().clone();
+    let visible_rows: u64 = staged_metadata
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|split| published.contains(split.split_id.as_str()))
+        .map(|split| split.num_rows)
+        .sum();
+    assert_eq!(
+        visible_rows, total_input_rows,
+        "restart must preserve committed rows"
     );
 
     universe.assert_quit().await;
@@ -323,6 +356,7 @@ async fn test_merge_pipeline_multi_round() {
 
     let params = ParquetMergePipelineParams {
         index_uid: quickwit_proto::types::IndexUid::for_test("test-merge-index", 0),
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage.clone(),

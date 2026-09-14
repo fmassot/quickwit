@@ -12,64 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared infrastructure for indexing pipeline supervisors (logs and metrics).
-
-use std::time::Duration;
-
-use tokio::sync::Semaphore;
-
-pub(crate) const SUPERVISE_INTERVAL: Duration = Duration::from_secs(1);
-
-const MAX_RETRY_DELAY: Duration = Duration::from_mins(10);
-
-#[derive(Debug)]
-pub(crate) struct SuperviseLoop;
-
-/// Calculates the wait time based on retry count.
-// retry_count, wait_time
-// 0   1s
-// 1   2s
-// 2   4s
-// 3   8s
-// ...
-// >=8   5mn
-pub(crate) fn wait_duration_before_retry(retry_count: usize) -> Duration {
-    // Protect against a `retry_count` that will lead to an overflow.
-    let max_power = (retry_count as u32).min(31);
-    Duration::from_secs(2u64.pow(max_power)).min(MAX_RETRY_DELAY)
-}
-
-/// Spawning an indexing pipeline puts a lot of pressure on the file system, metastore, etc. so
-/// we rely on this semaphore to limit the number of indexing pipelines that can be spawned
-/// concurrently.
-/// See also <https://github.com/quickwit-oss/quickwit/issues/1638>.
-pub(crate) static SPAWN_PIPELINE_SEMAPHORE: Semaphore = Semaphore::const_new(10);
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Spawn {
-    pub(crate) retry_count: usize,
-}
-
-// ---------------------------------------------------------------------------
-// Pipeline trait — type-erased handle for any indexing pipeline actor
-// ---------------------------------------------------------------------------
+//! Type-erased indexing pipeline handles for the indexing service. The actor graphs remain
+//! statically typed; erasure is confined to this service boundary.
 
 use async_trait::async_trait;
 use quickwit_actors::{
     Actor, ActorExitStatus, ActorHandle, ActorState, DeferableReplyHandler, Health, Mailbox,
     Observation, SendError, Supervisable,
 };
+use quickwit_config::IndexType;
 use quickwit_proto::indexing::IndexingPipelineId;
 
 use crate::models::IndexingStatistics;
 use crate::source::AssignShards;
 
-/// Trait that abstracts over the concrete pipeline actor type
-/// (`IndexingPipeline` or `MetricsPipeline`). This allows `PipelineHandle`
-/// to hold a single `Box<dyn PipelineHandle>`.
+/// The control surface shared by Tantivy and Parquet indexing pipelines.
 #[async_trait]
 pub trait PipelineHandle: Send + Sync {
     fn indexing_pipeline_id(&self) -> &IndexingPipelineId;
+    fn index_type(&self) -> IndexType;
     fn state(&self) -> ActorState;
     fn refresh_observe(&self);
     fn last_observation(&self) -> IndexingStatistics;
@@ -85,6 +46,7 @@ pub trait PipelineHandle: Send + Sync {
 /// observable state and message handlers.
 pub(crate) struct ActorPipeline<A: Actor<ObservableState = IndexingStatistics>> {
     pub pipeline_id: IndexingPipelineId,
+    pub index_type: IndexType,
     pub mailbox: Mailbox<A>,
     pub handle: ActorHandle<A>,
 }
@@ -95,6 +57,10 @@ where A: Actor<ObservableState = IndexingStatistics> + DeferableReplyHandler<Ass
 {
     fn indexing_pipeline_id(&self) -> &IndexingPipelineId {
         &self.pipeline_id
+    }
+
+    fn index_type(&self) -> IndexType {
+        self.index_type
     }
 
     fn state(&self) -> ActorState {

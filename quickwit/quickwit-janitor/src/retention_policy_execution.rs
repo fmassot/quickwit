@@ -13,17 +13,15 @@
 // limitations under the License.
 
 use quickwit_actors::ActorContext;
-use quickwit_common::is_sketches_index;
 use quickwit_common::pretty::PrettySample;
 use quickwit_config::RetentionPolicy;
 use quickwit_metastore::{
-    ListParquetSplitsQuery, ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt,
-    ParquetSplitRecord, SplitMetadata, SplitState, list_parquet_splits_paginated,
+    ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, ParquetSplitRecord,
+    ParquetSplits, SplitMetadata, SplitState,
 };
 use quickwit_parquet_engine::split::ParquetSplitKind;
 use quickwit_proto::metastore::{
-    ListSplitsRequest, MarkMetricsSplitsForDeletionRequest, MarkSketchSplitsForDeletionRequest,
-    MarkSplitsForDeletionRequest, MetastoreService, MetastoreServiceClient,
+    ListSplitsRequest, MarkSplitsForDeletionRequest, MetastoreService, MetastoreServiceClient,
 };
 use quickwit_proto::types::{IndexUid, SplitId};
 use time::OffsetDateTime;
@@ -99,6 +97,7 @@ pub async fn run_execute_retention_policy(
 /// mark them as `MarkedForDeletion`.
 pub async fn run_execute_parquet_retention_policy(
     index_uid: &IndexUid,
+    kind: ParquetSplitKind,
     metastore: MetastoreServiceClient,
     retention_policy: &RetentionPolicy,
     ctx: &ActorContext<RetentionPolicyExecutor>,
@@ -107,18 +106,14 @@ pub async fn run_execute_parquet_retention_policy(
     let current_timestamp = OffsetDateTime::now_utc().unix_timestamp();
     let max_retention_timestamp = current_timestamp - retention_period.as_secs() as i64;
 
-    let query = ListParquetSplitsQuery::for_index(index_uid.clone())
+    let catalog = ParquetSplits::new(metastore, index_uid.clone(), kind);
+    let query = catalog
+        .query()
         .with_split_states(vec![SplitState::Published])
         .with_max_time_range_end(max_retention_timestamp);
 
-    let kind = if is_sketches_index(&index_uid.index_id) {
-        ParquetSplitKind::Sketches
-    } else {
-        ParquetSplitKind::Metrics
-    };
-    let expired_splits: Vec<ParquetSplitRecord> = ctx
-        .protect_future(list_parquet_splits_paginated(&metastore, kind, query))
-        .await?;
+    let expired_splits: Vec<ParquetSplitRecord> =
+        ctx.protect_future(catalog.list_all(query)).await?;
 
     if expired_splits.is_empty() {
         return Ok(0);
@@ -136,23 +131,8 @@ pub async fn run_execute_parquet_retention_policy(
         expired_split_ids.len()
     );
 
-    if is_sketches_index(&index_uid.index_id) {
-        ctx.protect_future(metastore.mark_sketch_splits_for_deletion(
-            MarkSketchSplitsForDeletionRequest {
-                index_uid: Some(index_uid.clone()),
-                split_ids: expired_split_ids,
-            },
-        ))
+    ctx.protect_future(catalog.mark_for_deletion(&expired_split_ids))
         .await?;
-    } else {
-        ctx.protect_future(metastore.mark_metrics_splits_for_deletion(
-            MarkMetricsSplitsForDeletionRequest {
-                index_uid: Some(index_uid.clone()),
-                split_ids: expired_split_ids,
-            },
-        ))
-        .await?;
-    }
 
     Ok(expired_splits.len())
 }

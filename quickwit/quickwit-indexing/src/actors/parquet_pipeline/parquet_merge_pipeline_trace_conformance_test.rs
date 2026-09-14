@@ -60,32 +60,76 @@ use super::parquet_merge_pipeline_test::{
 };
 
 // ---------------------------------------------------------------------------
-// Event collector — single global Vec, drained between tests.
+// Event collector — independent capture per index, including when tests run in parallel.
 // ---------------------------------------------------------------------------
 //
-// The observer infrastructure uses `fn` pointers (no captures), so we can't
-// install a fresh closure per test. Instead we install a single
-// process-wide observer that pushes into a global Vec, and tests drain it.
-// `serial_test` ensures only one trace test runs at a time.
-
-static EVENT_LOG: OnceLock<Mutex<Vec<MergePipelineEvent>>> = OnceLock::new();
+// The observer uses a process-wide function pointer, but a trace belongs to one index.
+// Capture *all* events for that index, without consuming another test's events or retaining
+// unrelated planner-property-test traffic. Split fixtures must use the same index UID as the
+// pipeline; production requires that invariant as well.
+static EVENT_LOG: OnceLock<Mutex<HashMap<String, Vec<MergePipelineEvent>>>> = OnceLock::new();
 static OBSERVER_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn observer(event: &MergePipelineEvent) {
-    let log = EVENT_LOG.get_or_init(|| Mutex::new(Vec::new()));
-    log.lock().unwrap().push(event.clone());
+    let mut log = EVENT_LOG.get_or_init(Default::default).lock().unwrap();
+    if let Some(events) = log.get_mut(event.index_uid()) {
+        events.push(event.clone());
+    }
 }
 
-fn install_observer_once() {
-    OBSERVER_INSTALLED.get_or_init(|| {
-        set_merge_pipeline_event_observer(observer);
+struct EventCapture(String);
+
+impl EventCapture {
+    fn new(index_uid: &quickwit_proto::types::IndexUid) -> Self {
+        OBSERVER_INSTALLED.get_or_init(|| set_merge_pipeline_event_observer(observer));
+        let key = index_uid.to_string();
+        let previous = EVENT_LOG
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Vec::new());
+        assert!(previous.is_none(), "each trace needs its own index UID");
+        Self(key)
+    }
+
+    fn finish(self) -> Vec<MergePipelineEvent> {
+        EVENT_LOG
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&self.0)
+            .unwrap()
+    }
+}
+
+impl Drop for EventCapture {
+    fn drop(&mut self) {
+        EVENT_LOG.get().unwrap().lock().unwrap().remove(&self.0);
+    }
+}
+
+#[test]
+fn test_event_capture_isolates_indexes() {
+    let first_uid = quickwit_proto::types::IndexUid::for_test("capture-first", 0);
+    let second_uid = quickwit_proto::types::IndexUid::for_test("capture-second", 0);
+    let first = EventCapture::new(&first_uid);
+    let second = EventCapture::new(&second_uid);
+    observer(&MergePipelineEvent::DrainComplete {
+        index_uid: first_uid.to_string(),
     });
-}
-
-fn drain_events() -> Vec<MergePipelineEvent> {
-    let log = EVENT_LOG.get_or_init(|| Mutex::new(Vec::new()));
-    let mut guard = log.lock().unwrap();
-    std::mem::take(&mut *guard)
+    observer(&MergePipelineEvent::DrainComplete {
+        index_uid: second_uid.to_string(),
+    });
+    observer(&MergePipelineEvent::DrainComplete {
+        index_uid: "unrelated".to_string(),
+    });
+    let first_events = first.finish();
+    let second_events = second.finish();
+    assert_eq!(first_events.len(), 1);
+    assert_eq!(second_events.len(), 1);
+    assert_eq!(first_events[0].index_uid(), first_uid.to_string());
+    assert_eq!(second_events[0].index_uid(), second_uid.to_string());
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +492,7 @@ async fn create_and_upload_splits(
     temp_dir: &Path,
     storage: &Arc<dyn Storage>,
     count: usize,
+    index_uid: &quickwit_proto::types::IndexUid,
 ) -> Vec<ParquetSplitMetadata> {
     let mut metas = Vec::with_capacity(count);
     for i in 0..count {
@@ -456,7 +501,8 @@ async fn create_and_upload_splits(
         let metric = if i % 2 == 0 { "cpu.usage" } else { "mem.usage" };
         let ts_start = 100 + (i as u64) * 100;
         let batch = create_custom_test_batch(metric, ts_start, 25, "web", "host-1");
-        let meta = make_test_split_metadata(&split_id, 25, 0, ts_start, metric);
+        let mut meta = make_test_split_metadata(&split_id, 25, 0, ts_start, metric);
+        meta.index_uid = index_uid.to_string();
         let size = write_test_parquet_file(temp_dir, &filename, &batch, &meta);
         let mut meta = meta;
         meta.size_bytes = size;
@@ -566,7 +612,7 @@ fn build_mock_metastore(tracker: Arc<MockMetastoreState>) -> MetastoreServiceCli
     let list_clone = tracker.clone();
     mock.expect_list_metrics_splits().returning(move |_| {
         let published = list_clone.published.lock().unwrap();
-        let records: Vec<ParquetSplitRecord> = published
+        let mut records: Vec<ParquetSplitRecord> = published
             .values()
             .cloned()
             .map(|metadata| ParquetSplitRecord {
@@ -575,13 +621,14 @@ fn build_mock_metastore(tracker: Arc<MockMetastoreState>) -> MetastoreServiceCli
                 metadata,
             })
             .collect();
-        Ok(
-            ListMetricsSplitsResponse::try_from_splits(&records).unwrap_or_else(|_| {
-                ListMetricsSplitsResponse {
-                    splits_serialized_json: Vec::new(),
-                }
-            }),
-        )
+        // The metastore contract is ascending split-ID order, not HashMap order.
+        records.sort_by(|left, right| {
+            left.metadata
+                .split_id
+                .as_str()
+                .cmp(right.metadata.split_id.as_str())
+        });
+        ListMetricsSplitsResponse::try_from_splits(&records)
     });
 
     MetastoreServiceClient::from_mock(mock)
@@ -604,14 +651,15 @@ fn seed_published(tracker: &Arc<MockMetastoreState>, splits: &[ParquetSplitMetad
 #[tokio::test]
 async fn test_trace_conformance_normal_path() {
     quickwit_common::setup_logging_for_tests();
-    install_observer_once();
-    let _ = drain_events();
+    let index_uid = quickwit_proto::types::IndexUid::for_test("trace-conformance-index", 0);
+    let capture = EventCapture::new(&index_uid);
 
     let universe = Universe::with_accelerated_time();
     let temp_dir = tempfile::tempdir().unwrap();
     let ram_storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
 
-    let initial_splits = create_and_upload_splits(temp_dir.path(), &ram_storage, 4).await;
+    let initial_splits =
+        create_and_upload_splits(temp_dir.path(), &ram_storage, 4, &index_uid).await;
     let total_initial_rows: u64 = initial_splits.iter().map(|s| s.num_rows).sum();
 
     let publish_done = Arc::new(AtomicBool::new(false));
@@ -627,7 +675,8 @@ async fn test_trace_conformance_normal_path() {
     let metastore = build_mock_metastore(tracker.clone());
 
     let params = ParquetMergePipelineParams {
-        index_uid: quickwit_proto::types::IndexUid::for_test("trace-conformance-index", 0),
+        index_uid,
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage.clone(),
@@ -660,8 +709,15 @@ async fn test_trace_conformance_normal_path() {
     // Allow events to flush.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let events = drain_events();
+    let events = capture.finish();
     universe.assert_quit().await;
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event, MergePipelineEvent::PublishMergeAndFeedback { .. }))
+            .count()
+            >= 3
+    );
 
     println!("captured {} events:", events.len());
     for (i, e) in events.iter().enumerate() {
@@ -727,13 +783,14 @@ async fn test_trace_conformance_normal_path() {
 #[tokio::test]
 async fn test_trace_conformance_crash_mid_cascade() {
     quickwit_common::setup_logging_for_tests();
-    install_observer_once();
-    let _ = drain_events();
+    let index_uid = quickwit_proto::types::IndexUid::for_test("trace-crash-index", 0);
+    let capture = EventCapture::new(&index_uid);
 
     let universe = Universe::with_accelerated_time();
     let temp_dir = tempfile::tempdir().unwrap();
     let ram_storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
-    let initial_splits = create_and_upload_splits(temp_dir.path(), &ram_storage, 4).await;
+    let initial_splits =
+        create_and_upload_splits(temp_dir.path(), &ram_storage, 4, &index_uid).await;
 
     let publish_done = Arc::new(AtomicBool::new(false));
     let tracker = Arc::new(MockMetastoreState {
@@ -749,7 +806,8 @@ async fn test_trace_conformance_crash_mid_cascade() {
     let metastore = build_mock_metastore(tracker.clone());
 
     let params = ParquetMergePipelineParams {
-        index_uid: quickwit_proto::types::IndexUid::for_test("trace-crash-index", 0),
+        index_uid,
+        split_kind: quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         indexing_directory: TempDirectory::for_test(),
         metastore,
         storage: ram_storage.clone(),
@@ -780,7 +838,7 @@ async fn test_trace_conformance_crash_mid_cascade() {
     .expect("timed out waiting for post-crash publish");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let events = drain_events();
+    let events = capture.finish();
     universe.assert_quit().await;
 
     println!("captured {} events (crash scenario):", events.len());

@@ -35,7 +35,7 @@ mod parquet_splits_update;
 mod parquet_uploader;
 mod pipeline;
 mod processed_parquet_batch;
-mod publisher_impl;
+mod publisher;
 
 #[cfg(test)]
 #[allow(
@@ -79,17 +79,34 @@ pub use parquet_merge_split_downloader::ParquetMergeSplitDownloader;
 pub use parquet_packager::{ParquetBatchForPackager, ParquetPackager, ParquetPackagerCounters};
 pub use parquet_splits_update::ParquetSplitsUpdate;
 pub use parquet_uploader::ParquetUploader;
-pub use pipeline::{MetricsPipeline, MetricsPipelineParams};
+pub use pipeline::{ParquetIndexingPipeline, ParquetIndexingPipelineParams};
 pub use processed_parquet_batch::ProcessedParquetBatch;
-pub(crate) use publisher_impl::METRICS_PUBLISHER_NAME;
+pub use publisher::{ParquetPublicationEngine, ParquetPublisher};
 
 #[cfg(test)]
 /// Spawn a `Sequencer<Publisher>` in front of the given publisher mailbox.
 pub(crate) fn spawn_sequencer_for_test(
     universe: &quickwit_actors::Universe,
-    publisher_mailbox: quickwit_actors::Mailbox<crate::actors::Publisher>,
-) -> quickwit_actors::Mailbox<crate::actors::Sequencer<crate::actors::Publisher>> {
+    publisher_mailbox: quickwit_actors::Mailbox<ParquetPublisher>,
+) -> quickwit_actors::Mailbox<crate::actors::Sequencer<ParquetPublisher>> {
     let sequencer = crate::actors::Sequencer::new(publisher_mailbox);
     let (sequencer_mailbox, _sequencer_handle) = universe.spawn_builder().spawn(sequencer);
     sequencer_mailbox
+}
+
+/// Maps an index type to the kind of Parquet splits it produces.
+pub fn parquet_split_kind(
+    index_type: quickwit_config::IndexType,
+) -> quickwit_parquet_engine::split::ParquetSplitKind {
+    match index_type {
+        quickwit_config::IndexType::Metrics => {
+            quickwit_parquet_engine::split::ParquetSplitKind::Metrics
+        }
+        quickwit_config::IndexType::Sketches => {
+            quickwit_parquet_engine::split::ParquetSplitKind::Sketches
+        }
+        quickwit_config::IndexType::Tantivy => {
+            unreachable!("Tantivy indexes do not use Parquet splits")
+        }
+    }
 }

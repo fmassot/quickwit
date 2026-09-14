@@ -260,7 +260,7 @@ mod tests {
     use quickwit_storage::RamStorage;
 
     use super::*;
-    use crate::actors::{Publisher, UploaderType};
+    use crate::actors::{ParquetPublisher as Publisher, UploaderType};
 
     fn create_test_uploader(
         universe: &Universe,

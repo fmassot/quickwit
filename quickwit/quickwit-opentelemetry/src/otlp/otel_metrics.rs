@@ -59,6 +59,7 @@ const OTEL_METRICS_INDEX_CONFIG: &str = r#"
 version: 0.8
 
 index_id: ${INDEX_ID}
+index_type: metrics
 
 doc_mapping:
   mode: dynamic
@@ -585,6 +586,7 @@ mod tests {
         let index_config =
             OtlpGrpcMetricsService::index_config(&Uri::for_test("ram:///indexes")).unwrap();
         assert_eq!(index_config.index_id, OTEL_METRICS_INDEX_ID);
+        assert_eq!(index_config.index_type, quickwit_config::IndexType::Metrics);
         let retention = index_config
             .retention_policy_opt
             .expect("retention policy should be set");

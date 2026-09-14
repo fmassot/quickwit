@@ -12,323 +12,108 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeSet;
+//! Tantivy indexing graph. Lifecycle and source assignment handling live in `pipeline_supervisor`.
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use quickwit_actors::{
-    Actor, ActorContext, ActorExitStatus, ActorHandle, HEARTBEAT, Handler, Health, Mailbox,
-    QueueCapacity, Supervisable,
-};
-use quickwit_common::KillSwitch;
+use quickwit_actors::{ActorContext, ActorHandle, Mailbox, QueueCapacity};
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_config::{IndexingSettings, RetentionPolicy, SourceConfig};
 use quickwit_doc_mapper::DocMapper;
 use quickwit_ingest::IngesterPool;
-use quickwit_metrics::{GaugeGuard, counter, gauge, label_values};
+use quickwit_metrics::{counter, label_values};
 use quickwit_proto::indexing::IndexingPipelineId;
-use quickwit_proto::metastore::{MetastoreError, MetastoreServiceClient};
-use quickwit_proto::types::{IndexingPlanId, ShardId};
+use quickwit_proto::metastore::MetastoreServiceClient;
 use quickwit_storage::{Storage, StorageResolver};
 use tokio::sync::Semaphore;
-use tracing::{debug, error, info, instrument, warn};
 
-use super::{DocProcessor, IndexSerializer, Indexer, MergePlanner, Packager};
-use crate::SplitsUpdateMailbox;
-use crate::actors::pipeline_shared::{
-    SPAWN_PIPELINE_SEMAPHORE, SUPERVISE_INTERVAL, Spawn, SuperviseLoop, wait_duration_before_retry,
+use super::pipeline_supervisor::{
+    INDEXING_SPAWN_SEMAPHORE, Pipeline, PipelineActors, PipelineSupervisor, SourcePipeline,
+    SourceState,
 };
-use crate::actors::sequencer::Sequencer;
-use crate::actors::uploader::UploaderType;
-use crate::actors::{Publisher, Uploader};
+use super::{
+    DocProcessor, IndexSerializer, Indexer, MergePlanner, Packager, Publisher, Sequencer, Uploader,
+    UploaderType,
+};
+use crate::SplitsUpdateMailbox;
 use crate::docs_clustering::Fingerprinter;
 use crate::merge_policy::MergePolicy;
-use crate::metrics::{ACTOR_NAME, BACKPRESSURE_MICROS, INDEXING_PIPELINES};
-use crate::models::{IndexingStatistics, SharedPublishToken};
-use crate::source::{
-    AssignShards, Assignment, SourceActor, SourceRuntime, quickwit_supported_sources,
-};
+use crate::metrics::{ACTOR_NAME, BACKPRESSURE_MICROS};
+use crate::models::IndexingStatistics;
+use crate::source::{SourceActor, SourceRuntime};
 use crate::split_store::IndexingSplitStore;
 
-/// Handles for standard Tantivy-based indexing pipeline.
-struct IndexingPipelineHandles {
-    source_mailbox: Mailbox<SourceActor>,
-    source_handle: ActorHandle<SourceActor>,
-    doc_processor: ActorHandle<DocProcessor>,
-    indexer: ActorHandle<Indexer>,
-    index_serializer: ActorHandle<IndexSerializer>,
-    packager: ActorHandle<Packager>,
-    uploader: ActorHandle<Uploader>,
-    sequencer: ActorHandle<Sequencer<Publisher>>,
-    publisher: ActorHandle<Publisher>,
-    next_check_for_progress: Instant,
-}
+pub type IndexingPipeline = PipelineSupervisor<TantivyIndexing>;
 
-impl IndexingPipelineHandles {
-    fn should_check_for_progress(&mut self) -> bool {
-        let now = Instant::now();
-        let check_for_progress = now > self.next_check_for_progress;
-        if check_for_progress {
-            self.next_check_for_progress = now + *HEARTBEAT;
-        }
-        check_for_progress
-    }
-}
-
-pub struct IndexingPipeline {
+pub struct TantivyIndexing {
     params: IndexingPipelineParams,
-    previous_generations_statistics: IndexingStatistics,
-    statistics: IndexingStatistics,
-    handles_opt: Option<IndexingPipelineHandles>,
-    // Killswitch used for the actors in the pipeline. This is not the supervisor killswitch.
-    kill_switch: KillSwitch,
-
-    // The set of shard is something that can change dynamically without necessarily
-    // requiring a respawn of the pipeline.
-    // We keep the list of shards here however, to reassign them after a respawn.
-    shard_ids: BTreeSet<ShardId>,
-    // Id of the last indexing plan assigned to this pipeline. Kept here, like `shard_ids`, so it
-    // can be re-sent to the source on respawn; the source adopts it as its publish token.
-    indexing_plan_id: IndexingPlanId,
-    publish_token: SharedPublishToken,
-    _indexing_pipelines_gauge_guard: GaugeGuard,
+    source: SourceState,
 }
 
-#[async_trait]
-impl Actor for IndexingPipeline {
-    type ObservableState = IndexingStatistics;
-
-    fn observable_state(&self) -> Self::ObservableState {
-        self.statistics.clone()
-    }
-
-    fn name(&self) -> String {
-        "IndexingPipeline".to_string()
-    }
-
-    async fn initialize(&mut self, ctx: &ActorContext<Self>) -> Result<(), ActorExitStatus> {
-        self.handle(Spawn::default(), ctx).await?;
-        self.handle(SuperviseLoop, ctx).await?;
-        Ok(())
-    }
-
-    async fn finalize(
-        &mut self,
-        _exit_status: &ActorExitStatus,
-        ctx: &ActorContext<Self>,
-    ) -> anyhow::Result<()> {
-        // We update the observation to ensure our last "black box" observation
-        // is up to date.
-        self.perform_observe(ctx);
-        Ok(())
-    }
+pub struct TantivyIndexingRunning {
+    source: Arc<ActorHandle<SourceActor>>,
+    doc_processor: Arc<ActorHandle<DocProcessor>>,
+    indexer: Arc<ActorHandle<Indexer>>,
+    uploader: Arc<ActorHandle<Uploader>>,
+    publisher: Arc<ActorHandle<Publisher>>,
 }
 
 impl IndexingPipeline {
     pub fn new(params: IndexingPipelineParams) -> Self {
-        let indexing_pipelines_gauge = gauge!(parent: INDEXING_PIPELINES, "index" => params.pipeline_id.index_uid.index_id.clone());
-        let indexing_pipelines_gauge_guard = GaugeGuard::new(&indexing_pipelines_gauge, 1.0);
-        let params_fingerprint = params.params_fingerprint;
-        IndexingPipeline {
-            params,
-            previous_generations_statistics: Default::default(),
-            handles_opt: None,
-            kill_switch: KillSwitch::default(),
-            statistics: IndexingStatistics {
-                params_fingerprint,
-                ..Default::default()
-            },
-            shard_ids: Default::default(),
-            indexing_plan_id: IndexingPlanId::new(),
-            publish_token: SharedPublishToken::default(),
-            _indexing_pipelines_gauge_guard: indexing_pipelines_gauge_guard,
-        }
+        let source = SourceState::new(&params.pipeline_id, params.params_fingerprint);
+        Self::from_pipeline(TantivyIndexing { params, source })
+    }
+}
+
+#[async_trait]
+impl Pipeline for TantivyIndexing {
+    type Statistics = IndexingStatistics;
+    type Running = TantivyIndexingRunning;
+    const NAME: &'static str = "IndexingPipeline";
+
+    fn index_uid(&self) -> &quickwit_proto::types::IndexUid {
+        &self.params.pipeline_id.index_uid
     }
 
-    fn supervisables(&self) -> Vec<&dyn Supervisable> {
-        match &self.handles_opt {
-            Some(handles) => {
-                vec![
-                    &handles.source_handle,
-                    &handles.doc_processor,
-                    &handles.indexer,
-                    &handles.index_serializer,
-                    &handles.packager,
-                    &handles.uploader,
-                    &handles.sequencer,
-                    &handles.publisher,
-                ]
-            }
-            None => Vec::new(),
-        }
+    fn spawn_semaphore(&self) -> &'static Semaphore {
+        &INDEXING_SPAWN_SEMAPHORE
+    }
+    fn restart_delay(&self) -> Duration {
+        Duration::from_secs(1)
     }
 
-    /// Performs healthcheck on all of the actors in the pipeline,
-    /// and consolidates the result.
-    fn healthcheck(&self, check_for_progress: bool) -> Health {
-        let mut healthy_actors: Vec<&str> = Default::default();
-        let mut failure_or_unhealthy_actors: Vec<&str> = Default::default();
-        let mut success_actors: Vec<&str> = Default::default();
-        for supervisable in self.supervisables() {
-            match supervisable.check_health(check_for_progress) {
-                Health::Healthy => {
-                    // At least one other actor is running.
-                    healthy_actors.push(supervisable.name());
-                }
-                Health::FailureOrUnhealthy => {
-                    failure_or_unhealthy_actors.push(supervisable.name());
-                }
-                Health::Success => {
-                    success_actors.push(supervisable.name());
-                }
-            }
-        }
-
-        if !failure_or_unhealthy_actors.is_empty() {
-            debug!(
-                pipeline_id=?self.params.pipeline_id,
-                generation=self.generation(),
-                healthy_actors=?healthy_actors,
-                failed_or_unhealthy_actors=?failure_or_unhealthy_actors,
-                success_actors=?success_actors,
-                "indexing pipeline failure"
-            );
-            return Health::FailureOrUnhealthy;
-        }
-        if healthy_actors.is_empty() {
-            // All the actors finished successfully.
-            info!(
-                pipeline_id=?self.params.pipeline_id,
-                generation=self.generation(),
-                "Indexing pipeline success."
-            );
-            return Health::Success;
-        }
-        // No error at this point and there are still some actors running.
-        debug!(
-            pipeline_id=?self.params.pipeline_id,
-            generation=self.generation(),
-            healthy_actors=?healthy_actors,
-            failed_or_unhealthy_actors=?failure_or_unhealthy_actors,
-            success_actors=?success_actors,
-            "Indexing pipeline running."
-        );
-        Health::Healthy
-    }
-
-    fn generation(&self) -> usize {
-        self.statistics.generation
-    }
-
-    fn perform_observe(&mut self, ctx: &ActorContext<Self>) {
-        if let Some(handles) = &self.handles_opt {
-            handles.doc_processor.refresh_observe();
-            handles.indexer.refresh_observe();
-            handles.uploader.refresh_observe();
-            handles.publisher.refresh_observe();
-            self.statistics = self
-                .previous_generations_statistics
-                .clone()
-                .add_actor_counters(
-                    &handles.doc_processor.last_observation(),
-                    &handles.indexer.last_observation(),
-                    &handles.uploader.last_observation(),
-                    &handles.publisher.last_observation(),
-                )
-                .set_generation(self.statistics.generation)
-                .set_num_spawn_attempts(self.statistics.num_spawn_attempts);
-            let pipeline_metrics_opt = handles.indexer.last_observation().pipeline_metrics_opt;
-            self.statistics.pipeline_metrics_opt = pipeline_metrics_opt;
-        }
-        // Always update params_fingerprint, shard_ids, and emit observation.
-        // This ensures shard assignments are reported to the control plane via chitchat.
-        self.statistics.params_fingerprint = self.params.params_fingerprint;
-        self.statistics.shard_ids.clone_from(&self.shard_ids);
-        ctx.observe(self);
-    }
-
-    /// Checks if some actors have terminated.
-    async fn perform_health_check(
+    async fn spawn(
         &mut self,
-        ctx: &ActorContext<Self>,
-    ) -> Result<(), ActorExitStatus> {
-        let check_for_progress = match &mut self.handles_opt {
-            Some(handles) => handles.should_check_for_progress(),
-            None => return Ok(()),
-        };
-        let health = self.healthcheck(check_for_progress);
-        match health {
-            Health::Healthy => {}
-            Health::FailureOrUnhealthy => {
-                self.terminate().await;
-                let first_retry_delay = wait_duration_before_retry(0);
-                ctx.schedule_self_msg(first_retry_delay, Spawn { retry_count: 0 });
-            }
-            Health::Success => {
-                return Err(ActorExitStatus::Success);
-            }
-        }
-        Ok(())
-    }
-
-    // TODO this should return an error saying whether we can retry or not.
-    #[instrument(
-        name="spawn_pipeline",
-        level="info",
-        skip_all,
-        fields(
-            index=%self.params.pipeline_id.index_uid.index_id,
-            r#gen=self.generation()
-        ))]
-    async fn spawn_pipeline(&mut self, ctx: &ActorContext<Self>) -> anyhow::Result<()> {
-        let _spawn_pipeline_permit = ctx
-            .protect_future(SPAWN_PIPELINE_SEMAPHORE.acquire())
-            .await
-            .expect("semaphore should not be closed");
-
-        self.statistics.num_spawn_attempts += 1;
-        self.kill_switch = ctx.kill_switch().child();
-
+        ctx: &ActorContext<IndexingPipeline>,
+        actors: &mut PipelineActors,
+    ) -> anyhow::Result<Self::Running> {
         let index_id = &self.params.pipeline_id.index_uid.index_id;
         let source_id = &self.params.pipeline_id.source_id;
-
-        info!(
-            index_id,
-            source_id,
-            pipeline_uid=%self.params.pipeline_id.pipeline_uid,
-            root_dir=%self.params.indexing_directory.path().display(),
-            "spawning indexing pipeline",
-        );
+        // Validate before starting any actors whenever possible.
+        let tag_fields = self.params.doc_mapper.tag_named_fields()?;
         let (source_mailbox, source_inbox) = ctx
             .spawn_ctx()
             .create_mailbox::<SourceActor>("SourceActor", QueueCapacity::Unbounded);
 
-        // Publisher
         let publisher = Publisher::new(
             super::PUBLISHER_NAME,
             QueueCapacity::Bounded(1),
             self.params.metastore.clone(),
             self.params.merge_planner_mailbox_opt.clone(),
             Some(source_mailbox.clone()),
-            self.publish_token.clone(),
+            self.source.publish_token.clone(),
         );
-        let (publisher_mailbox, publisher_handle) = ctx
-            .spawn_actor()
-            .set_kill_switch(self.kill_switch.clone())
-            .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "publisher")]))
-            .spawn(publisher);
-
-        let sequencer = Sequencer::new(publisher_mailbox);
-        let (sequencer_mailbox, sequencer_handle) = ctx
-            .spawn_actor()
-            .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "sequencer")]))
-            .set_kill_switch(self.kill_switch.clone())
-            .spawn(sequencer);
-
-        // Uploader
+        let (publisher_mailbox, publisher) = actors.spawn(
+            ctx.spawn_actor().set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "publisher")])), publisher,
+        );
+        let (sequencer_mailbox, _) = actors.spawn(
+            ctx.spawn_actor().set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "sequencer")])),
+            Sequencer::new(publisher_mailbox),
+        );
         let uploader = Uploader::new(
             UploaderType::IndexUploader,
             self.params.metastore.clone(),
@@ -339,28 +124,15 @@ impl IndexingPipeline {
             self.params.max_concurrent_split_uploads_index,
             self.params.event_broker.clone(),
         );
-        let (uploader_mailbox, uploader_handle) = ctx
-            .spawn_actor()
-            .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "uploader")]))
-            .set_kill_switch(self.kill_switch.clone())
-            .spawn(uploader);
-
-        // Packager
-        let tag_fields = self.params.doc_mapper.tag_named_fields()?;
-        let packager = Packager::new("Packager", tag_fields, uploader_mailbox);
-        let (packager_mailbox, packager_handle) = ctx
-            .spawn_actor()
-            .set_kill_switch(self.kill_switch.clone())
-            .spawn(packager);
-
-        // Index Serializer
-        let index_serializer = IndexSerializer::new(packager_mailbox);
-        let (index_serializer_mailbox, index_serializer_handle) = ctx
-            .spawn_actor()
-            .set_kill_switch(self.kill_switch.clone())
-            .spawn(index_serializer);
-
-        // Indexer
+        let (uploader_mailbox, uploader) = actors.spawn(
+            ctx.spawn_actor().set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "uploader")])), uploader,
+        );
+        let (packager_mailbox, _) = actors.spawn(
+            ctx.spawn_actor(),
+            Packager::new("Packager", tag_fields, uploader_mailbox),
+        );
+        let (serializer_mailbox, _) =
+            actors.spawn(ctx.spawn_actor(), IndexSerializer::new(packager_mailbox));
         let indexer = Indexer::new(
             self.params.pipeline_id.clone(),
             self.params.doc_mapper.clone(),
@@ -368,16 +140,13 @@ impl IndexingPipeline {
             self.params.indexing_directory.clone(),
             self.params.indexing_settings.clone(),
             self.params.cooperative_indexing_permits.clone(),
-            index_serializer_mailbox,
+            serializer_mailbox,
             self.params.fingerprinter_opt.clone(),
         );
-        let (indexer_mailbox, indexer_handle) = ctx
-            .spawn_actor()
-            .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "indexer")]))
-            .set_kill_switch(self.kill_switch.clone())
-            .spawn(indexer);
-
-        let doc_processor = DocProcessor::try_new(
+        let (indexer_mailbox, indexer) = actors.spawn(
+            ctx.spawn_actor().set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "indexer")])), indexer,
+        );
+        let processor = DocProcessor::try_new(
             index_id.to_string(),
             source_id.to_string(),
             self.params.doc_mapper.clone(),
@@ -386,12 +155,10 @@ impl IndexingPipeline {
             self.params.source_config.input_format,
             self.params.fingerprinter_opt.clone(),
         )?;
-        let (doc_processor_mailbox, doc_processor_handle) = ctx
-            .spawn_actor()
-            .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "doc_processor")]))
-            .set_kill_switch(self.kill_switch.clone())
-            .spawn(doc_processor);
-        let source_runtime = SourceRuntime {
+        let (processor_mailbox, doc_processor) = actors.spawn(
+            ctx.spawn_actor().set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "doc_processor")])), processor,
+        );
+        let runtime = SourceRuntime {
             pipeline_id: self.params.pipeline_id.clone(),
             source_config: self.params.source_config.clone(),
             metastore: self.params.metastore.clone(),
@@ -400,143 +167,53 @@ impl IndexingPipeline {
             storage_resolver: self.params.source_storage_resolver.clone(),
             event_broker: self.params.event_broker.clone(),
             indexing_setting: self.params.indexing_settings.clone(),
-            publish_token: self.publish_token.clone(),
+            publish_token: self.source.publish_token.clone(),
         };
-        let source = ctx
-            .protect_future(quickwit_supported_sources().load_source(source_runtime))
+        let source = self
+            .source
+            .spawn(
+                ctx,
+                actors,
+                runtime,
+                processor_mailbox,
+                (source_mailbox, source_inbox),
+            )
             .await?;
-        let actor_source = SourceActor::new(source, doc_processor_mailbox);
-        let (source_mailbox, source_handle) = ctx
-            .spawn_actor()
-            .set_mailboxes(source_mailbox, source_inbox)
-            .set_kill_switch(self.kill_switch.clone())
-            .spawn(actor_source);
-        let assign_shards_message = AssignShards(Assignment {
-            shard_ids: self.shard_ids.clone(),
-            indexing_plan_id: self.indexing_plan_id.clone(),
-        });
-        source_mailbox.send_message(assign_shards_message).await?;
-
-        // Increment generation once we are sure there will be no spawning error.
-        self.previous_generations_statistics = self.statistics.clone();
-        self.statistics.generation += 1;
-        self.handles_opt = Some(IndexingPipelineHandles {
-            source_mailbox,
-            source_handle,
-            doc_processor: doc_processor_handle,
-            indexer: indexer_handle,
-            index_serializer: index_serializer_handle,
-            packager: packager_handle,
-            uploader: uploader_handle,
-            sequencer: sequencer_handle,
-            publisher: publisher_handle,
-            next_check_for_progress: Instant::now() + *HEARTBEAT,
-        });
-        Ok(())
+        Ok(TantivyIndexingRunning {
+            source,
+            doc_processor,
+            indexer,
+            uploader,
+            publisher,
+        })
     }
 
-    async fn terminate(&mut self) {
-        self.kill_switch.kill();
-        if let Some(handles) = self.handles_opt.take() {
-            tokio::join!(
-                handles.source_handle.kill(),
-                handles.indexer.kill(),
-                handles.packager.kill(),
-                handles.uploader.kill(),
-                handles.publisher.kill(),
-            );
-        }
+    fn observe(&self, running: &Self::Running, previous: IndexingStatistics) -> IndexingStatistics {
+        running.doc_processor.refresh_observe();
+        running.indexer.refresh_observe();
+        running.uploader.refresh_observe();
+        running.publisher.refresh_observe();
+        let mut statistics = previous.add_actor_counters(
+            &running.doc_processor.last_observation(),
+            &running.indexer.last_observation(),
+            &running.uploader.last_observation(),
+            &running.publisher.last_observation(),
+        );
+        statistics.pipeline_metrics_opt = running.indexer.last_observation().pipeline_metrics_opt;
+        statistics
+    }
+
+    fn update_metadata(&self, statistics: &mut IndexingStatistics) {
+        self.source.update_metadata(statistics);
     }
 }
 
-#[async_trait]
-impl Handler<SuperviseLoop> for IndexingPipeline {
-    type Reply = ();
-    async fn handle(
-        &mut self,
-        supervise_loop_token: SuperviseLoop,
-        ctx: &ActorContext<Self>,
-    ) -> Result<(), ActorExitStatus> {
-        self.perform_observe(ctx);
-        self.perform_health_check(ctx).await?;
-        ctx.schedule_self_msg(SUPERVISE_INTERVAL, supervise_loop_token);
-        Ok(())
+impl SourcePipeline for TantivyIndexing {
+    fn source(&mut self) -> &mut SourceState {
+        &mut self.source
     }
-}
-
-#[async_trait]
-impl Handler<Spawn> for IndexingPipeline {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        spawn: Spawn,
-        ctx: &ActorContext<Self>,
-    ) -> Result<(), ActorExitStatus> {
-        if self.handles_opt.is_some() {
-            return Ok(());
-        }
-        self.previous_generations_statistics.num_spawn_attempts = 1 + spawn.retry_count;
-        if let Err(spawn_error) = self.spawn_pipeline(ctx).await {
-            if let Some(MetastoreError::NotFound { .. }) =
-                spawn_error.downcast_ref::<MetastoreError>()
-            {
-                info!(error = ?spawn_error, "could not spawn pipeline, index might have been deleted");
-                return Err(ActorExitStatus::Success);
-            }
-            let retry_delay = wait_duration_before_retry(spawn.retry_count + 1);
-            error!(error = ?spawn_error, retry_count = spawn.retry_count, retry_delay = ?retry_delay, "error while spawning indexing pipeline, retrying after some time");
-            ctx.schedule_self_msg(
-                retry_delay,
-                Spawn {
-                    retry_count: spawn.retry_count + 1,
-                },
-            );
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Handler<AssignShards> for IndexingPipeline {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        assign_shards_message: AssignShards,
-        ctx: &ActorContext<Self>,
-    ) -> Result<(), ActorExitStatus> {
-        self.shard_ids
-            .clone_from(&assign_shards_message.0.shard_ids);
-        self.indexing_plan_id
-            .clone_from(&assign_shards_message.0.indexing_plan_id);
-        // If the pipeline is running, we forward the message to its source.
-        // If it is not, it will be respawned soon, and the shards will be assigned afterward.
-        if let Some(handles) = &self.handles_opt {
-            info!(
-                shard_ids=?assign_shards_message.0.shard_ids,
-                "assigning shards to indexing pipeline"
-            );
-            // The source may have died since the last supervision tick, in which case its
-            // mailbox is already closed. `self.shard_ids` was
-            // updated above, the supervise loop will notice the dead source within
-            // `SUPERVISE_INTERVAL` and respawn the pipeline, and the new generation will be
-            // assigned those shards.
-            if let Err(error) = handles
-                .source_mailbox
-                .send_message(assign_shards_message)
-                .await
-            {
-                warn!(
-                    %error,
-                    "source mailbox closed while assigning shards, shards will be reassigned on \
-                     respawn"
-                );
-            }
-        }
-        // We perform observe to make sure the set of shard ids is up to date.
-        self.perform_observe(ctx);
-        Ok(())
+    fn source_mailbox(running: &Self::Running) -> &Mailbox<SourceActor> {
+        running.source.mailbox()
     }
 }
 
@@ -544,8 +221,6 @@ pub struct IndexingPipelineParams {
     pub pipeline_id: IndexingPipelineId,
     pub metastore: MetastoreServiceClient,
     pub storage: Arc<dyn Storage>,
-
-    // Indexing-related parameters
     pub doc_mapper: Arc<DocMapper>,
     pub indexing_directory: TempDirectory,
     pub indexing_settings: IndexingSettings,
@@ -553,31 +228,27 @@ pub struct IndexingPipelineParams {
     pub split_store: IndexingSplitStore,
     pub max_concurrent_split_uploads_index: usize,
     pub cooperative_indexing_permits: Option<Arc<Semaphore>>,
-
-    // Merge-related parameters
     pub merge_policy: Arc<dyn MergePolicy>,
     pub retention_policy: Option<RetentionPolicy>,
     pub merge_planner_mailbox_opt: Option<Mailbox<MergePlanner>>,
     pub max_concurrent_split_uploads_merge: usize,
-
-    // Source-related parameters
     pub source_config: SourceConfig,
     pub source_storage_resolver: StorageResolver,
     pub ingester_pool: IngesterPool,
     pub queues_dir_path: PathBuf,
     pub params_fingerprint: u64,
-
     pub event_broker: EventBroker,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use quickwit_actors::{ActorState, Command, Universe};
+    use quickwit_actors::{ActorState, Command, Health, Supervisable, Universe};
     use quickwit_common::ServiceStream;
     use quickwit_common::test_utils::wait_until_predicate;
     use quickwit_config::{IndexingSettings, SourceInputFormat, SourceParams};
@@ -588,12 +259,14 @@ mod tests {
         EmptyResponse, IndexMetadataResponse, LastDeleteOpstampResponse, MetastoreError,
         MockMetastoreService,
     };
-    use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
+    use quickwit_proto::types::{IndexUid, NodeId, PipelineUid, ShardId};
     use quickwit_storage::RamStorage;
 
     use super::{IndexingPipeline, *};
+    use crate::actors::pipeline_supervisor::wait_duration_before_retry;
     use crate::actors::{MergePipeline, MergePipelineParams};
     use crate::merge_policy::default_merge_policy;
+    use crate::source::{AssignShards, Assignment};
 
     #[test]
     fn test_wait_duration() {
@@ -1175,6 +848,7 @@ mod tests {
     }
 
     async fn indexing_pipeline_all_failures_handling(test_file: &str) -> anyhow::Result<()> {
+        quickwit_common::setup_logging_for_tests();
         let node_id = NodeId::from_str("test-node");
         let index_uid: IndexUid = IndexUid::for_test("test-index", 2);
         let pipeline_id = IndexingPipelineId {

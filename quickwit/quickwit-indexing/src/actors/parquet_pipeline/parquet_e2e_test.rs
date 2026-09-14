@@ -41,7 +41,8 @@ use quickwit_storage::RamStorage;
 
 use crate::actors::sequencer::Sequencer;
 use crate::actors::{
-    ParquetDocProcessor, ParquetIndexer, ParquetPackager, ParquetUploader, Publisher, UploaderType,
+    ParquetDocProcessor, ParquetIndexer, ParquetPackager, ParquetPublisher as Publisher,
+    ParquetUploader, UploaderType,
 };
 use crate::models::{RawDocBatch, SharedPublishToken};
 
@@ -145,7 +146,9 @@ fn create_raw_doc_batch(
 /// - Splits are staged and published via metastore
 #[tokio::test]
 async fn test_metrics_pipeline_e2e() {
-    let universe = Universe::with_accelerated_time();
+    // This test exercises explicit commits, not timeouts. Accelerating time between the
+    // two phases can legitimately fire the 60-second commit timer and create another split.
+    let universe = Universe::new();
     let temp_dir = tempfile::tempdir().unwrap();
 
     let mut mock_metastore = MockMetastoreService::new();
@@ -160,11 +163,10 @@ async fn test_metrics_pipeline_e2e() {
         quickwit_proto::metastore::MetastoreServiceClient::from_mock(mock_metastore);
     let ram_storage = Arc::new(RamStorage::default());
 
-    let publisher = Publisher::new(
-        super::METRICS_PUBLISHER_NAME,
+    let publisher = Publisher::new_parquet(
+        quickwit_parquet_engine::split::ParquetSplitKind::Metrics,
         quickwit_actors::QueueCapacity::Bounded(1),
         metastore_client.clone(),
-        None,
         None,
         SharedPublishToken::default(),
     );
@@ -511,11 +513,10 @@ async fn test_sketch_pipeline_e2e() {
         quickwit_proto::metastore::MetastoreServiceClient::from_mock(mock_metastore);
     let ram_storage = Arc::new(RamStorage::default());
 
-    let publisher = Publisher::new(
-        super::METRICS_PUBLISHER_NAME,
+    let publisher = Publisher::new_parquet(
+        quickwit_parquet_engine::split::ParquetSplitKind::Sketches,
         QueueCapacity::Bounded(1),
         metastore_client.clone(),
-        None,
         None,
         SharedPublishToken::default(),
     );
@@ -548,7 +549,7 @@ async fn test_sketch_pipeline_e2e() {
     let (packager_mailbox, packager_handle) = universe.spawn_builder().spawn(packager);
 
     let indexer = ParquetIndexer::new(
-        IndexUid::for_test("sketches-test-index", 0),
+        IndexUid::for_test("cpu-distributions", 0),
         "test-source".to_string(),
         None,
         packager_mailbox,
@@ -561,7 +562,7 @@ async fn test_sketch_pipeline_e2e() {
     );
     let doc_processor = ParquetDocProcessor::new(
         sketch_processor,
-        "sketches-test-index".to_string(),
+        "cpu-distributions".to_string(),
         "test-source".to_string(),
         indexer_mailbox,
     );

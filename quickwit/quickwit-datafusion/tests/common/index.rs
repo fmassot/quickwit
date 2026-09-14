@@ -17,15 +17,32 @@ use quickwit_proto::metastore::{CreateIndexRequest, MetastoreService, MetastoreS
 use quickwit_proto::types::IndexUid;
 
 /// Create a metrics index rooted at `data_dir` and return its `IndexUid`.
+#[allow(dead_code)] // Not used by the sketches integration test binary.
 pub async fn create_metrics_index(
     metastore: &MetastoreServiceClient,
     index_id: &str,
     data_dir: &std::path::Path,
 ) -> IndexUid {
+    create_parquet_index(
+        metastore,
+        index_id,
+        data_dir,
+        quickwit_config::IndexType::Metrics,
+    )
+    .await
+}
+
+pub async fn create_parquet_index(
+    metastore: &MetastoreServiceClient,
+    index_id: &str,
+    data_dir: &std::path::Path,
+    index_type: quickwit_config::IndexType,
+) -> IndexUid {
     let index_uri = format!("file://{}", data_dir.display());
     let index_config: quickwit_config::IndexConfig = serde_json::from_value(serde_json::json!({
         "version": "0.8",
         "index_id": index_id,
+        "index_type": index_type,
         "index_uri": index_uri,
         "doc_mapping": { "field_mappings": [] },
     }))

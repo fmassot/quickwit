@@ -35,19 +35,23 @@ use tracing::debug;
 use super::metastore_provider::MetastoreSplitProvider;
 use super::table_provider::MetricsSplitProvider;
 
+/// A resolved Parquet index.
+pub struct ResolvedParquetIndex {
+    pub split_provider: Arc<dyn MetricsSplitProvider>,
+    pub index_uri: Uri,
+    pub split_kind: ParquetSplitKind,
+}
+
 /// Resolves per-index resources needed to scan a metrics index.
 #[async_trait]
 pub trait MetricsIndexResolver: Send + Sync + std::fmt::Debug {
-    /// Returns the split provider and storage URI for `index_name`. The
-    /// `ObjectStore` for that URI is built on demand by the registry the
-    /// first time DataFusion reads from it.
-    async fn resolve(
-        &self,
-        index_name: &str,
-        split_kind: ParquetSplitKind,
-    ) -> DFResult<(Arc<dyn MetricsSplitProvider>, Uri)>;
+    /// Returns the split provider, storage URI and split kind for `index_name`, or `None` if
+    /// the index does not exist or is not a Parquet index. The `ObjectStore` for the URI is
+    /// built on demand by the registry the first time DataFusion reads from it.
+    async fn resolve(&self, index_name: &str) -> DFResult<Option<ResolvedParquetIndex>>;
 
-    async fn list_index_names(&self) -> DFResult<Vec<String>>;
+    /// Names of the Parquet (metrics / sketches) indexes.
+    async fn list_parquet_index_names(&self) -> DFResult<Vec<String>>;
 }
 
 // ── Production implementation ─────────────────────────────────────────
@@ -76,27 +80,36 @@ impl std::fmt::Debug for MetastoreIndexResolver {
 
 #[async_trait]
 impl MetricsIndexResolver for MetastoreIndexResolver {
-    async fn resolve(
-        &self,
-        index_name: &str,
-        split_kind: ParquetSplitKind,
-    ) -> DFResult<(Arc<dyn MetricsSplitProvider>, Uri)> {
-        debug!(index_name, ?split_kind, "resolving parquet index");
+    async fn resolve(&self, index_name: &str) -> DFResult<Option<ResolvedParquetIndex>> {
+        debug!(index_name, "resolving parquet index");
 
-        let response = self
+        let response = match self
             .metastore
             .index_metadata(IndexMetadataRequest::for_index_id(index_name.to_string()))
             .await
-            .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?;
+        {
+            Ok(response) => response,
+            Err(quickwit_proto::metastore::MetastoreError::NotFound(_)) => return Ok(None),
+            Err(err) => return Err(datafusion::error::DataFusionError::External(Box::new(err))),
+        };
 
         let index_metadata = response
             .deserialize_index_metadata()
             .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?;
 
+        let index_type = index_metadata.index_config.index_type;
+        if !index_type.is_parquet() {
+            return Ok(None);
+        }
+        let split_kind = if index_type.is_sketches() {
+            ParquetSplitKind::Sketches
+        } else {
+            ParquetSplitKind::Metrics
+        };
         let index_uid = index_metadata.index_uid.clone();
         let index_uri = index_metadata.index_config.index_uri.clone();
 
-        debug!(%index_uid, %index_uri, "resolved index metadata");
+        debug!(%index_uid, %index_uri, ?split_kind, "resolved index metadata");
 
         let split_provider: Arc<dyn MetricsSplitProvider> = Arc::new(MetastoreSplitProvider::new(
             self.metastore.clone(),
@@ -104,10 +117,14 @@ impl MetricsIndexResolver for MetastoreIndexResolver {
             split_kind,
         ));
 
-        Ok((split_provider, index_uri))
+        Ok(Some(ResolvedParquetIndex {
+            split_provider,
+            index_uri,
+            split_kind,
+        }))
     }
 
-    async fn list_index_names(&self) -> DFResult<Vec<String>> {
+    async fn list_parquet_index_names(&self) -> DFResult<Vec<String>> {
         let response = self
             .metastore
             .list_indexes_metadata(ListIndexesMetadataRequest::all())
@@ -121,7 +138,72 @@ impl MetricsIndexResolver for MetastoreIndexResolver {
 
         Ok(indexes
             .into_iter()
+            .filter(|idx| idx.index_config.index_type.is_parquet())
             .map(|idx| idx.index_config.index_id)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quickwit_config::IndexType;
+    use quickwit_metastore::IndexMetadata;
+    use quickwit_proto::metastore::{
+        EntityKind, IndexMetadataResponse, ListIndexesMetadataResponse, MetastoreError,
+        MockMetastoreService,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_resolver_uses_type_not_name() {
+        let mut indexes = Vec::new();
+        let mut mock = MockMetastoreService::new();
+        for (name, index_type, expected_kind) in [
+            ("cpu", IndexType::Metrics, Some(ParquetSplitKind::Metrics)),
+            (
+                "latencies",
+                IndexType::Sketches,
+                Some(ParquetSplitKind::Sketches),
+            ),
+            ("metrics-logs", IndexType::Tantivy, None),
+        ] {
+            let mut metadata = IndexMetadata::for_test(name, "ram:///indexes/test");
+            metadata.index_config.index_type = index_type;
+            indexes.push(metadata.clone());
+            let mut resolver_mock = MockMetastoreService::new();
+            resolver_mock
+                .expect_index_metadata()
+                .times(1)
+                .returning(move |_| IndexMetadataResponse::try_from_index_metadata(&metadata));
+            let resolver =
+                MetastoreIndexResolver::new(MetastoreServiceClient::from_mock(resolver_mock));
+            let resolved = resolver.resolve(name).await.unwrap();
+            assert_eq!(resolved.map(|index| index.split_kind), expected_kind);
+        }
+        mock.expect_list_indexes_metadata()
+            .times(1)
+            .returning(move |_| Ok(ListIndexesMetadataResponse::for_test(indexes.clone())));
+        let resolver = MetastoreIndexResolver::new(MetastoreServiceClient::from_mock(mock));
+        assert_eq!(
+            resolver.list_parquet_index_names().await.unwrap(),
+            ["cpu", "latencies"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolver_only_swallows_not_found() {
+        let mut mock = MockMetastoreService::new();
+        mock.expect_index_metadata().times(1).returning(|_| {
+            Err(MetastoreError::NotFound(EntityKind::Index {
+                index_id: "missing".to_string(),
+            }))
+        });
+        mock.expect_index_metadata()
+            .times(1)
+            .returning(|_| Err(MetastoreError::Unavailable("offline".to_string())));
+        let resolver = MetastoreIndexResolver::new(MetastoreServiceClient::from_mock(mock));
+        assert!(resolver.resolve("missing").await.unwrap().is_none());
+        assert!(resolver.resolve("cpu").await.is_err());
     }
 }

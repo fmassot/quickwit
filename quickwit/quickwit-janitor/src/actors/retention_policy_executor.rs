@@ -18,7 +18,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use itertools::Itertools;
 use quickwit_actors::{Actor, ActorContext, Handler};
-use quickwit_common::is_parquet_pipeline_index;
 use quickwit_config::IndexConfig;
 use quickwit_metastore::ListIndexesMetadataResponseExt;
 use quickwit_proto::metastore::{
@@ -210,9 +209,15 @@ impl Handler<Execute> for RetentionPolicyExecutor {
             .as_ref()
             .expect("Expected index to have retention policy configure.");
 
-        if is_parquet_pipeline_index(&message.index_uid.index_id) {
+        if index_config.index_type.is_parquet() {
+            let kind = if index_config.index_type.is_sketches() {
+                quickwit_parquet_engine::split::ParquetSplitKind::Sketches
+            } else {
+                quickwit_parquet_engine::split::ParquetSplitKind::Metrics
+            };
             let execution_result = run_execute_parquet_retention_policy(
                 &message.index_uid,
+                kind,
                 self.metastore.clone(),
                 retention_policy,
                 ctx,
@@ -536,7 +541,9 @@ mod tests {
             .expect_list_indexes_metadata()
             .times(..)
             .returning(|_| {
-                let indexes = make_indexes(&[("otel-metrics-v0_9", Some("1 hour"))]);
+                let mut indexes = make_indexes(&[("cpu", Some("1 hour"))]);
+                indexes[0].index_config.index_type = quickwit_config::IndexType::Metrics;
+                indexes[0].index_uid = IndexUid::for_test("cpu", 0);
                 Ok(ListIndexesMetadataResponse::for_test(indexes))
             });
 
@@ -546,7 +553,7 @@ mod tests {
             update_timestamp: 0,
             metadata: ParquetSplitMetadata::metrics_builder()
                 .split_id(ParquetSplitId::new("metrics_expired"))
-                .index_uid("otel-metrics-v0_9:00000000000000000000000000")
+                .index_uid("cpu:00000000000000000000000000")
                 .time_range(TimeRange::new(0, 100))
                 .num_rows(10)
                 .size_bytes(512)

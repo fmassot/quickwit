@@ -112,6 +112,8 @@ quickwit-search = { workspace = true, features = ["testsuite"] }
 quickwit-storage = { workspace = true, features = ["testsuite"] }
 
 [features]
+# Metrics ingestion, Parquet indexing, and SQL query support.
+metrics = ["quickwit-indexing/metrics", "datafusion"]
 datafusion = ["dep:quickwit-datafusion"]
 pprof = [
   "dep:pprof"

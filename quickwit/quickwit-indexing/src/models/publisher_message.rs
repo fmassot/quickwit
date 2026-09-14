@@ -14,7 +14,6 @@
 
 use std::fmt;
 
-use itertools::Itertools;
 use quickwit_metastore::SplitMetadata;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
 use quickwit_proto::types::{IndexUid, SplitId};
@@ -23,31 +22,31 @@ use tracing::Span;
 use crate::merge_policy::MergeTask;
 use crate::models::PublishLock;
 
-pub struct SplitsUpdate {
+/// The common publication envelope. The split and merge-task types keep storage
+/// engines distinct at mailbox boundaries; no runtime engine dispatch is needed.
+pub struct SplitUpdate<Split, Task> {
     pub index_uid: IndexUid,
-    pub new_splits: Vec<SplitMetadata>,
+    pub new_splits: Vec<Split>,
     pub replaced_split_ids: Vec<SplitId>,
     pub checkpoint_delta_opt: Option<IndexCheckpointDelta>,
     pub publish_lock: PublishLock,
-    /// A [`MergeTask`] tracked by either the `MergePlanner` or the `DeleteTaskPlanner`
-    /// in the `MergePipeline` or `DeleteTaskPipeline`.
-    /// See planners docs to understand the usage.
-    /// If `None`, the split batch was built in the `IndexingPipeline`.
-    pub merge_task: Option<MergeTask>,
+    /// Kept alive through metastore publication, source notification and planner
+    /// feedback. Dropping it earlier can release in-flight merge inventory/permits.
+    pub merge_task: Option<Task>,
     pub parent_span: Span,
 }
 
-impl fmt::Debug for SplitsUpdate {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let new_split_ids: String = self
-            .new_splits
-            .iter()
-            .map(|split| split.split_id())
-            .join(",");
-        f.debug_struct("SplitsUpdate")
-            .field("index_id", &self.index_uid.index_id)
-            .field("new_splits", &new_split_ids)
+impl<Split, Task> fmt::Debug for SplitUpdate<Split, Task> {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter
+            .debug_struct("SplitUpdate")
+            .field("index_uid", &self.index_uid)
+            .field("num_new_splits", &self.new_splits.len())
+            .field("replaced_split_ids", &self.replaced_split_ids)
             .field("checkpoint_delta", &self.checkpoint_delta_opt)
             .finish()
     }
 }
+
+/// Tantivy publication; Parquet uses its own split metadata and merge-task types.
+pub type SplitsUpdate = SplitUpdate<SplitMetadata, MergeTask>;

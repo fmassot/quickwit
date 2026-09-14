@@ -27,7 +27,8 @@ use quickwit_parquet_engine::ingest::{ArrowSketchBatchBuilder, SketchDataPoint};
 mod common;
 mod sketch_splits;
 
-use common::{TestSandbox, create_metrics_index};
+use common::TestSandbox;
+use common::index::create_parquet_index;
 use sketch_splits::publish_sketch_split;
 
 async fn start_sandbox() -> TestSandbox {
@@ -111,7 +112,13 @@ async fn test_sketch_merge_and_quantile_sql() {
     let data_dir = &sandbox.data_dir;
     let builder = session_builder(&sandbox);
 
-    let index_uid = create_metrics_index(&metastore, "sketches-latency", data_dir.path()).await;
+    let index_uid = create_parquet_index(
+        &metastore,
+        "sketches-latency",
+        data_dir.path(),
+        quickwit_config::IndexType::Sketches,
+    )
+    .await;
     let batch = make_doc_example_batch();
     publish_sketch_split(
         &metastore,
@@ -208,7 +215,13 @@ async fn test_sketch_merge_and_quantile_substrait() {
     let data_dir = &sandbox.data_dir;
     let builder = session_builder(&sandbox);
 
-    let index_uid = create_metrics_index(&metastore, "datadog-sketches", data_dir.path()).await;
+    let index_uid = create_parquet_index(
+        &metastore,
+        "datadog-sketches",
+        data_dir.path(),
+        quickwit_config::IndexType::Sketches,
+    )
+    .await;
     let batch = make_doc_example_batch();
     publish_sketch_split(
         &metastore,
