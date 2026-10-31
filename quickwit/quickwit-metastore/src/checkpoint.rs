@@ -128,10 +128,15 @@ impl IndexCheckpoint {
         Ok(true)
     }
 
-    /// Resets the checkpoint of the source identified by `source_id`. Returns whether a mutation
-    /// occurred.
+    /// Resets the checkpoint of the source identified by `source_id` to an empty checkpoint.
+    /// Returns whether a mutation occurred.
+    ///
+    /// The empty checkpoint is kept: sources fetch the checkpoint of their source when they start.
     pub(crate) fn reset_source(&mut self, source_id: &str) -> bool {
-        self.per_source.remove(source_id).is_some()
+        let Some(source_checkpoint) = self.per_source.get_mut(source_id) else {
+            return false;
+        };
+        !std::mem::take(source_checkpoint).is_empty()
     }
 
     /// Returns the checkpoint associated with a given source.
@@ -539,6 +544,20 @@ impl SourceCheckpointDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reset_source_keeps_an_empty_checkpoint() {
+        let mut checkpoint = IndexCheckpoint::default();
+        assert!(!checkpoint.reset_source("unknown-source"));
+        checkpoint.add_source("source");
+        assert!(!checkpoint.reset_source("source"));
+        checkpoint
+            .try_apply_delta(IndexCheckpointDelta::for_test("source", 0..3))
+            .unwrap();
+        assert!(checkpoint.reset_source("source"));
+        assert!(checkpoint.source_checkpoint("source").unwrap().is_empty());
+        assert!(checkpoint.source_checkpoint("unknown-source").is_none());
+    }
 
     #[test]
     fn test_delta_from_range() {

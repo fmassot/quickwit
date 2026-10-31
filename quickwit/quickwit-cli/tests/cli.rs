@@ -319,6 +319,47 @@ async fn test_reingest_same_file_cli() {
     assert_eq!(splits_metadata[0].num_docs, 5);
 }
 
+#[tokio::test]
+async fn test_reingest_same_file_with_overwrite_cli() {
+    quickwit_common::setup_logging_for_tests();
+    let index_id = append_random_suffix("test-index-overwrite");
+    let test_env = create_test_env(index_id.clone(), TestStorageType::LocalFileSystem)
+        .await
+        .unwrap();
+    test_env.start_server().await.unwrap();
+    create_logs_index(&test_env).await.unwrap();
+    let index_uid = test_env.index_metadata().await.unwrap().index_uid;
+
+    // `--overwrite` resets the checkpoint, so each run indexes the file again.
+    for overwrite in [false, true, true] {
+        let args = LocalIngestDocsArgs {
+            config_uri: test_env.resource_files.config.clone(),
+            index_id: index_id.clone(),
+            input_path_opt: Some(test_env.resource_files.log_docs.clone()),
+            input_format: SourceInputFormat::Json,
+            overwrite,
+            clear_cache: true,
+            vrl_script: None,
+        };
+        tokio::time::timeout(Duration::from_secs(60), local_ingest_docs_cli(args))
+            .await
+            .expect("local ingest must not wait for a missing checkpoint")
+            .unwrap();
+    }
+
+    let splits_metadata: Vec<SplitMetadata> = test_env
+        .metastore()
+        .await
+        .list_splits(ListSplitsRequest::try_from_index_uid(index_uid).unwrap())
+        .await
+        .unwrap()
+        .collect_splits_metadata()
+        .await
+        .unwrap();
+    assert_eq!(splits_metadata.len(), 1);
+    assert_eq!(splits_metadata[0].num_docs, 5);
+}
+
 /// Helper function to compare a json payload.
 ///
 /// It will serialize and deserialize the value in order

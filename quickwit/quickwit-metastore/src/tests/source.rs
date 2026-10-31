@@ -506,7 +506,8 @@ pub async fn test_metastore_reset_checkpoint<
         index_metadata
             .checkpoint
             .source_checkpoint(&source_ids[0])
-            .is_none()
+            .unwrap()
+            .is_empty()
     );
 
     assert!(
@@ -546,16 +547,21 @@ pub async fn test_metastore_reset_checkpoint<
         .await
         .unwrap();
 
-    assert!(
-        metastore
-            .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
-            .await
-            .unwrap()
-            .deserialize_index_metadata()
-            .unwrap()
-            .checkpoint
-            .is_empty()
-    );
+    let index_metadata = metastore
+        .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
+        .await
+        .unwrap()
+        .deserialize_index_metadata()
+        .unwrap();
+    for source_id in &source_ids {
+        assert!(
+            index_metadata
+                .checkpoint
+                .source_checkpoint(source_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     cleanup_index(&mut metastore, index_uid).await;
 }
