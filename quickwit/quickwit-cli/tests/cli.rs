@@ -67,6 +67,7 @@ async fn local_ingest_docs(uri: Uri, test_env: &TestEnv) -> anyhow::Result<()> {
         overwrite: false,
         clear_cache: true,
         vrl_script: None,
+        num_pipelines: std::num::NonZeroUsize::MIN,
     };
     local_ingest_docs_cli(args).await
 }
@@ -177,6 +178,7 @@ async fn test_cmd_ingest_on_non_existing_index() {
         overwrite: false,
         clear_cache: true,
         vrl_script: None,
+        num_pipelines: std::num::NonZeroUsize::MIN,
     };
 
     let error = local_ingest_docs_cli(args).await.unwrap_err();
@@ -207,6 +209,7 @@ async fn test_ingest_docs_cli_keep_cache() {
         overwrite: false,
         clear_cache: false,
         vrl_script: None,
+        num_pipelines: std::num::NonZeroUsize::MIN,
     };
 
     local_ingest_docs_cli(args).await.unwrap();
@@ -234,6 +237,7 @@ async fn test_ingest_docs_cli() {
         overwrite: false,
         clear_cache: true,
         vrl_script: None,
+        num_pipelines: std::num::NonZeroUsize::MIN,
     };
 
     local_ingest_docs_cli(args).await.unwrap();
@@ -268,6 +272,7 @@ async fn test_ingest_docs_cli() {
         overwrite: false,
         clear_cache: true,
         vrl_script: None,
+        num_pipelines: std::num::NonZeroUsize::MIN,
     };
 
     let error = local_ingest_docs_cli(args).await.unwrap_err();
@@ -300,6 +305,7 @@ async fn test_reingest_same_file_cli() {
             overwrite: false,
             clear_cache: true,
             vrl_script: None,
+            num_pipelines: std::num::NonZeroUsize::MIN,
         };
 
         local_ingest_docs_cli(args).await.unwrap();

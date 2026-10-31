@@ -448,13 +448,84 @@ mod tests {
                     overwrite,
                     vrl_script: Some(vrl_script),
                     clear_cache,
+                    num_pipelines,
                 })) if &index_id == "wikipedia"
+                       && num_pipelines.get() == 1
                        && config_uri == Uri::from_str("file:///config.yaml").unwrap()
                        && vrl_script == ".message = downcase(string!(.message))"
                        && overwrite
                        && !clear_cache
                        && input_format == SourceInputFormat::PlainText,
         ));
+    }
+
+    #[test]
+    fn test_parse_local_ingest_parquet_args() {
+        let app = build_cli().no_binary_name(true);
+        let matches = app
+            .try_get_matches_from([
+                "tool",
+                "local-ingest",
+                "--index",
+                "wikipedia",
+                "--config",
+                "/config.yaml",
+                "--input-path",
+                "/data/wikipedia.parquet",
+                "--num-pipelines",
+                "8",
+            ])
+            .unwrap();
+        let command = CliCommand::parse_cli_args(matches).unwrap();
+        let CliCommand::Tool(ToolCliCommand::LocalIngest(args)) = command else {
+            panic!("expected local ingest command");
+        };
+        assert_eq!(args.input_format, SourceInputFormat::Json);
+        assert_eq!(args.num_pipelines.get(), 8);
+    }
+
+    #[test]
+    fn test_parse_local_ingest_args_rejects_multiple_json_pipelines() {
+        let app = build_cli().no_binary_name(true);
+        let matches = app
+            .try_get_matches_from([
+                "tool",
+                "local-ingest",
+                "--index",
+                "wikipedia",
+                "--config",
+                "/config.yaml",
+                "--num-pipelines",
+                "2",
+            ])
+            .unwrap();
+        let error = CliCommand::parse_cli_args(matches).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a `.parquet` input file")
+        );
+    }
+
+    #[test]
+    fn test_parse_local_ingest_args_rejects_plain_parquet() {
+        let app = build_cli().no_binary_name(true);
+        let matches = app
+            .try_get_matches_from([
+                "tool",
+                "local-ingest",
+                "--index",
+                "wikipedia",
+                "--config",
+                "/config.yaml",
+                "--input-path",
+                "/data/wikipedia.parquet",
+                "--input-format",
+                "plain",
+            ])
+            .unwrap();
+        let error = CliCommand::parse_cli_args(matches).unwrap_err();
+        assert!(error.to_string().contains("indexed as `json` documents"));
     }
 
     #[test]
