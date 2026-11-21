@@ -431,6 +431,7 @@
         <a href="#journey">Optimization Journey</a>
         <a href="#benchmarks">Benchmark Tables</a>
         <a href="#deep-dive">Categories &amp; Pareto</a>
+        <a href="#indexing">Indexing</a>
         <a href="#findings">Key Takeaways</a>
       </nav>
     </div>
@@ -1520,10 +1521,225 @@
       </div>
     </section>
 
+    <!-- INDEXING PERFORMANCE -->
+    <section id="indexing">
+      <div class="section-head">
+        <h2>5. Indexing Throughput &amp; Load Times</h2>
+        <span class="section-tag">CPU efficiency &amp; end-to-end dataset load</span>
+      </div>
+
+      <div class="chart-card">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;" viewBox="0 0 1380 440">
+  <defs>
+    <filter id="shadow_c5" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#141413" flood-opacity="0.04"/>
+    </filter>
+  </defs>
+  <rect width="1380" height="440" fill="#FAF9F6"/>
+  <style>
+    text { font-family: Adwaita Sans, Liberation Sans, sans-serif; fill: #141413; }
+    .mono { font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .title { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .subtitle { font-size: 13px; fill: #5E5C56; }
+    .card-title { font-size: 15px; font-weight: 700; }
+    .card-sub { font-size: 11.5px; fill: #5E5C56; }
+    .label { font-size: 11.5px; fill: #141413; font-weight: 600; }
+    .label-muted { font-size: 10.5px; fill: #5E5C56; }
+    .val { font-size: 11px; font-weight: 700; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .val-sub { font-size: 10px; fill: #5E5C56; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .axis { font-size: 10px; fill: #8C8980; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .pill-txt { font-size: 10.5px; font-weight: 700; }
+    .footer { font-size: 10.5px; fill: #8C8980; }
+  </style>
+<text x="36" y="40" class="title">Indexing Performance — CPU Efficiency &amp; End-to-End Load Times</text>
+<text x="36" y="61" class="subtitle">Left: Quickwit server CPU per doc across indexing optimization waves (2.47M OTEL logs) · Right: Full dataset load times (lower is better)</text>
+<rect x="36" y="82" width="650" height="326" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c5)"/>
+<text x="58" y="110" class="card-title">Quickwit Indexing CPU Cost (2.47M OTEL Logs / 2.9 GB)</text>
+<text x="58" y="128" class="card-sub">Server CPU microseconds per document · Lower is better</text>
+<rect x="552.0" y="98.0" width="112.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="608.0" y="112.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">-61% / 2.58x</text>
+<line x1="88" y1="340.0" x2="660" y2="340.0" stroke="#ECE9E2"/>
+<text x="80" y="343.5" text-anchor="end" class="axis">0 us</text>
+<line x1="88" y1="278.0" x2="660" y2="278.0" stroke="#ECE9E2"/>
+<text x="80" y="281.5" text-anchor="end" class="axis">10 us</text>
+<line x1="88" y1="216.0" x2="660" y2="216.0" stroke="#ECE9E2"/>
+<text x="80" y="219.5" text-anchor="end" class="axis">20 us</text>
+<line x1="88" y1="154.0" x2="660" y2="154.0" stroke="#ECE9E2"/>
+<text x="80" y="157.5" text-anchor="end" class="axis">30 us</text>
+<rect x="111.7" y="171.7" width="48" height="168.3" rx="4.5" fill="#A8A49B"/>
+<text x="135.7" y="155.7" text-anchor="middle" class="val">27.1 us</text>
+<text x="135.7" y="167.7" text-anchor="middle" class="val-sub">(67.2s)</text>
+<text x="135.7" y="356" text-anchor="middle" class="label-muted">0.9.3 Base</text>
+<rect x="207.0" y="249.2" width="48" height="90.8" rx="4.5" fill="#F2B59B"/>
+<text x="231.0" y="233.2" text-anchor="middle" class="val">14.6 us</text>
+<text x="231.0" y="245.2" text-anchor="middle" class="val-sub">(36.2s)</text>
+<text x="231.0" y="356" text-anchor="middle" class="label-muted">Wave 2</text>
+<text x="231.0" y="369" text-anchor="middle" class="label-muted">Stream JSON</text>
+<rect x="302.3" y="255.2" width="48" height="84.8" rx="4.5" fill="#F2B59B"/>
+<text x="326.3" y="239.2" text-anchor="middle" class="val">13.7 us</text>
+<text x="326.3" y="251.2" text-anchor="middle" class="val-sub">(33.8s)</text>
+<text x="326.3" y="356" text-anchor="middle" class="label-muted">Wave 3a</text>
+<rect x="397.7" y="269.9" width="48" height="70.1" rx="4.5" fill="#D9653B"/>
+<text x="421.7" y="253.9" text-anchor="middle" class="val">11.3 us</text>
+<text x="421.7" y="265.9" text-anchor="middle" class="val-sub">(28.0s)</text>
+<text x="421.7" y="356" text-anchor="middle" class="label-muted">Wave 4</text>
+<rect x="493.0" y="272.5" width="48" height="67.5" rx="4.5" fill="#D9653B"/>
+<text x="517.0" y="256.5" text-anchor="middle" class="val">10.9 us</text>
+<text x="517.0" y="268.5" text-anchor="middle" class="val-sub">(26.9s)</text>
+<text x="517.0" y="356" text-anchor="middle" class="label-muted">Wave 5</text>
+<rect x="588.3" y="274.8" width="48" height="65.2" rx="4.5" fill="#B54A24"/>
+<text x="612.3" y="258.8" text-anchor="middle" class="val">10.5 us</text>
+<text x="612.3" y="270.8" text-anchor="middle" class="val-sub">(26.0s)</text>
+<text x="612.3" y="356" text-anchor="middle" class="label-muted">Wave 6</text>
+<text x="612.3" y="369" text-anchor="middle" class="label-muted">(0.9.3-perf)</text>
+<text x="58" y="394" class="footer">Streaming zero-copy JSON + fast doc encoding cut server CPU from 67.2s to 26.0s (-61%).</text>
+<rect x="704" y="82" width="640" height="326" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c5)"/>
+<text x="726" y="110" class="card-title">End-to-End Dataset Load Time (Big5 10M &amp; ClickBench 10M)</text>
+<text x="726" y="128" class="card-sub">Wall seconds to searchable, compacted index · Stacked light bar = refresh + forcemerge</text>
+<text x="904" y="170" text-anchor="end" class="label">Big5: Quickwit 0.9.3-perf</text>
+<rect x="914" y="159" width="240.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="914" y="159" width="96.0" height="15" rx="3.5" fill="#D9653B"/>
+<text x="1017.0" y="170" class="val-sub">64.0s (no merge needed)</text>
+<text x="904" y="208" text-anchor="end" class="label">Big5: Elasticsearch 8.17.4</text>
+<rect x="914" y="197" width="240.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="914" y="197" width="79.3" height="15" rx="3.5" fill="#6E56CF"/>
+<rect x="991.4" y="197" width="33.7" height="15" rx="3.5" fill="#BFB3ED"/>
+<text x="1032.0" y="208" class="val-sub">52.9s + 21.1s fm = 74.0s</text>
+<text x="904" y="246" text-anchor="end" class="label">Big5: OpenSearch 3.10.0</text>
+<rect x="914" y="235" width="240.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="914" y="235" width="84.8" height="15" rx="3.5" fill="#2A8C78"/>
+<rect x="996.8" y="235" width="60.8" height="15" rx="3.5" fill="#9AD0C4"/>
+<text x="1064.5" y="246" class="val-sub">56.5s + 39.2s fm = 95.7s</text>
+<text x="904" y="284" text-anchor="end" class="label">Big5: Quickwit Clustered</text>
+<rect x="914" y="273" width="240.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="914" y="273" width="226.5" height="15" rx="3.5" fill="#B88470"/>
+<text x="1147.5" y="284" class="val-sub">151.0s (2.36x clustering cost)</text>
+<line x1="726" y1="300" x2="1322" y2="300" stroke="#E5E2DC" stroke-dasharray="4,3"/>
+<text x="904" y="322" text-anchor="end" class="label">ClickBench: QW Trimmed+Hashes</text>
+<rect x="914" y="311" width="240.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="914" y="311" width="91.7" height="15" rx="3.5" fill="#B54A24"/>
+<text x="1012.6" y="322" class="val-sub">61.1s (Parquet-&gt;JSON pipe)</text>
+<text x="904" y="360" text-anchor="end" class="label">ClickBench: ClickHouse 26.8</text>
+<rect x="914" y="349" width="240.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="914" y="349" width="12.0" height="15" rx="3.5" fill="#D99B26"/>
+<text x="933.0" y="360" class="val-sub">~8s (native Parquet)</text>
+<text x="726" y="394" class="footer">Quickwit loads Big5 faster end-to-end than ES/OS once forcemerge is counted (1.8-3.4x smaller).</text>
+<text x="36" y="426" class="footer">SearchBench 100M native-Parquet loads: SereneDB 26.09.1 (32.4s), ClickHouse 26.8 nophrase (40.7s) / full (60.7s); Quickwit 0.9.3 Base HTTP/JSON (478.2s).</text>
+</svg>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Benchmark &amp; Dataset</th>
+              <th>Engine / Variant</th>
+              <th>Ingest Input Path</th>
+              <th class="num">Ingest / Load Time</th>
+              <th class="num">Effective Rate</th>
+              <th class="num">Output Size</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="highlight">
+              <td rowspan="2"><strong>OTEL Logs 2.5M</strong><br><span class="dim">2.47M docs · 2.90 GB NDJSON (CPU bench)</span></td>
+              <td><strong>Quickwit 0.9.3-perf</strong> <span class="badge b-qw">Wave 6</span></td>
+              <td>HTTP NDJSON (server CPU measured)</td>
+              <td class="num win">26.0 cpu-s <span class="dim">(10.5 µs/doc)</span></td>
+              <td class="num win">2.58× less CPU</td>
+              <td class="num">183.7 MB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit 0.9.3 Baseline</strong> <span class="badge b-base">Base</span></td>
+              <td>HTTP NDJSON (server CPU measured)</td>
+              <td class="num">67.2 cpu-s <span class="dim">(27.1 µs/doc)</span></td>
+              <td class="num">1.00× baseline</td>
+              <td class="num">190.4 MB</td>
+            </tr>
+            <tr class="highlight">
+              <td rowspan="4"><strong>OpenSearch Big5 10M</strong><br><span class="dim">9.89M docs · zstd NDJSON</span></td>
+              <td><strong>Quickwit 0.9.3-perf</strong> <span class="badge b-qw">49 splits</span></td>
+              <td><code>zstdcat</code> &rarr; <code>local-ingest</code></td>
+              <td class="num win">64.0 s <span class="dim">(ready immediately)</span></td>
+              <td class="num win">154.5k docs/s</td>
+              <td class="num win">2.10 GB</td>
+            </tr>
+            <tr>
+              <td><strong>Elasticsearch 8.17.4</strong> <span class="badge b-es">16 shards</span></td>
+              <td>Bulk HTTP + refresh (1.0s) + forcemerge (20.1s)</td>
+              <td class="num">74.0 s <span class="dim">(52.9s pre-fm)</span></td>
+              <td class="num">133.6k docs/s</td>
+              <td class="num">3.78 GB</td>
+            </tr>
+            <tr>
+              <td><strong>OpenSearch 3.10.0</strong> <span class="badge b-os">16 shards</span></td>
+              <td>Bulk HTTP + refresh (3.5s) + forcemerge (35.7s)</td>
+              <td class="num">95.7 s <span class="dim">(56.5s pre-fm)</span></td>
+              <td class="num">103.3k docs/s</td>
+              <td class="num">7.22 GB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit Clustered</strong> <span class="badge b-qw">49 splits</span></td>
+              <td><code>zstdcat</code> &rarr; <code>local-ingest</code> + clustering</td>
+              <td class="num">151.0 s</td>
+              <td class="num">65.5k docs/s</td>
+              <td class="num">2.19 GB</td>
+            </tr>
+            <tr class="highlight">
+              <td rowspan="2"><strong>ClickBench 10M</strong><br><span class="dim">9.77M valid rows · 105 columns</span></td>
+              <td><strong>Quickwit Trimmed+Hashes</strong> <span class="badge b-qw">14 idx</span></td>
+              <td>Parquet &rarr; JSON pipe &rarr; <code>local-ingest</code></td>
+              <td class="num">61.1 s</td>
+              <td class="num">159.9k rows/s</td>
+              <td class="num">2.45 GB</td>
+            </tr>
+            <tr>
+              <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">28 parts</span></td>
+              <td>Native Parquet direct <code>INSERT</code></td>
+              <td class="num win">~8 s</td>
+              <td class="num win">~1.2M rows/s</td>
+              <td class="num win">1.44 GB</td>
+            </tr>
+            <tr>
+              <td rowspan="4"><strong>SearchBench 100M</strong><br><span class="dim">100M OTEL logs</span></td>
+              <td><strong>SereneDB 26.09.1</strong> <span class="badge b-sdb">local</span></td>
+              <td>Native Parquet load</td>
+              <td class="num win">32.4 s</td>
+              <td class="num win">3.08M docs/s</td>
+              <td class="num">12.03 GB</td>
+            </tr>
+            <tr>
+              <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">nophrase</span></td>
+              <td>Native Parquet load</td>
+              <td class="num">40.7 s</td>
+              <td class="num">2.46M docs/s</td>
+              <td class="num">7.92 GB</td>
+            </tr>
+            <tr>
+              <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">full-text</span></td>
+              <td>Native Parquet load</td>
+              <td class="num">60.7 s</td>
+              <td class="num">1.65M docs/s</td>
+              <td class="num">20.16 GB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit 0.9.3 Baseline</strong> <span class="badge b-base">main-local</span></td>
+              <td>HTTP NDJSON pipeline (pre-opt baseline)*</td>
+              <td class="num">478.2 s</td>
+              <td class="num">209k docs/s</td>
+              <td class="num win">4.53 GB</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="dim" style="margin-top:-10px;">
+        *SearchBench 100M Quickwit load time is from the pre-optimization <code>0.9.3</code> local baseline run; our <code>0.9.3-perf</code> streaming JSON + doc encoding optimizations (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/b92426cfbcacbe4b9789389ee3169b79481409cf" target="_blank" rel="noopener"><code>b92426cfb</code></a> + <a class="commit-link" href="https://github.com/fmassot/tantivy/commit/487c0731f2e0447faa1b31889113064860ce0035" target="_blank" rel="noopener"><code>487c0731f</code></a>) cut Quickwit's server indexing CPU per doc by 2.58× (measured on the 2.47M OTEL slice above).
+      </p>
+    </section>
+
     <!-- KEY TAKEAWAYS -->
     <section id="findings">
       <div class="section-head">
-        <h2>5. Key Architectural Takeaways &amp; Next Opportunities</h2>
+        <h2>6. Key Architectural Takeaways &amp; Next Opportunities</h2>
         <span class="section-tag">Engineering roadmap</span>
       </div>
 
