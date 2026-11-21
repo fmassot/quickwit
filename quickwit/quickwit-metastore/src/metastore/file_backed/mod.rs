@@ -1329,11 +1329,7 @@ async fn get_index_metadata(
     metastore: FileBackedMetastore,
     index_id: IndexId,
 ) -> MetastoreResult<Option<IndexMetadata>> {
-    let request = IndexMetadataRequest::for_index_id(index_id);
-    let index_metadata_result = metastore
-        .index_metadata(request)
-        .await
-        .and_then(|response| response.deserialize_index_metadata());
+    let index_metadata_result = metastore.index_metadata_inner(Some(&index_id), None).await;
     match index_metadata_result {
         Ok(index_metadata) => Ok(Some(index_metadata)),
         Err(MetastoreError::NotFound { .. }) => Ok(None),

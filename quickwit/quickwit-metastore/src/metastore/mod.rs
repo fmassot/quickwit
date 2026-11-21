@@ -372,14 +372,21 @@ impl ListIndexesMetadataResponseExt for ListIndexesMetadataResponse {
     async fn try_from_indexes_metadata(
         indexes_metadata: Vec<IndexMetadata>,
     ) -> MetastoreResult<Self> {
-        let indexes_metadata_json_zstd = run_cpu_intensive(move || {
-            serde_utils::to_json_zstd(&indexes_metadata, 0).map(Bytes::from)
-        })
-        .await
-        .map_err(|join_error| MetastoreError::Internal {
-            message: "failed to serialize indexes metadata".to_string(),
-            cause: join_error.to_string(),
-        })??;
+        // Avoid cross-thread `run_cpu_intensive` handoff overhead for small index lists (the
+        // common single-index search path).
+        const INLINE_SERIALIZE_MAX_INDEXES: usize = 4;
+        let indexes_metadata_json_zstd = if indexes_metadata.len() <= INLINE_SERIALIZE_MAX_INDEXES {
+            serde_utils::to_json_zstd(&indexes_metadata, 0).map(Bytes::from)?
+        } else {
+            run_cpu_intensive(move || {
+                serde_utils::to_json_zstd(&indexes_metadata, 0).map(Bytes::from)
+            })
+            .await
+            .map_err(|join_error| MetastoreError::Internal {
+                message: "failed to serialize indexes metadata".to_string(),
+                cause: join_error.to_string(),
+            })??
+        };
         let response = Self {
             indexes_metadata_json_zstd,
             indexes_metadata_json_opt: None,
@@ -388,6 +395,18 @@ impl ListIndexesMetadataResponseExt for ListIndexesMetadataResponse {
     }
 
     async fn deserialize_indexes_metadata(self) -> MetastoreResult<Vec<IndexMetadata>> {
+        const INLINE_DESER_MAX_ZSTD_BYTES: usize = 16_384;
+        const INLINE_DESER_MAX_JSON_BYTES: usize = 65_536;
+        let is_small = match &self.indexes_metadata_json_opt {
+            Some(json) => json.len() <= INLINE_DESER_MAX_JSON_BYTES,
+            None => self.indexes_metadata_json_zstd.len() <= INLINE_DESER_MAX_ZSTD_BYTES,
+        };
+        if is_small {
+            if let Some(indexes_metadata_json) = &self.indexes_metadata_json_opt {
+                return serde_utils::from_json_str(indexes_metadata_json);
+            }
+            return serde_utils::from_json_zstd(&self.indexes_metadata_json_zstd);
+        }
         run_cpu_intensive(move || {
             if let Some(indexes_metadata_json) = &self.indexes_metadata_json_opt {
                 return serde_utils::from_json_str(indexes_metadata_json);
