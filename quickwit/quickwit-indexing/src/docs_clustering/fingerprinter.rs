@@ -65,7 +65,9 @@ use fnv::FnvHasher;
 use quickwit_config::{
     ClusteringMethod, ClusteringPolicy, DocsClusteringConfig, FingerprintPolicy, JsonPath,
 };
+use quickwit_doc_mapper::{ObservedPrimitive, StreamingJsonObserver};
 use serde_json::Value as JsonValue;
+use serde_json_borrow::{Map as BorrowedJsonMap, Value as BorrowedJsonValue};
 use smallvec::SmallVec;
 
 use super::tokenize;
@@ -101,26 +103,79 @@ impl Fingerprint {
 }
 
 #[derive(Clone)]
+enum StreamingPolicySpec {
+    Structure,
+    RawRoot { field: String },
+    TokenizedRoot { field: String, max_tokens: usize },
+}
+
+#[derive(Clone)]
 pub struct Fingerprinter {
     config: Arc<DocsClusteringConfig>,
     policies: Arc<[FingerprintPolicy]>,
+    streaming_specs_opt: Option<Arc<[StreamingPolicySpec]>>,
 }
 
 impl Fingerprinter {
     pub fn new(config: &DocsClusteringConfig) -> Self {
         let mut policies = Vec::new();
+        let mut streaming_specs = Vec::new();
+        let mut all_streamable = true;
         for policy in &config.policies {
             match policy {
                 ClusteringPolicy::Fingerprint { fingerprint } => {
+                    if fingerprint.fingerprint.len() == 1 {
+                        match &fingerprint.fingerprint[0] {
+                            ClusteringMethod::Structure { exclude } if exclude.is_empty() => {
+                                streaming_specs.push(StreamingPolicySpec::Structure);
+                            }
+                            ClusteringMethod::Raw { path } if path.len() == 1 => {
+                                streaming_specs.push(StreamingPolicySpec::RawRoot {
+                                    field: path[0].clone(),
+                                });
+                            }
+                            ClusteringMethod::Tokenized { path, max_tokens } if path.len() == 1 => {
+                                streaming_specs.push(StreamingPolicySpec::TokenizedRoot {
+                                    field: path[0].clone(),
+                                    max_tokens: max_tokens.unwrap_or(DEFAULT_MAX_GROUPING_TOKENS),
+                                });
+                            }
+                            _ => all_streamable = false,
+                        }
+                    } else {
+                        all_streamable = false;
+                    }
                     policies.push(fingerprint.clone());
                 }
             }
         }
 
+        let streaming_specs_opt = all_streamable.then(|| streaming_specs.into_boxed_slice().into());
         Self {
             config: Arc::new(config.clone()),
             policies: policies.into_boxed_slice().into(),
+            streaming_specs_opt,
         }
+    }
+
+    /// Creates a single-pass streaming observer if every configured policy can be evaluated
+    /// directly during streaming JSON deserialization.
+    pub fn streaming_observer(&self) -> Option<StreamingFingerprintObserver<'_>> {
+        let specs = self.streaming_specs_opt.as_deref()?;
+        let mut has_structure = false;
+        let mut policy_hashes = SmallVec::with_capacity(specs.len());
+        for spec in specs {
+            if matches!(spec, StreamingPolicySpec::Structure) {
+                has_structure = true;
+            }
+            policy_hashes.push(None);
+        }
+        Some(StreamingFingerprintObserver {
+            specs,
+            has_structure,
+            structure_acc: StructureSetHash::default(),
+            policy_hashes,
+        })
     }
 
     pub fn config(&self) -> &DocsClusteringConfig {
@@ -152,50 +207,228 @@ impl Fingerprinter {
         Fingerprint(fingerprint)
     }
 
-    fn hash_structure(&self, value: &JsonValue, exclude: &[JsonPath], hasher: &mut FnvHasher) {
-        fn walk<'a>(
-            json_value: &'a JsonValue,
-            exclude: &[JsonPath],
-            current: &mut Vec<&'a str>,
-            paths: &mut Vec<Vec<&'a str>>,
-        ) {
-            fn is_excluded(exclude: &[JsonPath], path: &[&str]) -> bool {
-                exclude.iter().any(|excluded_path| {
-                    excluded_path.len() == path.len()
-                        && excluded_path.iter().zip(path.iter()).all(
-                            |(excluded_component, component)| {
-                                excluded_component.as_str() == *component
-                            },
-                        )
-                })
+    /// Computes the exact same [`Fingerprint`] directly on a borrowed JSON object without
+    /// allocating an owned `serde_json::Value` tree.
+    pub fn fingerprint_borrowed(&self, json_obj: &BorrowedJsonMap<'_>) -> Fingerprint {
+        let mut fingerprint = SmallVec::new();
+        for policy in self.policies.iter() {
+            let mut hasher = FnvHasher::default();
+
+            for method in policy.fingerprint.iter() {
+                match method {
+                    ClusteringMethod::Structure { exclude } => {
+                        self.hash_structure_borrowed(json_obj, exclude, &mut hasher);
+                    }
+                    ClusteringMethod::Raw { path } => {
+                        self.hash_raw_value_borrowed(json_obj, path, &mut hasher);
+                    }
+                    ClusteringMethod::Tokenized { path, max_tokens } => {
+                        self.hash_string_tokenized_borrowed(
+                            json_obj,
+                            path,
+                            *max_tokens,
+                            &mut hasher,
+                        );
+                    }
+                }
             }
 
+            fingerprint.push(hasher.finish());
+        }
+
+        Fingerprint(fingerprint)
+    }
+
+    fn hash_structure(&self, value: &JsonValue, exclude: &[JsonPath], hasher: &mut FnvHasher) {
+        fn walk_no_exclude(json_value: &JsonValue, parent_hash: u64, acc: &mut StructureSetHash) {
             match json_value {
                 JsonValue::Object(obj) => {
                     for (key, child_value) in obj.iter() {
-                        current.push(key.as_str());
-                        if !is_excluded(exclude, current) {
-                            walk(child_value, exclude, current, paths);
+                        let child_hash = hash_path_component(parent_hash, key.as_str());
+                        walk_no_exclude(child_value, child_hash, acc);
+                    }
+                }
+                _ => acc.insert(parent_hash),
+            }
+        }
+
+        fn walk_with_exclude<'a>(
+            json_value: &'a JsonValue,
+            exclude: &[JsonPath],
+            parent_hash: u64,
+            current: &mut SmallVec<[&'a str; 16]>,
+            acc: &mut StructureSetHash,
+        ) {
+            match json_value {
+                JsonValue::Object(obj) => {
+                    for (key, child_value) in obj.iter() {
+                        let key_str = key.as_str();
+                        current.push(key_str);
+                        if !is_path_excluded(exclude, current) {
+                            let child_hash = hash_path_component(parent_hash, key_str);
+                            walk_with_exclude(child_value, exclude, child_hash, current, acc);
                         }
                         current.pop();
                     }
                 }
-                _ => paths.push(current.clone()),
+                _ => acc.insert(parent_hash),
             }
         }
 
-        let mut current = Vec::with_capacity(16);
-        let mut paths = Vec::with_capacity(32);
-        walk(value, exclude, &mut current, &mut paths);
-        paths.sort_unstable();
-
-        for path in paths {
-            for component in path {
-                hasher.write(component.as_bytes());
-                hasher.write_u8(PATH_COMPONENT_SEPARATOR);
-            }
-            hasher.write_u8(PATH_SEPARATOR);
+        let mut acc = StructureSetHash::default();
+        if exclude.is_empty() {
+            walk_no_exclude(value, STRUCTURE_HASH_SEED, &mut acc);
+        } else {
+            let mut current: SmallVec<[&str; 16]> = SmallVec::new();
+            walk_with_exclude(value, exclude, STRUCTURE_HASH_SEED, &mut current, &mut acc);
         }
+        acc.finish_into(hasher);
+    }
+
+    fn hash_structure_borrowed(
+        &self,
+        json_obj: &BorrowedJsonMap<'_>,
+        exclude: &[JsonPath],
+        hasher: &mut FnvHasher,
+    ) {
+        fn walk_obj_no_exclude(
+            obj: &BorrowedJsonMap<'_>,
+            parent_hash: u64,
+            acc: &mut StructureSetHash,
+        ) {
+            for (key, child_value) in obj.iter() {
+                let child_hash = hash_path_component(parent_hash, key);
+                match child_value {
+                    BorrowedJsonValue::Object(child_obj) => {
+                        walk_obj_no_exclude(child_obj, child_hash, acc);
+                    }
+                    _ => acc.insert(child_hash),
+                }
+            }
+        }
+
+        fn walk_obj_with_exclude<'a>(
+            obj: &'a BorrowedJsonMap<'a>,
+            exclude: &[JsonPath],
+            parent_hash: u64,
+            current: &mut SmallVec<[&'a str; 16]>,
+            acc: &mut StructureSetHash,
+        ) {
+            for (key, child_value) in obj.iter() {
+                current.push(key);
+                if !is_path_excluded(exclude, current) {
+                    let child_hash = hash_path_component(parent_hash, key);
+                    match child_value {
+                        BorrowedJsonValue::Object(child_obj) => {
+                            walk_obj_with_exclude(child_obj, exclude, child_hash, current, acc);
+                        }
+                        _ => acc.insert(child_hash),
+                    }
+                }
+                current.pop();
+            }
+        }
+
+        let mut acc = StructureSetHash::default();
+        if exclude.is_empty() {
+            walk_obj_no_exclude(json_obj, STRUCTURE_HASH_SEED, &mut acc);
+        } else {
+            let mut current: SmallVec<[&str; 16]> = SmallVec::new();
+            walk_obj_with_exclude(
+                json_obj,
+                exclude,
+                STRUCTURE_HASH_SEED,
+                &mut current,
+                &mut acc,
+            );
+        }
+        acc.finish_into(hasher);
+    }
+
+    fn hash_raw_value_borrowed(
+        &self,
+        json_obj: &BorrowedJsonMap<'_>,
+        path: &JsonPath,
+        hasher: &mut FnvHasher,
+    ) {
+        fn hash_raw_borrowed_inner(json_value: &BorrowedJsonValue<'_>, hasher: &mut FnvHasher) {
+            const RAW_NULL: u8 = 0;
+            const RAW_BOOL: u8 = 1;
+            const RAW_NUMBER: u8 = 2;
+            const RAW_STRING: u8 = 3;
+            const RAW_ARRAY: u8 = 4;
+            const RAW_OBJECT: u8 = 5;
+
+            match json_value {
+                BorrowedJsonValue::Null => hasher.write_u8(RAW_NULL),
+                BorrowedJsonValue::Bool(value) => {
+                    hasher.write_u8(RAW_BOOL);
+                    hasher.write_u8(*value as u8);
+                }
+                BorrowedJsonValue::Number(value) => {
+                    hasher.write_u8(RAW_NUMBER);
+                    let number = value.to_string();
+                    hasher.write(number.as_bytes());
+                }
+                BorrowedJsonValue::Str(value) => {
+                    hasher.write_u8(RAW_STRING);
+                    hasher.write_usize(value.len());
+                    hasher.write(value.as_bytes());
+                }
+                BorrowedJsonValue::Array(values) => {
+                    hasher.write_u8(RAW_ARRAY);
+                    hasher.write_usize(values.len());
+                    for value in values {
+                        hash_raw_borrowed_inner(value, hasher);
+                    }
+                }
+                BorrowedJsonValue::Object(map) => {
+                    let mut entries: SmallVec<[(&str, &BorrowedJsonValue<'_>); 16]> =
+                        map.iter().collect();
+                    entries.sort_unstable_by_key(|(key, _)| *key);
+                    hasher.write_u8(RAW_OBJECT);
+                    hasher.write_usize(entries.len());
+                    for (key, value) in entries {
+                        hasher.write_usize(key.len());
+                        hasher.write(key.as_bytes());
+                        hash_raw_borrowed_inner(value, hasher);
+                    }
+                }
+            }
+        }
+
+        let Some(json_value) = get_leaf_borrowed_value(json_obj, path) else {
+            hasher.write_u8(FIELD_ABSENT);
+            hasher.write_u8(FIELD_BOUNDARY);
+            return;
+        };
+        hasher.write_u8(FIELD_PRESENT);
+        hash_raw_borrowed_inner(json_value, hasher);
+        hasher.write_u8(FIELD_BOUNDARY);
+    }
+
+    fn hash_string_tokenized_borrowed(
+        &self,
+        json_obj: &BorrowedJsonMap<'_>,
+        path: &JsonPath,
+        max_tokens: Option<usize>,
+        hasher: &mut FnvHasher,
+    ) {
+        let Some(value) = get_leaf_borrowed_value(json_obj, path).and_then(|val| val.as_str())
+        else {
+            hasher.write_u8(FIELD_ABSENT);
+            hasher.write_u8(FIELD_BOUNDARY);
+            return;
+        };
+        hasher.write_u8(FIELD_PRESENT);
+
+        let max_tokens = max_tokens.unwrap_or(DEFAULT_MAX_GROUPING_TOKENS);
+        for span in tokenize(value).take(max_tokens) {
+            hasher.write_u8(span.token_type as u8);
+            hasher.write_u8(TOKENIZED_TOKEN_SEPARATOR);
+        }
+
+        hasher.write_u8(FIELD_BOUNDARY);
     }
 
     fn hash_raw_value(&self, json_value: &JsonValue, path: &JsonPath, hasher: &mut FnvHasher) {
@@ -274,6 +507,257 @@ impl Fingerprinter {
 
         hasher.write_u8(FIELD_BOUNDARY);
     }
+}
+
+/// Single-pass streaming fingerprint observer that computes the exact same [`Fingerprint`] as
+/// [`Fingerprinter::fingerprint`] while [`quickwit_doc_mapper::DocMapper`] streams JSON directly
+/// into a `CompactDoc`.
+pub struct StreamingFingerprintObserver<'a> {
+    specs: &'a [StreamingPolicySpec],
+    has_structure: bool,
+    structure_acc: StructureSetHash,
+    policy_hashes: SmallVec<[Option<u64>; 4]>,
+}
+
+impl StreamingFingerprintObserver<'_> {
+    /// Finalizes all policy hashes into a [`Fingerprint`].
+    pub fn finish(self) -> Fingerprint {
+        let mut structure_hash_opt: Option<u64> = None;
+        let mut absent_hash_opt: Option<u64> = None;
+        let mut fingerprint = SmallVec::with_capacity(self.specs.len());
+        for (idx, spec) in self.specs.iter().enumerate() {
+            let hash = match spec {
+                StreamingPolicySpec::Structure => *structure_hash_opt.get_or_insert_with(|| {
+                    let mut hasher = FnvHasher::default();
+                    self.structure_acc.finish_into(&mut hasher);
+                    hasher.finish()
+                }),
+                StreamingPolicySpec::RawRoot { .. } | StreamingPolicySpec::TokenizedRoot { .. } => {
+                    self.policy_hashes[idx].unwrap_or_else(|| {
+                        *absent_hash_opt.get_or_insert_with(|| {
+                            let mut hasher = FnvHasher::default();
+                            hasher.write_u8(FIELD_ABSENT);
+                            hasher.write_u8(FIELD_BOUNDARY);
+                            hasher.finish()
+                        })
+                    })
+                }
+            };
+            fingerprint.push(hash);
+        }
+        Fingerprint(fingerprint)
+    }
+}
+
+impl StreamingJsonObserver for StreamingFingerprintObserver<'_> {
+    #[inline]
+    fn root_hash_seed(&self) -> u64 {
+        STRUCTURE_HASH_SEED
+    }
+
+    #[inline]
+    fn wants_root_value(&self, key: &str) -> bool {
+        self.specs.iter().any(|spec| match spec {
+            StreamingPolicySpec::RawRoot { field } => field == key,
+            StreamingPolicySpec::TokenizedRoot { field, .. } => field == key,
+            StreamingPolicySpec::Structure => false,
+        })
+    }
+
+    #[inline]
+    fn on_root_primitive(&mut self, key: &str, value: ObservedPrimitive<'_>) {
+        if self.has_structure {
+            let leaf_hash = hash_path_component(STRUCTURE_HASH_SEED, key);
+            self.structure_acc.insert(leaf_hash);
+        }
+        for (idx, spec) in self.specs.iter().enumerate() {
+            match spec {
+                StreamingPolicySpec::RawRoot { field } if field == key => {
+                    let mut hasher = FnvHasher::default();
+                    hasher.write_u8(FIELD_PRESENT);
+                    hash_observed_raw_primitive(value, &mut hasher);
+                    hasher.write_u8(FIELD_BOUNDARY);
+                    self.policy_hashes[idx] = Some(hasher.finish());
+                }
+                StreamingPolicySpec::TokenizedRoot { field, max_tokens } if field == key => {
+                    let mut hasher = FnvHasher::default();
+                    if let ObservedPrimitive::Str(text) = value {
+                        hasher.write_u8(FIELD_PRESENT);
+                        for span in tokenize(text).take(*max_tokens) {
+                            hasher.write_u8(span.token_type as u8);
+                            hasher.write_u8(TOKENIZED_TOKEN_SEPARATOR);
+                        }
+                    } else {
+                        hasher.write_u8(FIELD_ABSENT);
+                    }
+                    hasher.write_u8(FIELD_BOUNDARY);
+                    self.policy_hashes[idx] = Some(hasher.finish());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[inline]
+    fn on_root_array(&mut self, key: &str) {
+        if self.has_structure {
+            let leaf_hash = hash_path_component(STRUCTURE_HASH_SEED, key);
+            self.structure_acc.insert(leaf_hash);
+        }
+    }
+
+    #[inline]
+    fn on_object_enter(&mut self, parent_hash: u64, key: &str) -> u64 {
+        if self.has_structure {
+            hash_path_component(parent_hash, key)
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn on_nested_leaf(&mut self, leaf_hash: u64) {
+        if self.has_structure {
+            self.structure_acc.insert(leaf_hash);
+        }
+    }
+}
+
+#[inline]
+fn hash_observed_raw_primitive(value: ObservedPrimitive<'_>, hasher: &mut FnvHasher) {
+    const RAW_NULL: u8 = 0;
+    const RAW_BOOL: u8 = 1;
+    const RAW_NUMBER: u8 = 2;
+    const RAW_STRING: u8 = 3;
+
+    match value {
+        ObservedPrimitive::Null => hasher.write_u8(RAW_NULL),
+        ObservedPrimitive::Bool(bool_val) => {
+            hasher.write_u8(RAW_BOOL);
+            hasher.write_u8(bool_val as u8);
+        }
+        ObservedPrimitive::I64(num) => {
+            hasher.write_u8(RAW_NUMBER);
+            let number = num.to_string();
+            hasher.write(number.as_bytes());
+        }
+        ObservedPrimitive::U64(num) => {
+            hasher.write_u8(RAW_NUMBER);
+            let number = num.to_string();
+            hasher.write(number.as_bytes());
+        }
+        ObservedPrimitive::F64(num) => {
+            hasher.write_u8(RAW_NUMBER);
+            let number = serde_json::Number::from_f64(num)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| num.to_string());
+            hasher.write(number.as_bytes());
+        }
+        ObservedPrimitive::Str(text) => {
+            hasher.write_u8(RAW_STRING);
+            hasher.write_usize(text.len());
+            hasher.write(text.as_bytes());
+        }
+    }
+}
+
+const STRUCTURE_HASH_SEED: u64 = 0x517cc1b727220a95;
+const FX_HASH_K: u64 = 0x517cc1b727220a95;
+
+/// Commutative, order-independent accumulator for the set of leaf JSON paths in a document.
+///
+/// Each leaf path is hashed incrementally during DFS (reusing each parent object's prefix hash
+/// across all its children), finalized with `splitmix64`, and folded into both a wrapping sum and
+/// an XOR accumulator along with the leaf count. This avoids allocating or sorting path lists
+/// while producing identical hashes regardless of JSON key ordering.
+#[derive(Default)]
+struct StructureSetHash {
+    sum: u64,
+    xor: u64,
+    count: u64,
+}
+
+impl StructureSetHash {
+    #[inline(always)]
+    fn insert(&mut self, leaf_hash: u64) {
+        let mixed = splitmix64(leaf_hash);
+        self.sum = self.sum.wrapping_add(mixed);
+        self.xor ^= mixed;
+        self.count += 1;
+    }
+
+    #[inline(always)]
+    fn finish_into(&self, hasher: &mut FnvHasher) {
+        hasher.write_u64(self.sum);
+        hasher.write_u64(self.xor);
+        hasher.write_u64(self.count);
+        hasher.write_u8(PATH_SEPARATOR);
+    }
+}
+
+#[inline(always)]
+fn splitmix64(mut val: u64) -> u64 {
+    val = val.wrapping_add(0x9e3779b97f4a7c15);
+    val = (val ^ (val >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    val = (val ^ (val >> 27)).wrapping_mul(0x94d049bb133111eb);
+    val ^ (val >> 31)
+}
+
+/// Extends `parent_hash` with one path component using 8-byte word hashing and a component
+/// separator so dotted keys (`"a.b"`) hash differently from nested paths (`["a", "b"]`).
+#[inline(always)]
+fn hash_path_component(mut state: u64, component: &str) -> u64 {
+    let mut bytes = component.as_bytes();
+    while bytes.len() >= 8 {
+        let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        state = (state.rotate_left(5) ^ word).wrapping_mul(FX_HASH_K);
+        bytes = &bytes[8..];
+    }
+    if bytes.len() >= 4 {
+        let word = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
+        state = (state.rotate_left(5) ^ word).wrapping_mul(FX_HASH_K);
+        bytes = &bytes[4..];
+    }
+    if bytes.len() >= 2 {
+        let word = u16::from_le_bytes(bytes[..2].try_into().unwrap()) as u64;
+        state = (state.rotate_left(5) ^ word).wrapping_mul(FX_HASH_K);
+        bytes = &bytes[2..];
+    }
+    if let Some(&last_byte) = bytes.first() {
+        state = (state.rotate_left(5) ^ (last_byte as u64)).wrapping_mul(FX_HASH_K);
+    }
+    // Mix component length and separator to keep component boundaries unambiguous.
+    let boundary = ((component.len() as u64) << 8) | (PATH_COMPONENT_SEPARATOR as u64);
+    (state.rotate_left(5) ^ boundary).wrapping_mul(FX_HASH_K)
+}
+
+#[inline]
+fn is_path_excluded(exclude: &[JsonPath], path: &[&str]) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    exclude.iter().any(|excluded_path| {
+        excluded_path.len() == path.len()
+            && excluded_path
+                .iter()
+                .zip(path.iter())
+                .all(|(excluded_component, component)| excluded_component.as_str() == *component)
+    })
+}
+
+fn get_leaf_borrowed_value<'a>(
+    json_obj: &'a BorrowedJsonMap<'a>,
+    path: &[String],
+) -> Option<&'a BorrowedJsonValue<'a>> {
+    let (first, rest) = path.split_first()?;
+    let mut current = json_obj.get(first.as_str())?;
+    for segment in rest {
+        let BorrowedJsonValue::Object(obj) = current else {
+            return None;
+        };
+        current = obj.get(segment.as_str())?;
+    }
+    Some(current)
 }
 
 fn get_leaf_json_value<'a>(json_value: &'a JsonValue, path: &[String]) -> Option<&'a JsonValue> {
@@ -550,5 +1034,84 @@ mod tests {
 
         assert_eq!(doc1_fingerprint[0], doc2_fingerprint[0]);
         assert_ne!(doc1_fingerprint[1], doc2_fingerprint[1]);
+    }
+
+    #[test]
+    fn borrowed_and_owned_fingerprints_match_across_key_orders() {
+        let fingerprinter = test_fingerprinter();
+        let json1 = r#"{"message":"server started at 8080","service":"api","attrs":{"z":1,"a":"v","nested":{"k":true}},"custom":{"ignored":1}}"#;
+        let json2 = r#"{"service":"api","attrs":{"nested":{"k":true},"a":"v","z":1},"message":"server started at 9090","custom":{"other":2}}"#;
+
+        let owned1 = parse(json1);
+        let owned2 = parse(json2);
+        let borrowed1: serde_json_borrow::Value = serde_json::from_str(json1).unwrap();
+        let borrowed2: serde_json_borrow::Value = serde_json::from_str(json2).unwrap();
+
+        let fp_owned1 = fingerprinter.fingerprint(&owned1);
+        let fp_owned2 = fingerprinter.fingerprint(&owned2);
+        let fp_borrowed1 = fingerprinter.fingerprint_borrowed(borrowed1.as_object().unwrap());
+        let fp_borrowed2 = fingerprinter.fingerprint_borrowed(borrowed2.as_object().unwrap());
+
+        assert_eq!(fp_owned1, fp_borrowed1);
+        assert_eq!(fp_owned2, fp_borrowed2);
+        assert_eq!(fp_borrowed1, fp_borrowed2);
+    }
+
+    #[test]
+    fn streaming_observer_matches_owned_and_borrowed_fingerprints() {
+        let docs_clustering_config = docs_clustering_config(serde_json::json!([
+            { "fingerprint": [{ "kind": "structure" }] },
+            { "fingerprint": [{ "path": "ServiceName", "kind": "raw" }] },
+            { "fingerprint": [{ "path": "SeverityText", "kind": "raw" }] },
+            { "fingerprint": [{ "path": "Body", "kind": "tokenized" }] }
+        ]));
+        let fingerprinter = Fingerprinter::new(&docs_clustering_config);
+        let doc_mapper: quickwit_doc_mapper::DocMapper =
+            serde_json::from_value(serde_json::json!({
+                "mode": "dynamic",
+                "dynamic_mapping": { "indexed": false, "stored": true, "fast": false },
+                "field_mappings": [
+                    { "name": "Timestamp", "type": "datetime", "fast": true, "indexed": false },
+                    { "name": "Body", "type": "text" },
+                    { "name": "ServiceName", "type": "text", "tokenizer": "raw", "fast": true },
+                    { "name": "SeverityText", "type": "text", "tokenizer": "raw", "fast": true }
+                ],
+                "timestamp_field": "Timestamp"
+            }))
+            .unwrap();
+        assert!(doc_mapper.can_stream_json());
+
+        let samples = [
+            r#"{"Timestamp":1758585600000,"ServiceName":"frontend","SeverityText":"error","Body":"Failed to place order 42","ResourceAttributes":{"host.name":"node-1","pid":"17"},"ScopeAttributes":{},"LogAttributes":{"trace_id":"abc","num":13,"flag":true}}"#,
+            r#"{"Timestamp":1758585600000,"ServiceName":"checkout","Body":"Timeout from 10.0.0.1","Extra":[1,2,3]}"#,
+        ];
+        for json_str in samples {
+            let owned = parse(json_str);
+            let borrowed: serde_json_borrow::Value = serde_json::from_str(json_str).unwrap();
+            let mut observer = fingerprinter.streaming_observer().unwrap();
+            let (stream_part, stream_doc) = doc_mapper
+                .try_doc_from_json_str_streaming(json_str, &mut observer)
+                .unwrap()
+                .unwrap();
+            let fp_stream = observer.finish();
+
+            assert_eq!(fp_stream, fingerprinter.fingerprint(&owned));
+            assert_eq!(
+                fp_stream,
+                fingerprinter.fingerprint_borrowed(borrowed.as_object().unwrap())
+            );
+            let (dom_part, dom_doc) = doc_mapper
+                .doc_from_json_obj(owned.as_object().unwrap().clone(), json_str.len() as u64)
+                .unwrap();
+            assert_eq!(stream_part, dom_part);
+            let schema = doc_mapper.schema();
+            let stream_json = doc_mapper
+                .doc_to_json(tantivy::Document::to_named_doc(&stream_doc, &schema).0)
+                .unwrap();
+            let dom_json = doc_mapper
+                .doc_to_json(tantivy::Document::to_named_doc(&dom_doc, &schema).0)
+                .unwrap();
+            assert_eq!(stream_json, dom_json);
+        }
     }
 }

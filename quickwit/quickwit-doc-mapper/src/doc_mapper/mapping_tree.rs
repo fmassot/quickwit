@@ -27,6 +27,9 @@ use tantivy::schema::{
     NumericOptions, OwnedValue as TantivyValue, SchemaBuilder, TextOptions,
 };
 
+use super::borrowed_json::{
+    BorrowedDocValue, DynamicEntry, emit_borrowed_json_concatenate, insert_borrowed_dynamic_path,
+};
 use super::date_time_type::QuickwitDateTimeOptions;
 use super::field_mapping_entry::QuickwitBoolOptions;
 use super::tantivy_val_to_json::formatted_tantivy_value_to_json;
@@ -220,6 +223,151 @@ impl LeafType {
         }
     }
 
+    fn add_borrowed_json_to_doc(
+        &self,
+        field: Field,
+        json_val: &BorrowedJsonValue<'_>,
+        document: &mut Document,
+    ) -> Result<(), String> {
+        match self {
+            LeafType::Text(_) => {
+                if let BorrowedJsonValue::Str(text) = json_val {
+                    document.add_text(field, text.as_ref());
+                    Ok(())
+                } else {
+                    Err(format!("expected string, got `{json_val}`"))
+                }
+            }
+            LeafType::I64(numeric_options) => {
+                let val = i64::from_borrowed_json_to_self(json_val, numeric_options.coerce)?;
+                document.add_i64(field, val);
+                Ok(())
+            }
+            LeafType::U64(numeric_options) => {
+                let val = u64::from_borrowed_json_to_self(json_val, numeric_options.coerce)?;
+                document.add_u64(field, val);
+                Ok(())
+            }
+            LeafType::F64(numeric_options) => {
+                let val = f64::from_borrowed_json_to_self(json_val, numeric_options.coerce)?;
+                document.add_f64(field, val);
+                Ok(())
+            }
+            LeafType::Bool(_) => {
+                if let BorrowedJsonValue::Bool(val) = json_val {
+                    document.add_bool(field, *val);
+                    Ok(())
+                } else {
+                    Err(format!("expected boolean, got `{json_val}`"))
+                }
+            }
+            LeafType::IpAddr(_) => {
+                if let BorrowedJsonValue::Str(ip_address) = json_val {
+                    let ipv6_value = IpAddr::from_str(ip_address.as_ref())
+                        .map_err(|err| format!("failed to parse IP address `{ip_address}`: {err}"))?
+                        .into_ipv6_addr();
+                    document.add_ip_addr(field, ipv6_value);
+                    Ok(())
+                } else {
+                    Err(format!("expected string, got `{json_val}`"))
+                }
+            }
+            LeafType::DateTime(date_time_options) => {
+                let date_time = date_time_options.parse_borrowed_json(json_val)?;
+                document.add_date(field, date_time);
+                Ok(())
+            }
+            LeafType::Bytes(binary_options) => {
+                if let BorrowedJsonValue::Str(byte_str) = json_val {
+                    let payload = binary_options.input_format.parse_str(byte_str.as_ref())?;
+                    document.add_bytes(field, &payload);
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "expected {} string, got `{json_val}`",
+                        binary_options.input_format.as_str()
+                    ))
+                }
+            }
+            LeafType::Json(_) => {
+                if let BorrowedJsonValue::Object(json_obj) = json_val {
+                    document.add_field_value(field, BorrowedDocValue::JsonObject(json_obj));
+                    Ok(())
+                } else {
+                    Err(format!("expected object, got `{json_val}`"))
+                }
+            }
+            LeafType::TieBreaker => {
+                Err("tie_breaker values are generated during segment serialization".to_string())
+            }
+        }
+    }
+
+    fn emit_borrowed_concatenate(
+        &self,
+        json_val: &BorrowedJsonValue<'_>,
+        concat_fields: &[Field],
+        document: &mut Document,
+    ) -> Result<(), String> {
+        match self {
+            LeafType::Text(_) => {
+                if let BorrowedJsonValue::Str(text) = json_val {
+                    for &field in concat_fields {
+                        document.add_text(field, text.as_ref());
+                    }
+                    Ok(())
+                } else {
+                    Err(format!("expected string, got `{json_val}`"))
+                }
+            }
+            LeafType::I64(numeric_options) => {
+                let val = i64::from_borrowed_json_to_self(json_val, numeric_options.coerce)?;
+                for &field in concat_fields {
+                    document.add_i64(field, val);
+                }
+                Ok(())
+            }
+            LeafType::U64(numeric_options) => {
+                let val = u64::from_borrowed_json_to_self(json_val, numeric_options.coerce)?;
+                for &field in concat_fields {
+                    document.add_u64(field, val);
+                }
+                Ok(())
+            }
+            LeafType::F64(numeric_options) => {
+                let val = f64::from_borrowed_json_to_self(json_val, numeric_options.coerce)?;
+                for &field in concat_fields {
+                    document.add_f64(field, val);
+                }
+                Ok(())
+            }
+            LeafType::Bool(_) => {
+                if let BorrowedJsonValue::Bool(val) = json_val {
+                    for &field in concat_fields {
+                        document.add_bool(field, *val);
+                    }
+                    Ok(())
+                } else {
+                    Err(format!("expected boolean, got `{json_val}`"))
+                }
+            }
+            LeafType::IpAddr(_) => Err("unsupported concat type: IpAddr".to_string()),
+            LeafType::DateTime(_) => Err("unsupported concat type: DateTime".to_string()),
+            LeafType::Bytes(_) => Err("unsupported concat type: Bytes".to_string()),
+            LeafType::Json(_) => {
+                if let BorrowedJsonValue::Object(json_obj) = json_val {
+                    for (_key, val) in json_obj.iter() {
+                        emit_borrowed_json_concatenate(val, concat_fields, document);
+                    }
+                    Ok(())
+                } else {
+                    Err(format!("expected object, got `{json_val}`"))
+                }
+            }
+            LeafType::TieBreaker => Err("unsupported concat type: TieBreaker".to_string()),
+        }
+    }
+
     fn value_from_json(&self, json_val: JsonValue) -> Result<TantivyValue, String> {
         match self {
             LeafType::Text(_) => {
@@ -336,11 +484,11 @@ impl LeafType {
 
 #[derive(Clone)]
 pub(crate) struct MappingLeaf {
-    field: Field,
-    typ: LeafType,
-    cardinality: Cardinality,
+    pub(crate) field: Field,
+    pub(crate) typ: LeafType,
+    pub(crate) cardinality: Cardinality,
     // concatenate fields this field is part of
-    concatenate: Vec<Field>,
+    pub(crate) concatenate: Vec<Field>,
 }
 
 impl MappingLeaf {
@@ -381,6 +529,55 @@ impl MappingLeaf {
             .validate_from_json(json_value)
             .map_err(|err_msg| DocParsingError::ValueError(path.join("."), err_msg))?;
 
+        Ok(())
+    }
+
+    pub fn doc_from_borrowed_json(
+        &self,
+        json_val: &BorrowedJsonValue<'_>,
+        document: &mut Document,
+        path: &[&str],
+        strict_mode: bool,
+    ) -> Result<(), DocParsingError> {
+        if matches!(self.typ, LeafType::TieBreaker) {
+            return check_supplied_tie_breaker_value(
+                json_val.is_null(),
+                strict_mode,
+                path.join("."),
+            );
+        }
+        if json_val.is_null() {
+            // We just ignore `null`.
+            return Ok(());
+        }
+        if let BorrowedJsonValue::Array(els) = json_val {
+            if self.cardinality == Cardinality::SingleValued {
+                return Err(DocParsingError::MultiValuesNotSupported(path.join(".")));
+            }
+            for el_json_val in els {
+                if el_json_val.is_null() {
+                    continue;
+                }
+                if !self.concatenate.is_empty() {
+                    self.typ
+                        .emit_borrowed_concatenate(el_json_val, &self.concatenate, document)
+                        .map_err(|err_msg| DocParsingError::ValueError(path.join("."), err_msg))?;
+                }
+                self.typ
+                    .add_borrowed_json_to_doc(self.field, el_json_val, document)
+                    .map_err(|err_msg| DocParsingError::ValueError(path.join("."), err_msg))?;
+            }
+            return Ok(());
+        }
+
+        if !self.concatenate.is_empty() {
+            self.typ
+                .emit_borrowed_concatenate(json_val, &self.concatenate, document)
+                .map_err(|err_msg| DocParsingError::ValueError(path.join("."), err_msg))?;
+        }
+        self.typ
+            .add_borrowed_json_to_doc(self.field, json_val, document)
+            .map_err(|err_msg| DocParsingError::ValueError(path.join("."), err_msg))?;
         Ok(())
     }
 
@@ -653,7 +850,7 @@ fn insert_json_val(
 
 /// Tie-breaker values are generated by Quickwit, so a supplied value is rejected in strict mode
 /// and ignored otherwise. `null` counts as no value.
-fn check_supplied_tie_breaker_value(
+pub(crate) fn check_supplied_tie_breaker_value(
     is_null: bool,
     strict_mode: bool,
     path: String,
@@ -693,6 +890,48 @@ pub(crate) trait NumVal: Sized + FromStr + ToString + Into<TantivyValue> {
                         )
                     })?;
                     Ok(())
+                } else {
+                    Err(format!(
+                        "expected JSON number, got string `\"{str_val}\"`. enable coercion to {} \
+                         with the `coerce` parameter in the field mapping",
+                        type_name::<Self>()
+                    ))
+                }
+            }
+            _ => {
+                let message = if coerce {
+                    format!("expected JSON number or string, got `{json_val}`")
+                } else {
+                    format!("expected JSON number, got `{json_val}`")
+                };
+                Err(message)
+            }
+        }
+    }
+
+    fn from_borrowed_json_number(num: &serde_json_borrow::Number) -> Option<Self>;
+
+    fn from_borrowed_json_to_self(
+        json_val: &BorrowedJsonValue,
+        coerce: bool,
+    ) -> Result<Self, String> {
+        match json_val {
+            BorrowedJsonValue::Number(num_val) => Self::from_borrowed_json_number(num_val)
+                .ok_or_else(|| {
+                    format!(
+                        "expected {}, got inconvertible JSON number `{}`",
+                        type_name::<Self>(),
+                        num_val
+                    )
+                }),
+            BorrowedJsonValue::Str(str_val) => {
+                if coerce {
+                    str_val.parse::<Self>().map_err(|_| {
+                        format!(
+                            "failed to coerce JSON string `\"{str_val}\"` to {}",
+                            type_name::<Self>()
+                        )
+                    })
                 } else {
                     Err(format!(
                         "expected JSON number, got string `\"{str_val}\"`. enable coercion to {} \
@@ -757,15 +996,27 @@ impl NumVal for u64 {
     fn from_json_number(num: &serde_json::Number) -> Option<Self> {
         num.as_u64()
     }
+
+    fn from_borrowed_json_number(num: &serde_json_borrow::Number) -> Option<Self> {
+        num.as_u64()
+    }
 }
 
 impl NumVal for i64 {
     fn from_json_number(num: &serde_json::Number) -> Option<Self> {
         num.as_i64()
     }
+
+    fn from_borrowed_json_number(num: &serde_json_borrow::Number) -> Option<Self> {
+        num.as_i64()
+    }
 }
 impl NumVal for f64 {
     fn from_json_number(num: &serde_json::Number) -> Option<Self> {
+        num.as_f64()
+    }
+
+    fn from_borrowed_json_number(num: &serde_json_borrow::Number) -> Option<Self> {
         num.as_f64()
     }
 }
@@ -841,6 +1092,13 @@ impl MappingNode {
         }
     }
 
+    pub fn has_nested_nodes_or_concatenate(&self) -> bool {
+        self.branches.values().any(|tree| match tree {
+            MappingTree::Node(_) => true,
+            MappingTree::Leaf(leaf) => !leaf.concatenate.is_empty(),
+        })
+    }
+
     #[cfg(test)]
     pub fn num_fields(&self) -> usize {
         self.branches.len()
@@ -880,6 +1138,40 @@ impl MappingNode {
                 path.push(field_name);
                 let field_path = path.join(".");
                 return Err(DocParsingError::NoSuchFieldInSchema(field_path));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn doc_from_borrowed_json<'a>(
+        &self,
+        json_obj: &'a BorrowedJsonMap<'a>,
+        mode: ModeType,
+        document: &mut Document,
+        path: &mut Vec<&'a str>,
+        dynamic_entries: &mut Vec<(&'a str, DynamicEntry<'a>)>,
+    ) -> Result<(), DocParsingError> {
+        for (field_name, val) in json_obj.iter() {
+            if let Some(child_tree) = self.branches.get(field_name) {
+                path.push(field_name);
+                child_tree.doc_from_borrowed_json(val, mode, document, path, dynamic_entries)?;
+                path.pop();
+            } else {
+                match mode {
+                    ModeType::Lenient => {}
+                    ModeType::Dynamic => {
+                        if path.is_empty() {
+                            dynamic_entries.push((field_name, DynamicEntry::Borrowed(val)));
+                        } else {
+                            insert_borrowed_dynamic_path(path, field_name, val, dynamic_entries);
+                        }
+                    }
+                    ModeType::Strict => {
+                        path.push(field_name);
+                        let field_path = path.join(".");
+                        return Err(DocParsingError::NoSuchFieldInSchema(field_path));
+                    }
+                }
             }
         }
         Ok(())
@@ -1017,6 +1309,43 @@ impl MappingTree {
                 } else {
                     Err(DocParsingError::ValueError(
                         field_path.join("."),
+                        format!("expected an JSON object, got {json_value}"),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn doc_from_borrowed_json<'a>(
+        &self,
+        json_value: &'a BorrowedJsonValue<'a>,
+        mode: ModeType,
+        document: &mut Document,
+        path: &mut Vec<&'a str>,
+        dynamic_entries: &mut Vec<(&'a str, DynamicEntry<'a>)>,
+    ) -> Result<(), DocParsingError> {
+        match self {
+            MappingTree::Leaf(mapping_leaf) => mapping_leaf.doc_from_borrowed_json(
+                json_value,
+                document,
+                path,
+                mode == ModeType::Strict,
+            ),
+            MappingTree::Node(mapping_node) => {
+                if is_empty_borrowed_json_value(json_value) {
+                    return Ok(());
+                }
+                if let Some(json_obj) = json_value.as_object() {
+                    mapping_node.doc_from_borrowed_json(
+                        json_obj,
+                        mode,
+                        document,
+                        path,
+                        dynamic_entries,
+                    )
+                } else {
+                    Err(DocParsingError::ValueError(
+                        path.join("."),
                         format!("expected an JSON object, got {json_value}"),
                     ))
                 }

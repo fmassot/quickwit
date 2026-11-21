@@ -27,11 +27,15 @@ use serde_json::{self, Value as JsonValue};
 use serde_json_borrow::Map as BorrowedJsonMap;
 use tantivy::TantivyDocument as Document;
 use tantivy::query::Query;
-use tantivy::schema::{Field, FieldType, INDEXED, OwnedValue as TantivyValue, STORED, Schema};
+use tantivy::schema::{Field, FieldType, OwnedValue as TantivyValue, STORED, Schema};
 
 use super::DocMapperBuilder;
+use super::borrowed_json::{BorrowedDocValue, emit_dynamic_entries_concatenate};
 use super::field_mapping_entry::RAW_TOKENIZER_NAME;
 use super::field_presence::populate_field_presence;
+use super::streaming_json::{
+    StreamingJsonObserver, StreamingParseOutcome, stream_json_str_into_doc,
+};
 use super::tantivy_val_to_json::tantivy_value_to_json;
 use crate::doc_mapper::mapping_tree::{
     JsonValueIterator, MappingNode, MappingNodeRoot, build_field_path_from_str, build_mapping_tree,
@@ -64,6 +68,15 @@ pub struct DocMapper {
     /// Indexes field presence. It is necessary to enable this in order to run exists
     /// queries.
     index_field_presence: bool,
+    /// Precomputed leaf presence hash for each non-JSON indexed non-fast field (indexed by
+    /// `field_id`), avoiding per-document `PathHasher` work.
+    field_presence_leaf_hashes: Vec<Option<u64>>,
+    /// True if any indexed non-fast field in `schema` is a `JsonObject`, which requires
+    /// recursive subfield presence hashing.
+    has_indexed_non_fast_json_field: bool,
+    /// True if documents can be parsed in a single streaming pass directly into `CompactDoc`
+    /// without building an intermediate JSON DOM.
+    can_stream_json: bool,
     /// Field in which the dynamically mapped fields should be stored.
     /// This field is only valid when using the schema associated with the default
     /// doc mapper, and therefore cannot be used in the `query` method.
@@ -162,8 +175,10 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
         let mut schema_builder = Schema::builder();
 
         // We want the field ID of the field presence field to be 0, so we add it to the schema
-        // first.
-        let field_presence_field = schema_builder.add_u64_field(FIELD_PRESENCE_FIELD_NAME, INDEXED);
+        // first. `_field_presence` is only used for existence checks and never needs fieldnorms.
+        let field_presence_options = tantivy::schema::NumericOptions::default().set_indexed();
+        let field_presence_field =
+            schema_builder.add_u64_field(FIELD_PRESENCE_FIELD_NAME, field_presence_options);
         assert_eq!(field_presence_field, FIELD_PRESENCE_FIELD);
 
         let doc_mapping = builder.doc_mapping;
@@ -279,10 +294,32 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
                 tag_field_names.insert(partition_key);
             }
         }
+        let mut field_presence_leaf_hashes = vec![None; schema.num_fields()];
+        let mut has_indexed_non_fast_json_field = false;
+        for (field, field_entry) in schema.fields() {
+            if !field_entry.is_indexed() || field_entry.is_fast() {
+                continue;
+            }
+            if matches!(field_entry.field_type(), FieldType::JsonObject(_)) {
+                has_indexed_non_fast_json_field = true;
+            } else {
+                let mut path_hasher = quickwit_common::PathHasher::default();
+                path_hasher.append(&field.field_id().to_le_bytes()[..]);
+                field_presence_leaf_hashes[field.field_id() as usize] =
+                    Some(path_hasher.finish_leaf());
+            }
+        }
+        let can_stream_json = partition_key.is_empty()
+            && source_field.is_none()
+            && concatenate_dynamic_fields.is_empty()
+            && !field_mappings.has_nested_nodes_or_concatenate();
         Ok(DocMapper {
             doc_mapping_uid: doc_mapping.doc_mapping_uid,
             schema,
             index_field_presence: doc_mapping.index_field_presence,
+            field_presence_leaf_hashes,
+            has_indexed_non_fast_json_field,
+            can_stream_json,
             source_field,
             dynamic_field,
             document_size_field,
@@ -465,11 +502,83 @@ impl DocMapper {
         Ok(())
     }
 
+    /// Returns `true` if this `DocMapper` supports single-pass streaming JSON parsing directly
+    /// into [`Document`] without building an intermediate JSON DOM.
+    #[inline]
+    pub fn can_stream_json(&self) -> bool {
+        self.can_stream_json
+    }
+
+    /// Attempts to parse a JSON object string directly into a tantivy [`Document`] in a single
+    /// streaming pass while notifying `observer`.
+    ///
+    /// Returns `None` if the mapper configuration or a runtime JSON shape requires the
+    /// DOM-based parser fallback.
+    pub fn try_doc_from_json_str_streaming<O: StreamingJsonObserver>(
+        &self,
+        json_str: &str,
+        observer: &mut O,
+    ) -> Option<Result<(Partition, Document), DocParsingError>> {
+        let mut scratch = Vec::with_capacity(256);
+        self.try_doc_from_json_str_streaming_with_scratch(json_str, &mut scratch, observer)
+    }
+
+    /// Same as [`Self::try_doc_from_json_str_streaming`], reusing a caller-owned `scratch` buffer
+    /// across documents in a batch to eliminate per-document scratch buffer setup.
+    pub fn try_doc_from_json_str_streaming_with_scratch<O: StreamingJsonObserver>(
+        &self,
+        json_str: &str,
+        scratch: &mut Vec<u8>,
+        observer: &mut O,
+    ) -> Option<Result<(Partition, Document), DocParsingError>> {
+        if !self.can_stream_json {
+            return None;
+        }
+        let document_len = json_str.len() as u64;
+        let mut document =
+            Document::with_capacity_and_num_fields(json_str.len() + 128, self.schema.num_fields());
+        match stream_json_str_into_doc(
+            json_str,
+            &self.field_mappings,
+            self.mode.mode_type(),
+            self.dynamic_field,
+            &mut document,
+            scratch,
+            observer,
+        ) {
+            StreamingParseOutcome::Ok => {
+                if let Some(document_size_field) = self.document_size_field {
+                    document.add_u64(document_size_field, document_len);
+                }
+                if self.index_field_presence {
+                    self.add_field_presence(&mut document);
+                }
+                // `can_stream_json` implies `partition_key.is_empty()`, whose hash is always 0.
+                Some(Ok((0u64, document)))
+            }
+            StreamingParseOutcome::FallbackRequired => None,
+            StreamingParseOutcome::Err(err) => Some(Err(err)),
+        }
+    }
+
     /// Parses a JSON byte slice into a tantivy [`Document`].
     pub fn doc_from_json_bytes(
         &self,
         json_doc: &[u8],
     ) -> Result<(Partition, Document), DocParsingError> {
+        if let Ok(json_str) = std::str::from_utf8(json_doc) {
+            if let Some(result) = self.try_doc_from_json_str_streaming(json_str, &mut ()) {
+                return result;
+            }
+            if let Ok(borrowed_val) = serde_json::from_str::<serde_json_borrow::Value>(json_str) {
+                if let serde_json_borrow::Value::Object(borrowed_obj) = borrowed_val {
+                    return self.doc_from_borrowed_json_obj(&borrowed_obj, json_doc.len() as u64);
+                }
+                let json_doc_sample: String =
+                    json_str.chars().take(20).chain("...".chars()).collect();
+                return Err(DocParsingError::NotJsonObject(json_doc_sample));
+            }
+        }
         let json_obj: JsonObject = serde_json::from_slice(json_doc).map_err(|_| {
             let json_doc_sample: String = std::str::from_utf8(json_doc)
                 .map(|doc_str| doc_str.chars().take(20).chain("...".chars()).collect())
@@ -484,11 +593,108 @@ impl DocMapper {
         &self,
         json_doc: &str,
     ) -> Result<(Partition, Document), DocParsingError> {
+        if let Some(result) = self.try_doc_from_json_str_streaming(json_doc, &mut ()) {
+            return result;
+        }
+        if let Ok(borrowed_val) = serde_json::from_str::<serde_json_borrow::Value>(json_doc) {
+            if let serde_json_borrow::Value::Object(borrowed_obj) = borrowed_val {
+                return self.doc_from_borrowed_json_obj(&borrowed_obj, json_doc.len() as u64);
+            }
+            let json_doc_sample: String = json_doc.chars().take(20).chain("...".chars()).collect();
+            return Err(DocParsingError::NotJsonObject(json_doc_sample));
+        }
         let json_obj: JsonObject = serde_json::from_str(json_doc).map_err(|_| {
             let json_doc_sample: String = json_doc.chars().take(20).chain("...".chars()).collect();
             DocParsingError::NotJsonObject(json_doc_sample)
         })?;
         self.doc_from_json_obj(json_obj, json_doc.len() as u64)
+    }
+
+    /// Transforms a borrowed JSON object into a tantivy [`Document`] without materializing
+    /// intermediate `serde_json::Map` or `OwnedValue` trees.
+    pub fn doc_from_borrowed_json_obj(
+        &self,
+        json_obj: &BorrowedJsonMap<'_>,
+        document_len: u64,
+    ) -> Result<(Partition, Document), DocParsingError> {
+        let partition: Partition = self.partition_key.eval_hash(json_obj);
+
+        let mut dynamic_entries = if self.dynamic_field.is_some() {
+            Vec::with_capacity(json_obj.len())
+        } else {
+            Vec::new()
+        };
+        let mut field_path = Vec::with_capacity(4);
+        let mut document = Document::with_capacity_and_num_fields(
+            document_len as usize + 128,
+            self.schema.num_fields(),
+        );
+
+        if let Some(source_field) = self.source_field {
+            document.add_field_value(source_field, BorrowedDocValue::JsonObject(json_obj));
+        }
+
+        let mode = self.mode.mode_type();
+        self.field_mappings.doc_from_borrowed_json(
+            json_obj,
+            mode,
+            &mut document,
+            &mut field_path,
+            &mut dynamic_entries,
+        )?;
+
+        if let Some(dynamic_field) = self.dynamic_field
+            && !dynamic_entries.is_empty()
+        {
+            if !self.concatenate_dynamic_fields.is_empty() {
+                emit_dynamic_entries_concatenate(
+                    &dynamic_entries,
+                    &self.concatenate_dynamic_fields,
+                    &mut document,
+                );
+            }
+            document.add_field_value(
+                dynamic_field,
+                BorrowedDocValue::DynamicObject(&dynamic_entries),
+            );
+        }
+
+        if let Some(document_size_field) = self.document_size_field {
+            document.add_u64(document_size_field, document_len);
+        }
+
+        if self.index_field_presence {
+            self.add_field_presence(&mut document);
+        }
+        Ok((partition, document))
+    }
+
+    #[inline]
+    fn add_field_presence(&self, document: &mut Document) {
+        if !self.has_indexed_non_fast_json_field && self.field_presence_leaf_hashes.len() <= 128 {
+            let mut seen_fields: u128 = 0;
+            for (field, _) in document.field_values() {
+                let field_id = field.field_id() as usize;
+                let mask = 1u128 << field_id;
+                if (seen_fields & mask) == 0 && self.field_presence_leaf_hashes[field_id].is_some()
+                {
+                    seen_fields |= mask;
+                }
+            }
+            while seen_fields != 0 {
+                let field_id = seen_fields.trailing_zeros() as usize;
+                seen_fields &= seen_fields - 1;
+                if let Some(hash) = self.field_presence_leaf_hashes[field_id] {
+                    document.add_u64(FIELD_PRESENCE_FIELD, hash);
+                }
+            }
+            return;
+        }
+        let field_presence_hashes: FnvHashSet<u64> =
+            populate_field_presence(document, &self.schema, true);
+        for field_presence_hash in field_presence_hashes {
+            document.add_u64(FIELD_PRESENCE_FIELD, field_presence_hash);
+        }
     }
 
     /// Transforms a JSON object into a tantivy [`Document`] according to the rules
@@ -502,17 +708,16 @@ impl DocMapper {
 
         let mut dynamic_json_obj = serde_json::Map::default();
         let mut field_path = Vec::new();
-        let mut document = Document::default();
+        let mut document = Document::with_capacity_and_num_fields(
+            document_len as usize + 128,
+            self.schema.num_fields(),
+        );
 
         if let Some(source_field) = self.source_field {
-            document.add_object(
-                source_field,
-                json_obj
-                    .clone()
-                    .into_iter()
-                    .map(|(key, val)| (key, TantivyValue::from(val)))
-                    .collect(),
-            );
+            // Stream directly through `&JsonValue` instead of cloning into a `BTreeMap<String,
+            // OwnedValue>`.
+            let source_val = JsonValue::Object(json_obj.clone());
+            document.add_field_value(source_field, &source_val);
         }
 
         let mode = self.mode.mode_type();
@@ -538,13 +743,8 @@ impl DocMapper {
                     }
                 }
             }
-            document.add_object(
-                dynamic_field,
-                dynamic_json_obj
-                    .into_iter()
-                    .map(|(key, val)| (key, TantivyValue::from(val)))
-                    .collect(),
-            );
+            let dynamic_val = JsonValue::Object(dynamic_json_obj);
+            document.add_field_value(dynamic_field, &dynamic_val);
         }
 
         if let Some(document_size_field) = self.document_size_field {
@@ -552,11 +752,7 @@ impl DocMapper {
         }
 
         if self.index_field_presence {
-            let field_presence_hashes: FnvHashSet<u64> =
-                populate_field_presence(&document, &self.schema, true);
-            for field_presence_hash in field_presence_hashes {
-                document.add_field_value(FIELD_PRESENCE_FIELD, &field_presence_hash);
-            }
+            self.add_field_presence(&mut document);
         }
         Ok((partition, document))
     }
@@ -641,6 +837,25 @@ impl DocMapper {
         with_validation: bool,
         cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
     ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
+        self.query_with_automaton_cache(
+            split_schema,
+            query_ast,
+            with_validation,
+            cache_context,
+            None,
+        )
+    }
+
+    /// Same as [`DocMapper::query`], with an optional per-split-search cache populated by async
+    /// automaton warmup so regex/wildcard queries do not scan the term dictionary twice.
+    pub fn query_with_automaton_cache(
+        &self,
+        split_schema: Schema,
+        query_ast: QueryAst,
+        with_validation: bool,
+        cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
+        automaton_term_infos_cache: Option<quickwit_query::query_ast::AutomatonTermInfosCache>,
+    ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
         build_query(
             query_ast,
             &BuildTantivyAstContext {
@@ -648,6 +863,7 @@ impl DocMapper {
                 tokenizer_manager: self.tokenizer_manager(),
                 search_fields: &self.default_search_field_names[..],
                 with_validation,
+                automaton_term_infos_cache,
             },
             cache_context,
         )

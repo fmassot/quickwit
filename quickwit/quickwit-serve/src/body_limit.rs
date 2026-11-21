@@ -69,16 +69,33 @@ where
         return Err(warp::reject::custom(PayloadTooLarge(limit)));
     }
     let max_len = limit.as_u64() as usize;
+    let hinted_len = content_length_opt
+        .map(|len| (len as usize).min(max_len))
+        .unwrap_or(0);
     let mut buffer: Vec<u8> = Vec::new();
+    let mut presized_from_hint = false;
     let mut body_stream = std::pin::pin!(body_stream);
 
     while let Some(chunk_res) = body_stream.next().await {
         let mut chunk =
             chunk_res.map_err(|error| warp::reject::custom(BodyReadError(error.to_string())))?;
-        if buffer.len() + chunk.remaining() > max_len {
+        let incoming = chunk.remaining();
+        if buffer.len() + incoming > max_len {
             return Err(warp::reject::custom(PayloadTooLarge(limit)));
         }
-        reserve_capped(&mut buffer, chunk.remaining(), max_len);
+        // Only honor `Content-Length` to avoid repeated doublings once the client has actually
+        // transmitted at least 16 KiB of payload (preventing zero-byte reservation DoS).
+        if !presized_from_hint
+            && hinted_len > buffer.capacity()
+            && buffer.len() + incoming >= 16 * 1024
+        {
+            presized_from_hint = true;
+            let capped_hint = hinted_len.min(32 * 1024 * 1024);
+            if capped_hint > buffer.capacity() {
+                buffer.reserve_exact(capped_hint - buffer.len());
+            }
+        }
+        reserve_capped(&mut buffer, incoming, max_len);
         while chunk.has_remaining() {
             let bytes = chunk.chunk();
             buffer.extend_from_slice(bytes);

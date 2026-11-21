@@ -97,6 +97,50 @@ impl QuickwitDateTimeOptions {
         }
     }
 
+    #[inline]
+    pub(crate) fn parse_i64(&self, timestamp_i64: i64) -> Result<TantivyDateTime, String> {
+        quickwit_datetime::parse_timestamp_int(timestamp_i64, &self.input_formats.0)
+    }
+
+    #[inline]
+    pub(crate) fn parse_f64(&self, timestamp_f64: f64) -> Result<TantivyDateTime, String> {
+        quickwit_datetime::parse_timestamp_float(timestamp_f64, &self.input_formats.0)
+    }
+
+    #[inline]
+    pub(crate) fn parse_str(&self, date_time_str: &str) -> Result<TantivyDateTime, String> {
+        quickwit_datetime::parse_date_time_str(date_time_str, &self.input_formats.0)
+    }
+
+    pub(crate) fn parse_borrowed_json(
+        &self,
+        json_value: &serde_json_borrow::Value,
+    ) -> Result<TantivyDateTime, String> {
+        match json_value {
+            serde_json_borrow::Value::Number(timestamp) => {
+                // `.as_f64()` actually converts floats to integers, so we must check for integers
+                // first.
+                if let Some(timestamp_i64) = timestamp.as_i64() {
+                    quickwit_datetime::parse_timestamp_int(timestamp_i64, &self.input_formats.0)
+                } else if let Some(timestamp_f64) = timestamp.as_f64() {
+                    quickwit_datetime::parse_timestamp_float(timestamp_f64, &self.input_formats.0)
+                } else {
+                    Err(format!(
+                        "failed to parse datetime `{}`: value is larger than i64::MAX",
+                        timestamp
+                    ))
+                }
+            }
+            serde_json_borrow::Value::Str(date_time_str) => {
+                quickwit_datetime::parse_date_time_str(date_time_str, &self.input_formats.0)
+            }
+            _ => Err(format!(
+                "failed to parse datetime: expected a float, integer, or string, got \
+                 `{json_value}`"
+            )),
+        }
+    }
+
     pub(crate) fn parse_json(&self, json_value: &JsonValue) -> Result<TantivyValue, String> {
         let date_time = match json_value {
             JsonValue::Number(timestamp) => {

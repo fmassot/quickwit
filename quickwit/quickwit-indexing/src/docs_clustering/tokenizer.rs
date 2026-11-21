@@ -203,8 +203,13 @@ fn classify_bytes(bytes: &[u8]) -> TokenType {
         return TokenType::Word;
     }
 
-    if matches!(is_uuid_v4(bytes), Some(len) if len == bytes.len()) {
+    if bytes.len() == 36 && is_uuid_v4(bytes).is_some() {
         return TokenType::Uuid;
+    }
+
+    // Numbers, decimals, and IPv4 addresses all start with an ASCII decimal digit.
+    if !DIGIT_LOOKUP_TABLE[first as usize] {
+        return TokenType::Word;
     }
 
     if matches!(is_number(bytes), Some(len) if len == bytes.len()) {

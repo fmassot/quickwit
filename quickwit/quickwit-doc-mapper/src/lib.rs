@@ -31,8 +31,9 @@ pub mod tag_pruning;
 
 pub use doc_mapper::{
     Automaton, BinaryFormat, DocMapper, DocMapperBuilder, FastFieldWarmupInfo, FieldMappingEntry,
-    FieldMappingType, JsonObject, NamedField, QuickwitBytesOptions, QuickwitJsonOptions, TermRange,
-    TokenizerConfig, TokenizerEntry, WarmupInfo, analyze_text,
+    FieldMappingType, JsonObject, NamedField, ObservedPrimitive, QuickwitBytesOptions,
+    QuickwitJsonOptions, StreamingJsonObserver, TermRange, TokenizerConfig, TokenizerEntry,
+    WarmupInfo, analyze_text,
 };
 use doc_mapper::{
     FastFieldOptions, FieldMappingEntryForSerialization, IndexRecordOptionSchema,

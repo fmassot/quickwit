@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod borrowed_json;
 mod date_time_type;
 mod doc_mapper_builder;
 mod doc_mapper_impl;
@@ -19,6 +20,7 @@ mod field_mapping_entry;
 mod field_mapping_type;
 mod field_presence;
 mod mapping_tree;
+mod streaming_json;
 mod tantivy_val_to_json;
 mod tokenizer_entry;
 
@@ -39,6 +41,7 @@ pub(crate) use field_mapping_entry::{
 pub(crate) use field_mapping_entry::{QuickwitNumericOptions, QuickwitTextOptions};
 pub use field_mapping_type::FieldMappingType;
 use serde_json::Value as JsonValue;
+pub use streaming_json::{ObservedPrimitive, StreamingJsonObserver};
 use tantivy::Term;
 use tantivy::schema::{Field, FieldType};
 pub(crate) use tokenizer_entry::{
