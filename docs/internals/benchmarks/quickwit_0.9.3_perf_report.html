@@ -1,0 +1,1589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quickwit 0.9.3-perf — Cross-Benchmark Performance Report</title>
+  <style>
+    :root {
+      --bg: #FAF9F6;
+      --surface: #FFFFFF;
+      --surface-alt: #F4F2EC;
+      --border: #E5E2DC;
+      --ink: #141413;
+      --muted: #5E5C56;
+      --subtle: #8C8980;
+      --accent: #D9653B;
+      --accent-dark: #B54A24;
+      --accent-soft: #FDF1EC;
+      --blue: #2D6A9F;
+      --blue-soft: #EBF3FA;
+      --gold: #C28516;
+      --gold-soft: #FDF5E6;
+      --teal: #2A8C78;
+      --teal-soft: #E7F5F2;
+      --violet: #6E56CF;
+      --violet-soft: #F0EDFA;
+      --radius: 14px;
+      --shadow: 0 2px 10px rgba(20, 20, 19, 0.045);
+      --sans: "Adwaita Sans", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "Liberation Sans", sans-serif;
+      --mono: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Top editorial bar */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(250, 249, 246, 0.88);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar-inner {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 12px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 14.5px;
+      letter-spacing: -0.2px;
+    }
+    .brand-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--accent);
+      display: inline-block;
+    }
+    .nav {
+      display: flex;
+      gap: 20px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .nav a {
+      color: inherit;
+      text-decoration: none;
+      font-weight: 500;
+      transition: color 0.15s;
+    }
+    .nav a:hover { color: var(--accent-dark); }
+
+    /* Container */
+    .container {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 40px 28px 80px;
+    }
+
+    /* Hero section */
+    .hero {
+      margin-bottom: 32px;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent-dark);
+      background: var(--accent-soft);
+      border: 1px solid #F3D4C8;
+      padding: 4px 12px;
+      border-radius: 999px;
+      margin-bottom: 14px;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 38px;
+      line-height: 1.15;
+      letter-spacing: -0.9px;
+      font-weight: 800;
+    }
+    .lead {
+      margin: 0 0 24px;
+      font-size: 16.5px;
+      color: var(--muted);
+      max-width: 880px;
+    }
+
+    /* KPI stat strip */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+    .kpi {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      box-shadow: var(--shadow);
+    }
+    .kpi-label {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--subtle);
+      margin-bottom: 6px;
+    }
+    .kpi-value {
+      font-family: var(--mono);
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.8px;
+      color: var(--ink);
+      line-height: 1.1;
+    }
+    .kpi-value.accent { color: var(--accent-dark); }
+    .kpi-sub {
+      margin-top: 6px;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+
+    /* Chart frame */
+    .chart-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 10px;
+      box-shadow: var(--shadow);
+      margin: 22px 0 32px;
+      overflow: hidden;
+    }
+
+    /* Sections */
+    section {
+      margin-top: 48px;
+      scroll-margin-top: 72px;
+    }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+      margin-bottom: 20px;
+      gap: 12px;
+    }
+    h2 {
+      margin: 0;
+      font-size: 23px;
+      letter-spacing: -0.4px;
+      font-weight: 750;
+    }
+    .section-tag {
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--subtle);
+    }
+    h3 {
+      margin: 26px 0 12px;
+      font-size: 16.5px;
+      font-weight: 700;
+      letter-spacing: -0.2px;
+    }
+
+    /* Tables */
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow-x: auto;
+      margin: 14px 0 22px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13.5px;
+    }
+    thead th {
+      text-align: left;
+      font-size: 11.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.45px;
+      color: var(--muted);
+      background: var(--surface-alt);
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    thead th.num, tbody td.num {
+      text-align: right;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+    tbody td {
+      padding: 11px 14px;
+      border-bottom: 1px solid #EFECE6;
+      vertical-align: middle;
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr.highlight {
+      background: #FFF9F6;
+    }
+    tbody tr.highlight td:first-child {
+      border-left: 3px solid var(--accent);
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .b-qw { background: var(--accent-soft); color: var(--accent-dark); }
+    .b-sdb { background: var(--blue-soft); color: var(--blue); }
+    .b-ch { background: var(--gold-soft); color: var(--gold); }
+    .b-os { background: var(--teal-soft); color: var(--teal); }
+    .b-es { background: var(--violet-soft); color: var(--violet); }
+    .b-base { background: #ECEAE4; color: #5E5C56; }
+    .b-ok { background: #EAF6EE; color: #1F7A45; }
+
+    .win { font-weight: 750; color: var(--accent-dark); }
+    .dim { color: var(--subtle); font-size: 12px; }
+
+    /* Callouts & Cards */
+    .callout {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 10px;
+      padding: 16px 20px;
+      margin: 18px 0;
+      box-shadow: var(--shadow);
+    }
+    .callout-title {
+      font-weight: 700;
+      font-size: 14px;
+      margin-bottom: 6px;
+      color: var(--ink);
+    }
+    .callout p, .callout li {
+      margin: 4px 0;
+      font-size: 13.5px;
+      color: var(--muted);
+    }
+    .callout ul {
+      margin: 6px 0 0;
+      padding-left: 18px;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      margin: 18px 0;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 22px;
+      box-shadow: var(--shadow);
+    }
+    .card h4 {
+      margin: 0 0 8px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .card p, .card li {
+      margin: 6px 0;
+      font-size: 13.5px;
+      color: var(--muted);
+    }
+    .card ul {
+      padding-left: 18px;
+      margin: 8px 0 0;
+    }
+    code {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      background: var(--surface-alt);
+      padding: 1.5px 5px;
+      border-radius: 5px;
+      color: var(--ink);
+    }
+    a.commit-link {
+      color: var(--accent-dark);
+      text-decoration: none;
+      font-weight: 600;
+    }
+    a.commit-link:hover {
+      text-decoration: underline;
+    }
+    a.commit-link code {
+      color: var(--accent-dark);
+      background: var(--accent-soft);
+    }
+    .commit-list {
+      list-style: none;
+      padding-left: 0 !important;
+      margin: 10px 0 0 !important;
+    }
+    .commit-list li {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 5px 0;
+      border-bottom: 1px solid #F2EFE9;
+      font-size: 13px;
+    }
+    .commit-list li:last-child { border-bottom: none; }
+
+    /* Interactive benchmark tabs */
+    .tabs {
+      display: inline-flex;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 4px;
+      gap: 4px;
+      margin-bottom: 16px;
+    }
+    .tab-btn {
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 7px 14px;
+      border-radius: 7px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .tab-btn.active {
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    footer {
+      margin-top: 64px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 12.5px;
+      color: var(--subtle);
+    }
+
+    @media (max-width: 960px) {
+      .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+      .grid-2 { grid-template-columns: 1fr; }
+      .nav { display: none; }
+      h1 { font-size: 28px; }
+    }
+    @media print {
+      .topbar { display: none; }
+      body { background: #FFFFFF; }
+      .tab-panel { display: block !important; }
+      .tabs { display: none; }
+      .chart-card, .table-wrap, .card, .kpi { box-shadow: none; break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span>Quickwit 0.9.3-perf Evaluation Report</span>
+      </div>
+      <nav class="nav">
+        <a href="#overview">Overview</a>
+        <a href="#versions">Versions &amp; Methodology</a>
+        <a href="#journey">Optimization Journey</a>
+        <a href="#benchmarks">Benchmark Tables</a>
+        <a href="#deep-dive">Categories &amp; Pareto</a>
+        <a href="#findings">Key Takeaways</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- HERO -->
+    <section class="hero" id="overview" style="margin-top:0;">
+      <h1>Quickwit 0.9.3-perf Benchmarks</h1>
+      <p class="lead">
+        <strong>SearchBench 100M</strong>, <strong>ClickBench 10M</strong>, and <strong>OpenSearch Big5 10M</strong> — measured on one 20-thread workstation.
+      </p>
+
+      <div class="kpi-grid" style="grid-template-columns: repeat(3, 1fr);">
+        <div class="kpi">
+          <div class="kpi-label">SearchBench 100M</div>
+          <div class="kpi-value accent">3.68× <span style="font-size:14px;font-weight:600;color:var(--muted)">faster vs 0.9.3</span></div>
+          <div class="kpi-sub">Beats SereneDB 26.09.1 (51/77) · 2.4× smaller</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">ClickBench 10M</div>
+          <div class="kpi-value accent">2.13× <span style="font-size:14px;font-weight:600;color:var(--muted)">vs ClickHouse</span></div>
+          <div class="kpi-sub">Disk-cold (30/35 wins) · 4.57× faster vs 0.9.3</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">OpenSearch Big5 10M</div>
+          <div class="kpi-value accent">2.89× <span style="font-size:14px;font-weight:600;color:var(--muted)">vs OpenSearch</span></div>
+          <div class="kpi-sub">4.16× vs Elasticsearch · 1.69× faster vs 0.9.3</div>
+        </div>
+      </div>
+
+      <div class="chart-card" style="padding:14px 10px 6px;">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;" viewBox="0 0 1380 485">
+  <defs>
+    <filter id="shadow_c1" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#141413" flood-opacity="0.04"/>
+    </filter>
+  </defs>
+  <rect width="1380" height="485" fill="#FAF9F6"/>
+  <style>
+    text { font-family: Adwaita Sans, Liberation Sans, sans-serif; fill: #141413; }
+    .mono { font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .title { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .subtitle { font-size: 13px; fill: #5E5C56; }
+    .card-title { font-size: 15px; font-weight: 700; }
+    .card-sub { font-size: 11.5px; fill: #5E5C56; }
+    .label { font-size: 11.5px; fill: #141413; font-weight: 600; }
+    .label-muted { font-size: 10.5px; fill: #5E5C56; }
+    .val { font-size: 11px; font-weight: 700; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .val-sub { font-size: 10px; fill: #5E5C56; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .axis { font-size: 10px; fill: #8C8980; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .pill-txt { font-size: 10.5px; font-weight: 700; }
+    .footer { font-size: 10.5px; fill: #8C8980; }
+  </style>
+<text x="36" y="30" class="card-title">Performance Overview</text>
+<text x="206" y="30" class="subtitle">· Lower latency &amp; smaller index are better</text>
+<rect x="1038" y="18" width="14" height="10" rx="2.5" fill="#D9653B"/>
+<text x="1058" y="27" class="label-muted">Hot latency</text>
+<rect x="1152" y="18" width="14" height="10" rx="2.5" fill="#F2B59B"/>
+<text x="1172" y="27" class="label-muted">Cold / Run 1 latency</text>
+<rect x="36" y="48" width="424" height="398" rx="12" fill="#FFFFFF" stroke="#E5E2DC" stroke-width="1" filter="url(#shadow_c1)"/>
+<text x="58" y="78" class="card-title">SearchBench 100M</text>
+<text x="58" y="97" class="card-sub">100M OTEL logs · Geomean (ms) · 77q</text>
+<text x="58" y="132" class="label">Quickwit 0.9.3-perf</text>
+<text x="438" y="132" text-anchor="end" class="label-muted">5.1 GB</text>
+<rect x="58" y="139" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="58" y="139" width="48.1" height="15" rx="3.5" fill="#D9653B"/>
+<text x="112.1" y="150.5" class="val">6.34 ms</text>
+<rect x="58" y="159" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="58" y="159" width="56.8" height="12" rx="3" fill="#F2B59B"/>
+<text x="120.8" y="168.5" class="val-sub">7.49 ms (disk-cold)</text>
+<line x1="58" y1="183" x2="438" y2="183" stroke="#ECE9E2" stroke-width="1"/>
+<text x="58" y="200" class="label">SereneDB 26.09.1</text>
+<text x="438" y="200" text-anchor="end" class="label-muted">12.0 GB</text>
+<rect x="58" y="207" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="58" y="207" width="55.0" height="15" rx="3.5" fill="#2D6A9F"/>
+<text x="119.0" y="218.5" class="val">7.25 ms</text>
+<rect x="58" y="227" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="58" y="227" width="70.6" height="12" rx="3" fill="#8EB8DB"/>
+<text x="134.6" y="236.5" class="val-sub">9.30 ms (run 1)</text>
+<line x1="58" y1="251" x2="438" y2="251" stroke="#ECE9E2" stroke-width="1"/>
+<text x="58" y="268" class="label">Quickwit 0.9.3 Base</text>
+<text x="438" y="268" text-anchor="end" class="label-muted">5.1 GB</text>
+<rect x="58" y="275" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="58" y="275" width="121.5" height="15" rx="3.5" fill="#A8A49B"/>
+<text x="185.5" y="286.5" class="val">16.01 ms</text>
+<rect x="58" y="295" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="58" y="295" width="185.4" height="12" rx="3" fill="#D3D0C8"/>
+<text x="249.4" y="304.5" class="val-sub">24.43 ms (disk-cold)</text>
+<line x1="58" y1="319" x2="438" y2="319" stroke="#ECE9E2" stroke-width="1"/>
+<text x="58" y="336" class="label">ClickHouse 26.8.2.7</text>
+<text x="438" y="336" text-anchor="end" class="label-muted">20.2 GB · 57q</text>
+<rect x="58" y="343" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="58" y="343" width="210.3" height="15" rx="3.5" fill="#D99B26"/>
+<text x="274.3" y="354.5" class="val">27.72 ms</text>
+<rect x="58" y="363" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="58" y="363" width="233.7" height="12" rx="3" fill="#F0CE84"/>
+<text x="297.7" y="372.5" class="val-sub">30.80 ms (run 1)</text>
+<line x1="58" y1="410" x2="438" y2="410" stroke="#E5E2DC" stroke-width="1"/>
+<text x="58" y="432" class="footer">Quickwit wins 51/77 Hot vs SereneDB · 2.4x smaller</text>
+<rect x="478" y="48" width="424" height="398" rx="12" fill="#FFFFFF" stroke="#E5E2DC" stroke-width="1" filter="url(#shadow_c1)"/>
+<text x="500" y="78" class="card-title">ClickBench 10M</text>
+<text x="500" y="97" class="card-sub">9.77M rows (105 cols) · Total (ms) · 35q</text>
+<text x="500" y="132" class="label">QW 0.9.3-perf Trimmed</text>
+<text x="880" y="132" text-anchor="end" class="label-muted">2.45 GB</text>
+<rect x="500" y="139" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="500" y="139" width="49.5" height="15" rx="3.5" fill="#D9653B"/>
+<text x="555.5" y="150.5" class="val">432 ms</text>
+<rect x="500" y="159" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="500" y="159" width="75.6" height="12" rx="3" fill="#F2B59B"/>
+<text x="581.6" y="168.5" class="val-sub">660 ms (disk-cold)</text>
+<line x1="500" y1="183" x2="880" y2="183" stroke="#ECE9E2" stroke-width="1"/>
+<text x="500" y="200" class="label">QW 0.9.3-perf Full</text>
+<text x="880" y="200" text-anchor="end" class="label-muted">3.32 GB</text>
+<rect x="500" y="207" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="500" y="207" width="49.0" height="15" rx="3.5" fill="#B54A24"/>
+<text x="555.0" y="218.5" class="val">427 ms</text>
+<rect x="500" y="227" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="500" y="227" width="57.6" height="12" rx="3" fill="#F2B59B"/>
+<text x="563.6" y="236.5" class="val-sub">502 ms (run 1)</text>
+<line x1="500" y1="251" x2="880" y2="251" stroke="#ECE9E2" stroke-width="1"/>
+<text x="500" y="268" class="label">ClickHouse 26.8.2.7</text>
+<text x="880" y="268" text-anchor="end" class="label-muted">1.44 GB</text>
+<rect x="500" y="275" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="500" y="275" width="113.2" height="15" rx="3.5" fill="#D99B26"/>
+<text x="619.2" y="286.5" class="val">987 ms</text>
+<rect x="500" y="295" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="500" y="295" width="160.7" height="12" rx="3" fill="#F0CE84"/>
+<text x="666.7" y="304.5" class="val-sub">1402 ms (disk-cold)</text>
+<line x1="500" y1="319" x2="880" y2="319" stroke="#ECE9E2" stroke-width="1"/>
+<text x="500" y="336" class="label">Quickwit 0.9.3 Base</text>
+<text x="880" y="336" text-anchor="end" class="label-muted">3.32 GB</text>
+<rect x="500" y="343" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="500" y="343" width="226.4" height="15" rx="3.5" fill="#A8A49B"/>
+<text x="732.4" y="354.5" class="val">1974 ms</text>
+<rect x="500" y="363" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="500" y="363" width="235.6" height="12" rx="3" fill="#D3D0C8"/>
+<text x="741.6" y="372.5" class="val-sub">2055 ms (run 1)</text>
+<line x1="500" y1="410" x2="880" y2="410" stroke="#E5E2DC" stroke-width="1"/>
+<text x="500" y="432" class="footer">2.13x faster Disk-Cold vs ClickHouse (30/35 wins)</text>
+<rect x="920" y="48" width="424" height="398" rx="12" fill="#FFFFFF" stroke="#E5E2DC" stroke-width="1" filter="url(#shadow_c1)"/>
+<text x="942" y="78" class="card-title">OpenSearch Big5 10M</text>
+<text x="942" y="97" class="card-sub">9.89M logs · Total (ms) · 44q</text>
+<text x="942" y="132" class="label">Quickwit 0.9.3-perf</text>
+<text x="1322" y="132" text-anchor="end" class="label-muted">2.10 GB</text>
+<rect x="942" y="139" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="942" y="139" width="22.1" height="15" rx="3.5" fill="#D9653B"/>
+<text x="970.1" y="150.5" class="val">150 ms</text>
+<rect x="942" y="159" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="942" y="159" width="26.6" height="12" rx="3" fill="#F2B59B"/>
+<text x="974.6" y="168.5" class="val-sub">180 ms (run 1)</text>
+<line x1="942" y1="183" x2="1322" y2="183" stroke="#ECE9E2" stroke-width="1"/>
+<text x="942" y="200" class="label">Quickwit 0.9.3 Base</text>
+<text x="1322" y="200" text-anchor="end" class="label-muted">2.10 GB</text>
+<rect x="942" y="207" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="942" y="207" width="37.3" height="15" rx="3.5" fill="#A8A49B"/>
+<text x="985.3" y="218.5" class="val">253 ms</text>
+<rect x="942" y="227" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="942" y="227" width="43.2" height="12" rx="3" fill="#D3D0C8"/>
+<text x="991.2" y="236.5" class="val-sub">293 ms (run 1)</text>
+<line x1="942" y1="251" x2="1322" y2="251" stroke="#ECE9E2" stroke-width="1"/>
+<text x="942" y="268" class="label">OpenSearch 3.10.0</text>
+<text x="1322" y="268" text-anchor="end" class="label-muted">7.22 GB</text>
+<rect x="942" y="275" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="942" y="275" width="63.8" height="15" rx="3.5" fill="#2A8C78"/>
+<text x="1011.8" y="286.5" class="val">433 ms</text>
+<rect x="942" y="295" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="942" y="295" width="220.6" height="12" rx="3" fill="#9AD0C4"/>
+<text x="1168.6" y="304.5" class="val-sub">1496 ms (run 1)</text>
+<line x1="942" y1="319" x2="1322" y2="319" stroke="#ECE9E2" stroke-width="1"/>
+<text x="942" y="336" class="label">Elasticsearch 8.17.4</text>
+<text x="1322" y="336" text-anchor="end" class="label-muted">3.78 GB</text>
+<rect x="942" y="343" width="258.0" height="15" rx="3.5" fill="#ECE9E2"/>
+<rect x="942" y="343" width="91.8" height="15" rx="3.5" fill="#6E56CF"/>
+<text x="1039.8" y="354.5" class="val">623 ms</text>
+<rect x="942" y="363" width="258.0" height="12" rx="3" fill="#ECE9E2"/>
+<rect x="942" y="363" width="227.4" height="12" rx="3" fill="#BFB3ED"/>
+<text x="1175.4" y="372.5" class="val-sub">1542 ms (run 1)</text>
+<line x1="942" y1="410" x2="1322" y2="410" stroke="#E5E2DC" stroke-width="1"/>
+<text x="942" y="432" class="footer">2.89x faster vs OpenSearch · 4.16x vs Elasticsearch</text>
+<text x="36" y="471" class="footer">Disk-cold runs evict OS page cache via posix_fadvise(DONTNEED); SearchBench SereneDB &amp; ClickHouse local runs are page-cache warm Run 1.</text>
+</svg>
+      </div>
+    </section>
+
+    <!-- VERSIONS & METHODOLOGY -->
+    <section id="versions">
+      <div class="section-head">
+        <h2>1. System Under Test &amp; Version Matrix</h2>
+        <span class="section-tag">Intel i5-13600K (14C/20T) · 32 GB RAM · Samsung 990 PRO NVMe · Linux 7.2.15</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Engine</th>
+              <th>Exact Version / Commit</th>
+              <th>Storage &amp; Execution Config</th>
+              <th>Benchmarks</th>
+              <th>Run Provenance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="highlight">
+              <td><strong>Quickwit 0.9.3-perf</strong> <span class="badge b-qw">Wave 6b</span></td>
+              <td>
+                <code>0.9.3</code> · <a class="commit-link" href="https://github.com/fmassot/quickwit/tree/perf/searchbench" target="_blank" rel="noopener"><code>perf/searchbench</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/5d7468d0f9efd57fc09bca1a31608284af85a380" target="_blank" rel="noopener"><code>5d7468d0f</code></a>)<br>
+                <span class="dim">Tantivy fork: <a class="commit-link" href="https://github.com/fmassot/tantivy/commit/da556bd624ae8830a3b1e9c568419f3645324cdd" target="_blank" rel="noopener"><code>da556bd62</code></a></span>
+              </td>
+              <td>Native release binary · 29 splits (SB), 49 splits (CB &amp; Big5)</td>
+              <td>SearchBench, ClickBench, Big5</td>
+              <td>Local live (2026-11-21)</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit 0.9.3</strong> <span class="badge b-base">Baseline</span></td>
+              <td><code>0.9.3</code> (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/b9fbdc7a874e32427aed14a977302ba61ff1ffd5" target="_blank" rel="noopener"><code>b9fbdc7a8</code></a>)</td>
+              <td>101 splits (SB), 10/49 splits (CB), 49 splits (Big5)</td>
+              <td>SearchBench, ClickBench, Big5</td>
+              <td>Local live (2026-11-21)</td>
+            </tr>
+            <tr>
+              <td><strong>SereneDB</strong> <span class="badge b-sdb">26.09.1</span></td>
+              <td><code>serenedb/serenedb:26.09.1</code></td>
+              <td>Official SearchBench schema + inverted view (DuckDB engine)</td>
+              <td>SearchBench 100M</td>
+              <td>Local same host (2026-09-27)*</td>
+            </tr>
+            <tr>
+              <td><strong>ClickHouse</strong> <span class="badge b-ch">26.8.2.7</span></td>
+              <td><code>26.8.2.7</code> (native binary)</td>
+              <td>ClickBench <code>MergeTree</code> (28 parts) · SB full-text index · <code>use_query_cache=0</code></td>
+              <td>ClickBench 10M, SearchBench 100M</td>
+              <td>CB: Local live (2026-11-21)<br>SB: Local same host (2026-09-27)*</td>
+            </tr>
+            <tr>
+              <td><strong>OpenSearch</strong> <span class="badge b-os">3.10.0</span></td>
+              <td><code>3.10.0</code> (Docker)</td>
+              <td>16 shards, 8 GB JVM heap, forcemerged (1 seg/shard), <code>request_cache=false</code></td>
+              <td>Big5 10M</td>
+              <td>Local live Docker (2026-11-21)</td>
+            </tr>
+            <tr>
+              <td><strong>Elasticsearch</strong> <span class="badge b-es">8.17.4</span></td>
+              <td><code>8.17.4</code> (Docker)</td>
+              <td>16 shards, 8 GB JVM heap, forcemerged (1 seg/shard), <code>request_cache=false</code></td>
+              <td>Big5 10M</td>
+              <td>Local live Docker (2026-11-21)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <div class="callout-title">Cold-Cache Methodology &amp; Fairness Notes</div>
+        <ul>
+          <li><strong>True Disk-Cold (<code>posix_fadvise(POSIX_FADV_DONTNEED)</code> + engine caches dropped/zeroed):</strong> Used for <strong>Quickwit SearchBench 100M</strong> and the dedicated <strong>ClickBench 10M Quickwit vs ClickHouse disk-cold shootout</strong>. Quickwit was verified reading <strong>1.48 GB</strong> directly from NVMe via <code>/proc/&lt;pid&gt;/io</code> with all 4 searcher caches set to <code>0B</code>; ClickHouse executed <code>SYSTEM DROP MARK / UNCOMPRESSED / QUERY CACHE</code> plus <code>fadvise</code> eviction before every query.</li>
+          <li><strong>App-Cold (Run 1, OS page cache warm):</strong> Local SearchBench runs for SereneDB <code>26.09.1</code> and ClickHouse <code>26.8.2.7</code> were captured on this exact workstation without <code>NOPASSWD</code> sudo, so <code>/proc/sys/vm/drop_caches</code> was skipped (making their cold numbers OS-warm relative to Quickwit's disk-cold). Big5 Run 1 ran on freshly started servers with <code>request_cache=false</code> (OpenSearch/ES Run 1 includes Lucene/JVM warmup).</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- OPTIMIZATION JOURNEY -->
+    <section id="journey">
+      <div class="section-head">
+        <h2>2. Optimization Journey (Baseline → Wave 6b)</h2>
+        <span class="section-tag">Tantivy fork da556bd62 + Quickwit perf/searchbench</span>
+      </div>
+
+      <div class="chart-card">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;" viewBox="0 0 1380 470">
+  <defs>
+    <filter id="shadow_c2" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#141413" flood-opacity="0.04"/>
+    </filter>
+  </defs>
+  <rect width="1380" height="470" fill="#FAF9F6"/>
+  <style>
+    text { font-family: Adwaita Sans, Liberation Sans, sans-serif; fill: #141413; }
+    .mono { font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .title { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .subtitle { font-size: 13px; fill: #5E5C56; }
+    .card-title { font-size: 15px; font-weight: 700; }
+    .card-sub { font-size: 11.5px; fill: #5E5C56; }
+    .label { font-size: 11.5px; fill: #141413; font-weight: 600; }
+    .label-muted { font-size: 10.5px; fill: #5E5C56; }
+    .val { font-size: 11px; font-weight: 700; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .val-sub { font-size: 10px; fill: #5E5C56; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .axis { font-size: 10px; fill: #8C8980; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .pill-txt { font-size: 10.5px; font-weight: 700; }
+    .footer { font-size: 10.5px; fill: #8C8980; }
+  </style>
+<text x="36" y="42" class="title">Optimization Journey — From Quickwit 0.9.3 Baseline to 0.9.3-perf (Wave 6b)</text>
+<text x="36" y="63" class="subtitle">Cumulative impact of Tantivy fork (da556bd62) + Quickwit perf/searchbench (5d7468d0f) optimizations across all 3 benchmarks</text>
+<rect x="36" y="86" width="424" height="348" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c2)"/>
+<text x="56" y="114" class="card-title">SearchBench 100M (77 queries)</text>
+<text x="56" y="132" class="card-sub">Total Latency (ms) — True Disk-Cold vs Hot</text>
+<rect x="342.0" y="102.0" width="98.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="391.0" y="116.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">-73% / 3.7x</text>
+<line x1="88" y1="358.0" x2="438" y2="358.0" stroke="#ECE9E2"/>
+<text x="80" y="361.5" text-anchor="end" class="axis">0</text>
+<line x1="88" y1="305.4" x2="438" y2="305.4" stroke="#ECE9E2"/>
+<text x="80" y="308.9" text-anchor="end" class="axis">1000</text>
+<line x1="88" y1="252.7" x2="438" y2="252.7" stroke="#ECE9E2"/>
+<text x="80" y="256.2" text-anchor="end" class="axis">2000</text>
+<line x1="88" y1="200.1" x2="438" y2="200.1" stroke="#ECE9E2"/>
+<text x="80" y="203.6" text-anchor="end" class="axis">3000</text>
+<rect x="98.0" y="175.9" width="26" height="182.1" rx="3.5" fill="#A8A49B"/>
+<rect x="128.0" y="223.2" width="26" height="134.8" rx="3.5" fill="#7D7A72"/>
+<text x="111.0" y="170.9" text-anchor="middle" class="val-sub">3460</text>
+<text x="141.0" y="218.2" text-anchor="middle" class="val">2562</text>
+<text x="126.0" y="374" text-anchor="middle" class="label-muted">0.9.3 Base</text>
+<text x="126.0" y="387" text-anchor="middle" class="label-muted">(101sp)</text>
+<rect x="185.5" y="291.0" width="26" height="67.0" rx="3.5" fill="#F2B59B"/>
+<rect x="215.5" y="310.1" width="26" height="47.9" rx="3.5" fill="#D9653B"/>
+<text x="198.5" y="286.0" text-anchor="middle" class="val-sub">1273</text>
+<text x="228.5" y="305.1" text-anchor="middle" class="val">910</text>
+<text x="213.5" y="374" text-anchor="middle" class="label-muted">Post-SB</text>
+<text x="213.5" y="387" text-anchor="middle" class="label-muted">(101sp)</text>
+<rect x="273.0" y="305.9" width="26" height="52.1" rx="3.5" fill="#F2B59B"/>
+<rect x="303.0" y="313.1" width="26" height="44.9" rx="3.5" fill="#D9653B"/>
+<text x="286.0" y="300.9" text-anchor="middle" class="val-sub">990</text>
+<text x="316.0" y="308.1" text-anchor="middle" class="val">853</text>
+<text x="301.0" y="374" text-anchor="middle" class="label-muted">Wave 6b</text>
+<text x="301.0" y="387" text-anchor="middle" class="label-muted">(101sp)</text>
+<rect x="360.5" y="313.7" width="26" height="44.3" rx="3.5" fill="#F2B59B"/>
+<rect x="390.5" y="321.3" width="26" height="36.7" rx="3.5" fill="#D9653B"/>
+<text x="373.5" y="308.7" text-anchor="middle" class="val-sub">842</text>
+<text x="403.5" y="316.3" text-anchor="middle" class="val">697</text>
+<text x="388.5" y="374" text-anchor="middle" class="label-muted">Wave 6b</text>
+<text x="388.5" y="387" text-anchor="middle" class="label-muted">(29sp)</text>
+<rect x="88" y="410" width="10" height="10" rx="2" fill="#F2B59B"/>
+<text x="103" y="419" class="footer">Disk-Cold (fadvise)</text>
+<rect x="218" y="410" width="10" height="10" rx="2" fill="#D9653B"/>
+<text x="233" y="419" class="footer">Hot (min of 2)</text>
+<rect x="478" y="86" width="424" height="348" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c2)"/>
+<text x="498" y="114" class="card-title">ClickBench 10M (35 queries)</text>
+<text x="498" y="132" class="card-sub">Hot Total Latency (ms) &amp; Mapping Variants</text>
+<rect x="784.0" y="102.0" width="98.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="833.0" y="116.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">-78% / 4.6x</text>
+<line x1="530" y1="358.0" x2="880" y2="358.0" stroke="#ECE9E2"/>
+<text x="522" y="361.5" text-anchor="end" class="axis">0</text>
+<line x1="530" y1="312.5" x2="880" y2="312.5" stroke="#ECE9E2"/>
+<text x="522" y="316.0" text-anchor="end" class="axis">500</text>
+<line x1="530" y1="267.1" x2="880" y2="267.1" stroke="#ECE9E2"/>
+<text x="522" y="270.6" text-anchor="end" class="axis">1000</text>
+<line x1="530" y1="221.6" x2="880" y2="221.6" stroke="#ECE9E2"/>
+<text x="522" y="225.1" text-anchor="end" class="axis">1500</text>
+<line x1="530" y1="176.2" x2="880" y2="176.2" stroke="#ECE9E2"/>
+<text x="522" y="179.7" text-anchor="end" class="axis">2000</text>
+<line x1="530" y1="268.3" x2="880" y2="268.3" stroke="#D99B26" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="880" y="263.3" text-anchor="end" class="val" fill="#D99B26" style="fill:#D99B26;">ClickHouse 26.8: 987 ms</text>
+<rect x="542.2" y="178.5" width="34" height="179.5" rx="4" fill="#A8A49B"/>
+<text x="559.2" y="173.5" text-anchor="middle" class="val">1974</text>
+<text x="559.2" y="374" text-anchor="middle" class="label-muted">0.9.3 Base</text>
+<text x="559.2" y="387" text-anchor="middle" class="label-muted">(10sp)</text>
+<rect x="600.5" y="305.3" width="34" height="52.7" rx="4" fill="#C7C3BA"/>
+<text x="617.5" y="300.3" text-anchor="middle" class="val">580</text>
+<text x="617.5" y="374" text-anchor="middle" class="label-muted">50sp</text>
+<text x="617.5" y="387" text-anchor="middle" class="label-muted">Pre-Opt</text>
+<rect x="658.8" y="313.1" width="34" height="44.9" rx="4" fill="#F2B59B"/>
+<text x="675.8" y="308.1" text-anchor="middle" class="val">494</text>
+<text x="675.8" y="374" text-anchor="middle" class="label-muted">Wave 4</text>
+<text x="675.8" y="387" text-anchor="middle" class="label-muted">50sp</text>
+<rect x="717.2" y="319.2" width="34" height="38.8" rx="4" fill="#D9653B"/>
+<text x="734.2" y="314.2" text-anchor="middle" class="val">427</text>
+<text x="734.2" y="374" text-anchor="middle" class="label-muted">Wave 6b</text>
+<text x="734.2" y="387" text-anchor="middle" class="label-muted">3.32 GB</text>
+<rect x="775.5" y="318.7" width="34" height="39.3" rx="4" fill="#B54A24"/>
+<text x="792.5" y="313.7" text-anchor="middle" class="val">432</text>
+<text x="792.5" y="374" text-anchor="middle" class="label-muted">Trim+Hash</text>
+<text x="792.5" y="387" text-anchor="middle" class="label-muted">2.45 GB</text>
+<rect x="833.8" y="320.7" width="34" height="37.3" rx="4" fill="#943A1B"/>
+<text x="850.8" y="315.7" text-anchor="middle" class="val">410</text>
+<text x="850.8" y="374" text-anchor="middle" class="label-muted">Clustered</text>
+<text x="850.8" y="387" text-anchor="middle" class="label-muted">3.28 GB</text>
+<text x="530" y="419" class="footer">All 50-split variants return all 105 fields verbatim on Q20/Q24/Q25</text>
+<rect x="920" y="86" width="424" height="348" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c2)"/>
+<text x="940" y="114" class="card-title">Big5 10M (44 queries)</text>
+<text x="940" y="132" class="card-sub">Hot Total Latency (ms) — Wave 1 to Wave 6b</text>
+<rect x="1226.0" y="102.0" width="98.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="1275.0" y="116.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">-41% / 1.69x</text>
+<line x1="966" y1="358.0" x2="1322" y2="358.0" stroke="#ECE9E2"/>
+<text x="958" y="361.5" text-anchor="end" class="axis">0</text>
+<line x1="966" y1="312.5" x2="1322" y2="312.5" stroke="#ECE9E2"/>
+<text x="958" y="316.0" text-anchor="end" class="axis">150</text>
+<line x1="966" y1="267.1" x2="1322" y2="267.1" stroke="#ECE9E2"/>
+<text x="958" y="270.6" text-anchor="end" class="axis">300</text>
+<line x1="966" y1="221.6" x2="1322" y2="221.6" stroke="#ECE9E2"/>
+<text x="958" y="225.1" text-anchor="end" class="axis">450</text>
+<line x1="966" y1="176.2" x2="1322" y2="176.2" stroke="#ECE9E2"/>
+<text x="958" y="179.7" text-anchor="end" class="axis">600</text>
+<line x1="966" y1="169.2" x2="1322" y2="169.2" stroke="#6E56CF" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="1322" y="164.2" text-anchor="end" class="val" fill="#6E56CF" style="fill:#6E56CF;">Elasticsearch 8.17.4: 623 ms</text>
+<line x1="966" y1="226.9" x2="1322" y2="226.9" stroke="#2A8C78" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="1322" y="221.9" text-anchor="end" class="val" fill="#2A8C78" style="fill:#2A8C78;">OpenSearch 3.10.0: 433 ms</text>
+<path d="M 972.0,358.0 L 972.0,281.2 L 1021.1,296.3 L 1070.3,294.0 L 1119.4,299.5 L 1168.6,300.3 L 1217.7,303.8 L 1266.9,309.4 L 1316.0,312.6 L 1316.0,358.0 Z" fill="#D9653B" fill-opacity="0.12"/>
+<path d="M 972.0,281.2 L 1021.1,296.3 L 1070.3,294.0 L 1119.4,299.5 L 1168.6,300.3 L 1217.7,303.8 L 1266.9,309.4 L 1316.0,312.6" fill="none" stroke="#D9653B" stroke-width="2.6"/>
+<circle cx="972.0" cy="281.2" r="5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="972.0" y="272.2" text-anchor="middle" class="val">253</text>
+<text x="972.0" y="375" text-anchor="middle" class="label-muted">Base</text>
+<circle cx="1021.1" cy="296.3" r="3.5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="1021.1" y="287.3" text-anchor="middle" class="val">204</text>
+<text x="1021.1" y="375" text-anchor="middle" class="label-muted">W1</text>
+<circle cx="1070.3" cy="294.0" r="3.5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="1070.3" y="375" text-anchor="middle" class="label-muted">W2</text>
+<circle cx="1119.4" cy="299.5" r="3.5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="1119.4" y="290.5" text-anchor="middle" class="val">193</text>
+<text x="1119.4" y="375" text-anchor="middle" class="label-muted">W3</text>
+<circle cx="1168.6" cy="300.3" r="3.5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="1168.6" y="375" text-anchor="middle" class="label-muted">W4</text>
+<circle cx="1217.7" cy="303.8" r="3.5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="1217.7" y="294.8" text-anchor="middle" class="val">179</text>
+<text x="1217.7" y="375" text-anchor="middle" class="label-muted">W5</text>
+<circle cx="1266.9" cy="309.4" r="3.5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="1266.9" y="325.4" text-anchor="middle" class="val">160</text>
+<text x="1266.9" y="375" text-anchor="middle" class="label-muted">W6</text>
+<circle cx="1316.0" cy="312.6" r="5" fill="#D9653B" stroke="#FFFFFF" stroke-width="1.5"/>
+<text x="1316.0" y="303.6" text-anchor="middle" class="val">150</text>
+<text x="1316.0" y="375" text-anchor="middle" class="label-muted">W6b</text>
+<text x="966" y="419" class="footer">Geomean 4.84 -&gt; 2.84 ms (1.71x) · W6b: HeaderCache + SIMD</text>
+<text x="36" y="456" class="footer">Quickwit 0.9.3-perf: fmassot/quickwit@5d7468d0f (perf/searchbench) + fmassot/tantivy@da556bd62.</text>
+</svg>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>Tantivy Fork Commits — <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/searchbench" target="_blank" rel="noopener">fmassot/tantivy (perf/searchbench)</a></h4>
+          <ul class="commit-list">
+            <li><a class="commit-link" href="https://github.com/fmassot/tantivy/commit/da556bd624ae8830a3b1e9c568419f3645324cdd" target="_blank" rel="noopener"><code>da556bd62</code></a><span>Fast-field range queries: <code>RangeDocSet::fill_buffer</code>, horizon ramp &amp; AVX2 SIMD RLE range filter</span></li>
+            <li><a class="commit-link" href="https://github.com/fmassot/tantivy/commit/2c515bbba83143dc84b73b39b4f99c60f4679eec" target="_blank" rel="noopener"><code>2c515bbba</code></a><span>Big5 analytics: <code>IndexMetaSnapshot</code>, composite/range/histogram/stats/HLL fast paths &amp; block cache</span></li>
+            <li><a class="commit-link" href="https://github.com/fmassot/tantivy/commit/8f120f61903b35fe4f4573f2c4694702aac99f51" target="_blank" rel="noopener"><code>8f120f619</code></a><span>Multi-split cardinality merges &amp; nested string terms resolution</span></li>
+            <li><a class="commit-link" href="https://github.com/fmassot/tantivy/commit/9543795b3241b8e44f747da401a5d57d0f37e1ee" target="_blank" rel="noopener"><code>9543795b3</code></a><span>ClickBench aggregations, columnar RLE reads &amp; SSTable substring scanning</span></li>
+            <li><a class="commit-link" href="https://github.com/fmassot/tantivy/commit/487c0731f2e0447faa1b31889113064860ce0035" target="_blank" rel="noopener"><code>487c0731f</code></a><span>Indexing, document encoding/serialization, postings &amp; temp store</span></li>
+            <li><a class="commit-link" href="https://github.com/fmassot/tantivy/commit/c77d077c06f57193d778079c730d94251530ba5e" target="_blank" rel="noopener"><code>c77d077c0</code></a><span>Search execution, SSTable automaton scanning &amp; columnar compression</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h4>Quickwit Commits — <a class="commit-link" href="https://github.com/fmassot/quickwit/compare/b9fbdc7a8...5d7468d0f" target="_blank" rel="noopener">fmassot/quickwit (perf/searchbench)</a></h4>
+          <ul class="commit-list">
+            <li><a class="commit-link" href="https://github.com/fmassot/quickwit/commit/5d7468d0f9efd57fc09bca1a31608284af85a380" target="_blank" rel="noopener"><code>5d7468d0f</code></a><span>Distributed search: <code>SplitHeaderCache</code>, <code>DocMapperCache</code>, fast collectors, regex/wildcard &amp; metastore hot paths</span></li>
+            <li><a class="commit-link" href="https://github.com/fmassot/quickwit/commit/b92426cfbcacbe4b9789389ee3169b79481409cf" target="_blank" rel="noopener"><code>b92426cfb</code></a><span>Document parsing, zero-copy streaming JSON mapping &amp; <code>docs_clustering</code> fingerprinter</span></li>
+            <li><a class="commit-link" href="https://github.com/fmassot/quickwit/commit/ddd393ab580c41bd93457257ddf5c4eb860e1a64" target="_blank" rel="noopener"><code>ddd393ab5</code></a><span>Update Tantivy workspace dependency to <code>fmassot/tantivy@da556bd62</code></span></li>
+          </ul>
+          <p style="margin-top:12px;">
+            <a class="commit-link" href="https://github.com/fmassot/quickwit/compare/b9fbdc7a8...5d7468d0f" target="_blank" rel="noopener">View full Quickwit diff (b9fbdc7a8...5d7468d0f) &rarr;</a>
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- BENCHMARK TABLES -->
+    <section id="benchmarks">
+      <div class="section-head">
+        <h2>3. Detailed Benchmark Results</h2>
+        <span class="section-tag">Switch tabs or print to view all 3 suites</span>
+      </div>
+
+      <div class="tabs" role="tablist">
+        <button class="tab-btn active" onclick="switchTab('sb', this)">SearchBench 100M</button>
+        <button class="tab-btn" onclick="switchTab('cb', this)">ClickBench 10M</button>
+        <button class="tab-btn" onclick="switchTab('b5', this)">OpenSearch Big5 10M</button>
+      </div>
+
+      <!-- TAB 1: SEARCHBENCH -->
+      <div id="tab-sb" class="tab-panel active">
+        <h3>3.1 SearchBench 100M — All 77 Queries (Quickwit vs SereneDB 26.09.1)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Engine &amp; Version</th>
+                <th class="num">Index Size</th>
+                <th class="num">Load Time</th>
+                <th class="num">Cold Total</th>
+                <th class="num">Cold GM</th>
+                <th class="num">Hot Total</th>
+                <th class="num">Hot GM</th>
+                <th>Head-to-Head</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="highlight">
+                <td><strong>Quickwit 0.9.3-perf</strong> <span class="badge b-qw">29 splits</span></td>
+                <td class="num win">5.10 GB</td>
+                <td class="num">—</td>
+                <td class="num win">842.3 ms <span class="dim">(disk)</span></td>
+                <td class="num win">7.49 ms</td>
+                <td class="num win">697.0 ms</td>
+                <td class="num win">6.34 ms</td>
+                <td><span class="badge b-ok">47/77 Cold · 51/77 Hot</span></td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3-perf</strong> <span class="badge b-qw">101 splits</span></td>
+                <td class="num">5.10 GB</td>
+                <td class="num">—</td>
+                <td class="num">990.3 ms <span class="dim">(disk)</span></td>
+                <td class="num">8.62 ms</td>
+                <td class="num">853.4 ms</td>
+                <td class="num">7.41 ms</td>
+                <td><span class="dim">3.00× faster vs 0.9.3 Base</span></td>
+              </tr>
+              <tr>
+                <td><strong>SereneDB 26.09.1</strong> <span class="badge b-sdb">local</span></td>
+                <td class="num">12.03 GB</td>
+                <td class="num">32.4 s</td>
+                <td class="num">1,030.0 ms <span class="dim">(run 1)</span></td>
+                <td class="num">9.30 ms</td>
+                <td class="num">766.0 ms</td>
+                <td class="num">7.25 ms</td>
+                <td><span class="dim">30/77 Cold · 26/77 Hot</span></td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3 Baseline</strong> <span class="badge b-base">101 splits</span></td>
+                <td class="num">5.10 GB</td>
+                <td class="num">—</td>
+                <td class="num">3,460.3 ms <span class="dim">(disk)</span></td>
+                <td class="num">24.43 ms</td>
+                <td class="num">2,561.8 ms</td>
+                <td class="num">16.01 ms</td>
+                <td><span class="dim">Pre-optimization baseline</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>SearchBench 100M — 57 Common Queries (Quickwit vs SereneDB 26.09.1 vs ClickHouse 26.8.2.7)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Engine &amp; Version</th>
+                <th class="num">Index Size</th>
+                <th class="num">Load Time</th>
+                <th class="num">Cold Total</th>
+                <th class="num">Cold GM</th>
+                <th class="num">Hot Total</th>
+                <th class="num">Hot GM</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="highlight">
+                <td><strong>Quickwit 0.9.3-perf</strong> <span class="badge b-qw">29 splits</span></td>
+                <td class="num win">5.10 GB</td>
+                <td class="num">—</td>
+                <td class="num">710.8 ms <span class="dim">(disk)</span></td>
+                <td class="num win">7.94 ms</td>
+                <td class="num">573.6 ms</td>
+                <td class="num win">6.53 ms</td>
+              </tr>
+              <tr>
+                <td><strong>SereneDB 26.09.1</strong> <span class="badge b-sdb">local</span></td>
+                <td class="num">12.03 GB</td>
+                <td class="num">32.4 s</td>
+                <td class="num win">674.0 ms <span class="dim">(run 1)</span></td>
+                <td class="num">8.33 ms</td>
+                <td class="num win">562.0 ms</td>
+                <td class="num">6.78 ms</td>
+              </tr>
+              <tr>
+                <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">full-text</span></td>
+                <td class="num">20.16 GB</td>
+                <td class="num">60.7 s</td>
+                <td class="num">9,028.0 ms <span class="dim">(run 1)</span></td>
+                <td class="num">30.80 ms</td>
+                <td class="num">8,425.0 ms</td>
+                <td class="num">27.72 ms</td>
+              </tr>
+              <tr>
+                <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">nophrase</span></td>
+                <td class="num">7.92 GB</td>
+                <td class="num">40.7 s</td>
+                <td class="num">9,125.0 ms <span class="dim">(run 1)</span></td>
+                <td class="num">29.86 ms</td>
+                <td class="num">8,900.0 ms</td>
+                <td class="num">26.93 ms</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 2: CLICKBENCH -->
+      <div id="tab-cb" class="tab-panel">
+        <h3>3.2 ClickBench 10M — Mapping Variants &amp; Standard Run (9.77M Rows, 105 Cols, 35 Queries)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Engine / Quickwit Variant</th>
+                <th class="num">Index Size</th>
+                <th class="num">Ingest</th>
+                <th class="num">Run 1 Total</th>
+                <th class="num">Hot Total</th>
+                <th class="num">Hot GM</th>
+                <th>105-Col Row Return</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="highlight">
+                <td><strong>Quickwit 0.9.3-perf Trimmed+Hashes</strong> <span class="badge b-qw">14 idx · 49sp</span></td>
+                <td class="num win">2.45 GB</td>
+                <td class="num win">61.1 s</td>
+                <td class="num">468.0 ms</td>
+                <td class="num">432.0 ms</td>
+                <td class="num">7.68 ms</td>
+                <td><span class="badge b-ok">100% Exact (Q20/24/25)</span></td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3-perf Clustered</strong> <span class="badge b-qw">105 idx · 49sp</span></td>
+                <td class="num">3.28 GB</td>
+                <td class="num">~2–4m</td>
+                <td class="num win">450.0 ms</td>
+                <td class="num win">410.0 ms</td>
+                <td class="num win">7.33 ms</td>
+                <td><span class="badge b-ok">100% Exact</span></td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3-perf Full</strong> <span class="badge b-qw">105 idx · 49sp</span></td>
+                <td class="num">3.32 GB</td>
+                <td class="num">~2–4m</td>
+                <td class="num">502.0 ms</td>
+                <td class="num">427.0 ms</td>
+                <td class="num">7.72 ms</td>
+                <td><span class="badge b-ok">100% Exact</span></td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3-perf Trimmed</strong> <span class="badge b-qw">12 idx · 49sp</span></td>
+                <td class="num">2.37 GB</td>
+                <td class="num">62.1 s</td>
+                <td class="num">493.0 ms</td>
+                <td class="num">448.0 ms</td>
+                <td class="num">8.02 ms</td>
+                <td><span class="badge b-ok">100% Exact</span></td>
+              </tr>
+              <tr>
+                <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">28 parts</span></td>
+                <td class="num win">1.44 GB</td>
+                <td class="num">~8 s</td>
+                <td class="num">1,173.2 ms</td>
+                <td class="num">987.0 ms</td>
+                <td class="num">14.16 ms</td>
+                <td>Yes (columnar)</td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3 Baseline</strong> <span class="badge b-base">10 splits</span></td>
+                <td class="num">3.32 GB</td>
+                <td class="num">—</td>
+                <td class="num">2,055.0 ms</td>
+                <td class="num">1,974.0 ms</td>
+                <td class="num">21.42 ms</td>
+                <td>Yes</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>ClickBench 10M — True Disk-Cold Shootout (<code>posix_fadvise(DONTNEED)</code> + Caches Dropped/Zeroed)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Engine (35 Queries)</th>
+                <th class="num">Size</th>
+                <th class="num">True Disk-Cold (Wall)</th>
+                <th class="num">Cold GM</th>
+                <th class="num">Hot (Wall, 0-cache)</th>
+                <th class="num">Hot GM</th>
+                <th>Head-to-Head</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="highlight">
+                <td><strong>Quickwit 0.9.3-perf Trimmed+Hashes</strong> <span class="badge b-qw">0B caches</span></td>
+                <td class="num">2.45 GB</td>
+                <td class="num win">659.5 ms</td>
+                <td class="num win">14.71 ms</td>
+                <td class="num win">490.8 ms</td>
+                <td class="num win">10.28 ms</td>
+                <td><span class="badge b-ok">30/35 Cold · 21/35 Hot</span></td>
+              </tr>
+              <tr>
+                <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">dropped caches</span></td>
+                <td class="num">1.44 GB</td>
+                <td class="num">1,401.7 ms <span class="dim">(1,378 eng)</span></td>
+                <td class="num">23.88 ms</td>
+                <td class="num">908.3 ms <span class="dim">(882 eng)</span></td>
+                <td class="num">13.25 ms</td>
+                <td><span class="dim">5/35 Cold · 14/35 Hot</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 3: BIG5 -->
+      <div id="tab-b5" class="tab-panel">
+        <h3>3.3 OpenSearch Benchmark Big5 10M (9.89M Docs, 44 Queries, <code>request_cache=false</code>)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Engine &amp; Version</th>
+                <th class="num">Index Size</th>
+                <th class="num">Ingest (+FM)</th>
+                <th class="num">Run 1 (App-Cold)</th>
+                <th class="num">Run 1 GM</th>
+                <th class="num">Hot Total</th>
+                <th class="num">Hot GM</th>
+                <th>Head-to-Head</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="highlight">
+                <td><strong>Quickwit 0.9.3-perf</strong> <span class="badge b-qw">49 splits</span></td>
+                <td class="num win">2.10 GB</td>
+                <td class="num">64.0 s</td>
+                <td class="num win">180.3 ms</td>
+                <td class="num win">3.48 ms</td>
+                <td class="num win">149.7 ms</td>
+                <td class="num win">2.84 ms</td>
+                <td><span class="badge b-ok">33/44 vs OS · 31/44 vs ES</span></td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3-perf Clustered</strong> <span class="badge b-qw">49 splits</span></td>
+                <td class="num">2.19 GB</td>
+                <td class="num">151.0 s</td>
+                <td class="num">185.3 ms</td>
+                <td class="num">3.63 ms</td>
+                <td class="num">155.9 ms</td>
+                <td class="num">2.94 ms</td>
+                <td><span class="dim">Breaks natural log_stream RLE</span></td>
+              </tr>
+              <tr>
+                <td><strong>Quickwit 0.9.3 Baseline</strong> <span class="badge b-base">49 splits</span></td>
+                <td class="num">2.10 GB</td>
+                <td class="num">64.0 s</td>
+                <td class="num">293.1 ms</td>
+                <td class="num">5.65 ms</td>
+                <td class="num">253.3 ms</td>
+                <td class="num">4.84 ms</td>
+                <td><span class="dim">1.69× speedup in Wave 6b</span></td>
+              </tr>
+              <tr>
+                <td><strong>OpenSearch 3.10.0</strong> <span class="badge b-os">16 shards</span></td>
+                <td class="num">7.22 GB</td>
+                <td class="num">56.5 s (+35.7 s)</td>
+                <td class="num">1,496.1 ms</td>
+                <td class="num">11.81 ms</td>
+                <td class="num">432.7 ms <span class="dim">(358 took)</span></td>
+                <td class="num">5.19 ms</td>
+                <td><span class="dim">2.89× slower Hot · 3.44× larger</span></td>
+              </tr>
+              <tr>
+                <td><strong>Elasticsearch 8.17.4</strong> <span class="badge b-es">16 shards</span></td>
+                <td class="num">3.78 GB</td>
+                <td class="num">52.9 s (+20.1 s)</td>
+                <td class="num">1,542.2 ms</td>
+                <td class="num">14.40 ms</td>
+                <td class="num">623.0 ms <span class="dim">(547 took)</span></td>
+                <td class="num">6.54 ms</td>
+                <td><span class="dim">4.16× slower Hot · 1.80× larger</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- CATEGORIES & PARETO -->
+    <section id="deep-dive">
+      <div class="section-head">
+        <h2>4. Category Deep Dive &amp; Storage–Latency Pareto Frontier</h2>
+        <span class="section-tag">Strengths, trade-offs &amp; efficiency frontier</span>
+      </div>
+
+      <div class="chart-card">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;" viewBox="0 0 1380 560">
+  <defs>
+    <filter id="shadow_c3" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#141413" flood-opacity="0.04"/>
+    </filter>
+  </defs>
+  <rect width="1380" height="560" fill="#FAF9F6"/>
+  <style>
+    text { font-family: Adwaita Sans, Liberation Sans, sans-serif; fill: #141413; }
+    .mono { font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .title { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .subtitle { font-size: 13px; fill: #5E5C56; }
+    .card-title { font-size: 15px; font-weight: 700; }
+    .card-sub { font-size: 11.5px; fill: #5E5C56; }
+    .label { font-size: 11.5px; fill: #141413; font-weight: 600; }
+    .label-muted { font-size: 10.5px; fill: #5E5C56; }
+    .val { font-size: 11px; font-weight: 700; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .val-sub { font-size: 10px; fill: #5E5C56; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .axis { font-size: 10px; fill: #8C8980; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .pill-txt { font-size: 10.5px; font-weight: 700; }
+    .footer { font-size: 10.5px; fill: #8C8980; }
+  </style>
+<text x="36" y="42" class="title">Category-Level Head-to-Head — Where Quickwit Leads and Where Peers Compete</text>
+<text x="36" y="63" class="subtitle">Total Hot Latency (ms) per query category · Lower is better · Speedup ratios show Peer / Quickwit</text>
+<rect x="36" y="86" width="650" height="442" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c3)"/>
+<text x="56" y="114" class="card-title">SearchBench 100M — Quickwit vs SereneDB 26.09.1 (77 queries)</text>
+<rect x="56" y="126" width="10" height="10" rx="2" fill="#D9653B"/>
+<text x="71" y="135" class="label-muted">Quickwit 0.9.3-perf (Hot: 697 ms)</text>
+<rect x="271" y="126" width="10" height="10" rx="2" fill="#2D6A9F"/>
+<text x="286" y="135" class="label-muted">SereneDB 26.09.1 local (Hot: 766 ms)</text>
+<text x="184" y="174" text-anchor="end" class="label">top_k BM25 (19q)</text>
+<rect x="194" y="160" width="168.7" height="12" rx="3" fill="#D9653B"/>
+<text x="367.7" y="169.5" class="val">109</text>
+<rect x="194" y="174" width="292.9" height="12" rx="3" fill="#2D6A9F"/>
+<text x="491.9" y="183.5" class="val-sub">190</text>
+<rect x="610.0" y="163.0" width="58.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="639.0" y="177.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">1.74x</text>
+<line x1="56" y1="192" x2="666" y2="192" stroke="#ECE9E2"/>
+<text x="184" y="213" text-anchor="end" class="label">count_bool (13q)</text>
+<rect x="194" y="199" width="68.5" height="12" rx="3" fill="#D9653B"/>
+<text x="267.4" y="208.5" class="val">44</text>
+<rect x="194" y="213" width="126.4" height="12" rx="3" fill="#2D6A9F"/>
+<text x="325.4" y="222.5" class="val-sub">82</text>
+<rect x="610.0" y="202.0" width="58.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="639.0" y="216.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">1.85x</text>
+<line x1="56" y1="231" x2="666" y2="231" stroke="#ECE9E2"/>
+<text x="184" y="252" text-anchor="end" class="label">group_by_term (8q)</text>
+<rect x="194" y="238" width="102.1" height="12" rx="3" fill="#D9653B"/>
+<text x="301.1" y="247.5" class="val">66</text>
+<rect x="194" y="252" width="154.2" height="12" rx="3" fill="#2D6A9F"/>
+<text x="353.2" y="261.5" class="val-sub">100</text>
+<rect x="610.0" y="241.0" width="58.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="639.0" y="255.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">1.51x</text>
+<line x1="56" y1="270" x2="666" y2="270" stroke="#ECE9E2"/>
+<text x="184" y="291" text-anchor="end" class="label">group_by_min (5q)</text>
+<rect x="194" y="277" width="119.2" height="12" rx="3" fill="#D9653B"/>
+<text x="318.2" y="286.5" class="val">77</text>
+<rect x="194" y="291" width="175.8" height="12" rx="3" fill="#2D6A9F"/>
+<text x="374.8" y="300.5" class="val-sub">114</text>
+<rect x="610.0" y="280.0" width="58.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="639.0" y="294.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">1.47x</text>
+<line x1="56" y1="309" x2="666" y2="309" stroke="#ECE9E2"/>
+<text x="184" y="330" text-anchor="end" class="label">count_minmatch (1q)</text>
+<rect x="194" y="316" width="10.3" height="12" rx="3" fill="#D9653B"/>
+<text x="209.3" y="325.5" class="val">7</text>
+<rect x="194" y="330" width="12.3" height="12" rx="3" fill="#2D6A9F"/>
+<text x="211.3" y="339.5" class="val-sub">8</text>
+<rect x="610.0" y="319.0" width="58.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="639.0" y="333.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">1.19x</text>
+<line x1="56" y1="348" x2="666" y2="348" stroke="#ECE9E2"/>
+<text x="184" y="369" text-anchor="end" class="label">count_phrase (6q)</text>
+<rect x="194" y="355" width="100.4" height="12" rx="3" fill="#D9653B"/>
+<text x="299.4" y="364.5" class="val">65</text>
+<rect x="194" y="369" width="114.1" height="12" rx="3" fill="#2D6A9F"/>
+<text x="313.1" y="378.5" class="val-sub">74</text>
+<rect x="610.0" y="358.0" width="58.0" height="21" rx="10.5" fill="#F4EFEA"/><text x="639.0" y="372.2" text-anchor="middle" class="pill-txt" fill="#B54A24" style="fill:#B54A24;">1.14x</text>
+<line x1="56" y1="387" x2="666" y2="387" stroke="#ECE9E2"/>
+<text x="184" y="408" text-anchor="end" class="label">recent_unsorted (8q)</text>
+<rect x="194" y="394" width="53.8" height="12" rx="3" fill="#D9653B"/>
+<text x="252.8" y="403.5" class="val">35</text>
+<rect x="194" y="408" width="44.7" height="12" rx="3" fill="#2D6A9F"/>
+<text x="243.7" y="417.5" class="val-sub">29</text>
+<rect x="610.0" y="397.0" width="66.0" height="21" rx="10.5" fill="#EBF3FA"/><text x="643.0" y="411.2" text-anchor="middle" class="pill-txt" fill="#2D6A9F" style="fill:#2D6A9F;">1.20x SDB</text>
+<line x1="56" y1="426" x2="666" y2="426" stroke="#ECE9E2"/>
+<text x="184" y="447" text-anchor="end" class="label">recent_sorted (8q)</text>
+<rect x="194" y="433" width="115.0" height="12" rx="3" fill="#D9653B"/>
+<text x="314.0" y="442.5" class="val">75</text>
+<rect x="194" y="447" width="86.3" height="12" rx="3" fill="#2D6A9F"/>
+<text x="285.3" y="456.5" class="val-sub">56</text>
+<rect x="610.0" y="436.0" width="66.0" height="21" rx="10.5" fill="#EBF3FA"/><text x="643.0" y="450.2" text-anchor="middle" class="pill-txt" fill="#2D6A9F" style="fill:#2D6A9F;">1.33x SDB</text>
+<line x1="56" y1="465" x2="666" y2="465" stroke="#ECE9E2"/>
+<text x="184" y="486" text-anchor="end" class="label">count_pattern (9q)</text>
+<rect x="194" y="472" width="336.9" height="12" rx="3" fill="#D9653B"/>
+<text x="535.9" y="481.5" class="val">218</text>
+<rect x="194" y="486" width="174.2" height="12" rx="3" fill="#2D6A9F"/>
+<text x="373.2" y="495.5" class="val-sub">113</text>
+<rect x="610.0" y="475.0" width="66.0" height="21" rx="10.5" fill="#EBF3FA"/><text x="643.0" y="489.2" text-anchor="middle" class="pill-txt" fill="#2D6A9F" style="fill:#2D6A9F;">1.93x SDB</text>
+<rect x="704" y="86" width="640" height="442" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c3)"/>
+<text x="724" y="114" class="card-title">OpenSearch Big5 10M — Quickwit vs OS vs ES (44 queries)</text>
+<rect x="724" y="126" width="10" height="10" rx="2" fill="#D9653B"/>
+<text x="739" y="135" class="label-muted">Quickwit (150 ms)</text>
+<rect x="859" y="126" width="10" height="10" rx="2" fill="#2A8C78"/>
+<text x="874" y="135" class="label-muted">OpenSearch 3.10.0 (433 ms)</text>
+<rect x="1049" y="126" width="10" height="10" rx="2" fill="#6E56CF"/>
+<text x="1064" y="135" class="label-muted">Elasticsearch 8.17.4 (623 ms)</text>
+<text x="844" y="181" text-anchor="end" class="label">Terms, Composite</text>
+<text x="844" y="195" text-anchor="end" class="label">&amp; HLL (10q)</text>
+<rect x="854" y="164" width="55.2" height="12.5" rx="3" fill="#D9653B"/>
+<text x="914.2" y="173.8" class="val">43.4 ms</text>
+<rect x="854" y="180" width="185.9" height="12.5" rx="3" fill="#2A8C78"/>
+<text x="1044.9" y="189.8" class="val-sub">146.1 ms</text>
+<rect x="854" y="196" width="326.6" height="12.5" rx="3" fill="#6E56CF"/>
+<text x="1185.6" y="205.8" class="val-sub">256.6 ms</text>
+<rect x="1248.0" y="168.0" width="78.0" height="21" rx="10.5" fill="#E7F5F2"/><text x="1287.0" y="182.2" text-anchor="middle" class="pill-txt" fill="#2A8C78" style="fill:#2A8C78;">3.4x vs OS</text>
+<rect x="1248.0" y="193.0" width="78.0" height="21" rx="10.5" fill="#F0EDFA"/><text x="1287.0" y="207.2" text-anchor="middle" class="pill-txt" fill="#6E56CF" style="fill:#6E56CF;">5.9x vs ES</text>
+<line x1="724" y1="222" x2="1324" y2="222" stroke="#ECE9E2"/>
+<text x="844" y="251" text-anchor="end" class="label">Range &amp; Metric</text>
+<text x="844" y="265" text-anchor="end" class="label">Aggs (9q)</text>
+<rect x="854" y="234" width="35.3" height="12.5" rx="3" fill="#D9653B"/>
+<text x="894.3" y="243.8" class="val">27.7 ms</text>
+<rect x="854" y="250" width="174.4" height="12.5" rx="3" fill="#2A8C78"/>
+<text x="1033.4" y="259.8" class="val-sub">137.0 ms</text>
+<rect x="854" y="266" width="186.2" height="12.5" rx="3" fill="#6E56CF"/>
+<text x="1045.2" y="275.8" class="val-sub">146.3 ms</text>
+<rect x="1248.0" y="238.0" width="78.0" height="21" rx="10.5" fill="#E7F5F2"/><text x="1287.0" y="252.2" text-anchor="middle" class="pill-txt" fill="#2A8C78" style="fill:#2A8C78;">4.9x vs OS</text>
+<rect x="1248.0" y="263.0" width="78.0" height="21" rx="10.5" fill="#F0EDFA"/><text x="1287.0" y="277.2" text-anchor="middle" class="pill-txt" fill="#6E56CF" style="fill:#6E56CF;">5.3x vs ES</text>
+<line x1="724" y1="292" x2="1324" y2="292" stroke="#ECE9E2"/>
+<text x="844" y="321" text-anchor="end" class="label">Sorting &amp;</text>
+<text x="844" y="335" text-anchor="end" class="label">Pagination (9q)</text>
+<rect x="854" y="304" width="48.7" height="12.5" rx="3" fill="#D9653B"/>
+<text x="907.7" y="313.8" class="val">38.3 ms</text>
+<rect x="854" y="320" width="79.2" height="12.5" rx="3" fill="#2A8C78"/>
+<text x="938.2" y="329.8" class="val-sub">62.2 ms</text>
+<rect x="854" y="336" width="145.7" height="12.5" rx="3" fill="#6E56CF"/>
+<text x="1004.7" y="345.8" class="val-sub">114.5 ms</text>
+<rect x="1248.0" y="308.0" width="78.0" height="21" rx="10.5" fill="#E7F5F2"/><text x="1287.0" y="322.2" text-anchor="middle" class="pill-txt" fill="#2A8C78" style="fill:#2A8C78;">1.6x vs OS</text>
+<rect x="1248.0" y="333.0" width="78.0" height="21" rx="10.5" fill="#F0EDFA"/><text x="1287.0" y="347.2" text-anchor="middle" class="pill-txt" fill="#6E56CF" style="fill:#6E56CF;">3.0x vs ES</text>
+<line x1="724" y1="362" x2="1324" y2="362" stroke="#ECE9E2"/>
+<text x="844" y="391" text-anchor="end" class="label">Date Histogram</text>
+<text x="844" y="405" text-anchor="end" class="label">(9q)</text>
+<rect x="854" y="374" width="29.3" height="12.5" rx="3" fill="#D9653B"/>
+<text x="888.3" y="383.8" class="val">23.0 ms</text>
+<rect x="854" y="390" width="62.5" height="12.5" rx="3" fill="#2A8C78"/>
+<text x="921.5" y="399.8" class="val-sub">49.1 ms</text>
+<rect x="854" y="406" width="72.4" height="12.5" rx="3" fill="#6E56CF"/>
+<text x="931.4" y="415.8" class="val-sub">56.9 ms</text>
+<rect x="1248.0" y="378.0" width="78.0" height="21" rx="10.5" fill="#E7F5F2"/><text x="1287.0" y="392.2" text-anchor="middle" class="pill-txt" fill="#2A8C78" style="fill:#2A8C78;">2.1x vs OS</text>
+<rect x="1248.0" y="403.0" width="78.0" height="21" rx="10.5" fill="#F0EDFA"/><text x="1287.0" y="417.2" text-anchor="middle" class="pill-txt" fill="#6E56CF" style="fill:#6E56CF;">2.5x vs ES</text>
+<line x1="724" y1="432" x2="1324" y2="432" stroke="#ECE9E2"/>
+<text x="844" y="461" text-anchor="end" class="label">Text &amp; Keyword</text>
+<text x="844" y="475" text-anchor="end" class="label">(7q)</text>
+<rect x="854" y="444" width="22.0" height="12.5" rx="3" fill="#D9653B"/>
+<text x="881.0" y="453.8" class="val">17.3 ms</text>
+<rect x="854" y="460" width="48.6" height="12.5" rx="3" fill="#2A8C78"/>
+<text x="907.6" y="469.8" class="val-sub">38.2 ms</text>
+<rect x="854" y="476" width="61.9" height="12.5" rx="3" fill="#6E56CF"/>
+<text x="920.9" y="485.8" class="val-sub">48.6 ms</text>
+<rect x="1248.0" y="448.0" width="78.0" height="21" rx="10.5" fill="#E7F5F2"/><text x="1287.0" y="462.2" text-anchor="middle" class="pill-txt" fill="#2A8C78" style="fill:#2A8C78;">2.2x vs OS</text>
+<rect x="1248.0" y="473.0" width="78.0" height="21" rx="10.5" fill="#F0EDFA"/><text x="1287.0" y="487.2" text-anchor="middle" class="pill-txt" fill="#6E56CF" style="fill:#6E56CF;">2.8x vs ES</text>
+<text x="36" y="546" class="footer">On SearchBench Cold runs, Quickwit widens its BM25 top_k lead to 2.91x over SereneDB (118 vs 343 ms); on Big5 Run 1, Quickwit is 8.3x faster than OpenSearch and 8.6x faster than Elasticsearch.</text>
+</svg>
+      </div>
+
+      <div class="chart-card">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;" viewBox="0 0 1380 460">
+  <defs>
+    <filter id="shadow_c4" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#141413" flood-opacity="0.04"/>
+    </filter>
+  </defs>
+  <rect width="1380" height="460" fill="#FAF9F6"/>
+  <style>
+    text { font-family: Adwaita Sans, Liberation Sans, sans-serif; fill: #141413; }
+    .mono { font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .title { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .subtitle { font-size: 13px; fill: #5E5C56; }
+    .card-title { font-size: 15px; font-weight: 700; }
+    .card-sub { font-size: 11.5px; fill: #5E5C56; }
+    .label { font-size: 11.5px; fill: #141413; font-weight: 600; }
+    .label-muted { font-size: 10.5px; fill: #5E5C56; }
+    .val { font-size: 11px; font-weight: 700; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .val-sub { font-size: 10px; fill: #5E5C56; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .axis { font-size: 10px; fill: #8C8980; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .pill-txt { font-size: 10.5px; font-weight: 700; }
+    .footer { font-size: 10.5px; fill: #8C8980; }
+  </style>
+<text x="36" y="42" class="title">Latency vs Index Footprint — Pareto Efficiency Frontier</text>
+<text x="36" y="63" class="subtitle">Index Size on Disk (GB) vs Hot Geomean Latency (ms) · Bottom-left corner is optimal (smaller &amp; faster)</text>
+<rect x="36" y="86" width="424" height="336" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c4)"/>
+<text x="56" y="114" class="card-title">SearchBench 100M (OTEL Logs)</text>
+<text x="56" y="132" class="card-sub">57 common queries (all 77q for QW &amp; SDB)</text>
+<rect x="88" y="310" width="72" height="56" rx="4" fill="#D9653B" fill-opacity="0.05"/>
+<text x="94" y="359" class="footer" fill="#B54A24" style="fill:#B54A24;">Optimal</text>
+<line x1="88.0" y1="154" x2="88.0" y2="366" stroke="#ECE9E2"/>
+<text x="88.0" y="381" text-anchor="middle" class="axis">0 GB</text>
+<line x1="163.7" y1="154" x2="163.7" y2="366" stroke="#ECE9E2"/>
+<text x="163.7" y="381" text-anchor="middle" class="axis">5 GB</text>
+<line x1="239.3" y1="154" x2="239.3" y2="366" stroke="#ECE9E2"/>
+<text x="239.3" y="381" text-anchor="middle" class="axis">10 GB</text>
+<line x1="315.0" y1="154" x2="315.0" y2="366" stroke="#ECE9E2"/>
+<text x="315.0" y="381" text-anchor="middle" class="axis">15 GB</text>
+<line x1="390.6" y1="154" x2="390.6" y2="366" stroke="#ECE9E2"/>
+<text x="390.6" y="381" text-anchor="middle" class="axis">20 GB</text>
+<line x1="88" y1="366.0" x2="436" y2="366.0" stroke="#ECE9E2"/>
+<text x="80" y="369.5" text-anchor="end" class="axis">0ms</text>
+<line x1="88" y1="299.8" x2="436" y2="299.8" stroke="#ECE9E2"/>
+<text x="80" y="303.2" text-anchor="end" class="axis">10ms</text>
+<line x1="88" y1="233.5" x2="436" y2="233.5" stroke="#ECE9E2"/>
+<text x="80" y="237.0" text-anchor="end" class="axis">20ms</text>
+<line x1="88" y1="167.2" x2="436" y2="167.2" stroke="#ECE9E2"/>
+<text x="80" y="170.8" text-anchor="end" class="axis">30ms</text>
+<line x1="88" y1="366" x2="436" y2="366" stroke="#E5E2DC" stroke-width="1.2"/>
+<line x1="88" y1="154" x2="88" y2="366" stroke="#E5E2DC" stroke-width="1.2"/>
+<circle cx="165.2" cy="324.0" r="8" fill="#D9653B" stroke="#FFFFFF" stroke-width="2"/>
+<text x="177.2" y="298.0" text-anchor="start" class="label">Quickwit 0.9.3-perf</text>
+<text x="177.2" y="310.0" text-anchor="start" class="val-sub">5.1 GB · 6.3 ms</text>
+<circle cx="270.0" cy="318.0" r="7" fill="#2D6A9F" stroke="#FFFFFF" stroke-width="2"/>
+<text x="282.0" y="326.0" text-anchor="start" class="label">SereneDB 26.09.1</text>
+<text x="282.0" y="338.0" text-anchor="start" class="val-sub">12.0 GB · 7.3 ms</text>
+<circle cx="207.8" cy="187.6" r="6.5" fill="#F0CE84" stroke="#FFFFFF" stroke-width="2"/>
+<text x="217.8" y="163.6" text-anchor="start" class="label">ClickHouse (nophrase)</text>
+<text x="217.8" y="175.6" text-anchor="start" class="val-sub">7.9 GB · 26.9 ms</text>
+<circle cx="393.0" cy="182.4" r="7" fill="#D99B26" stroke="#FFFFFF" stroke-width="2"/>
+<text x="381.0" y="202.4" text-anchor="end" class="label">ClickHouse 26.8 (full)</text>
+<text x="381.0" y="214.4" text-anchor="end" class="val-sub">20.2 GB · 27.7 ms</text>
+<text x="262.0" y="408" text-anchor="middle" class="footer">Index Size on Disk (GB) →</text>
+<rect x="478" y="86" width="424" height="336" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c4)"/>
+<text x="498" y="114" class="card-title">ClickBench 10M (35 queries)</text>
+<text x="498" y="132" class="card-sub">All Quickwit configs return all 105 fields</text>
+<rect x="530" y="310" width="72" height="56" rx="4" fill="#D9653B" fill-opacity="0.05"/>
+<text x="536" y="359" class="footer" fill="#B54A24" style="fill:#B54A24;">Optimal</text>
+<line x1="530.0" y1="154" x2="530.0" y2="366" stroke="#ECE9E2"/>
+<text x="530.0" y="381" text-anchor="middle" class="axis">0 GB</text>
+<line x1="612.9" y1="154" x2="612.9" y2="366" stroke="#ECE9E2"/>
+<text x="612.9" y="381" text-anchor="middle" class="axis">1 GB</text>
+<line x1="695.7" y1="154" x2="695.7" y2="366" stroke="#ECE9E2"/>
+<text x="695.7" y="381" text-anchor="middle" class="axis">2 GB</text>
+<line x1="778.6" y1="154" x2="778.6" y2="366" stroke="#ECE9E2"/>
+<text x="778.6" y="381" text-anchor="middle" class="axis">3 GB</text>
+<line x1="861.4" y1="154" x2="861.4" y2="366" stroke="#ECE9E2"/>
+<text x="861.4" y="381" text-anchor="middle" class="axis">4 GB</text>
+<line x1="530" y1="366.0" x2="878" y2="366.0" stroke="#ECE9E2"/>
+<text x="522" y="369.5" text-anchor="end" class="axis">0ms</text>
+<line x1="530" y1="323.6" x2="878" y2="323.6" stroke="#ECE9E2"/>
+<text x="522" y="327.1" text-anchor="end" class="axis">5ms</text>
+<line x1="530" y1="281.2" x2="878" y2="281.2" stroke="#ECE9E2"/>
+<text x="522" y="284.7" text-anchor="end" class="axis">10ms</text>
+<line x1="530" y1="238.8" x2="878" y2="238.8" stroke="#ECE9E2"/>
+<text x="522" y="242.3" text-anchor="end" class="axis">15ms</text>
+<line x1="530" y1="196.4" x2="878" y2="196.4" stroke="#ECE9E2"/>
+<text x="522" y="199.9" text-anchor="end" class="axis">20ms</text>
+<line x1="530" y1="154.0" x2="878" y2="154.0" stroke="#ECE9E2"/>
+<text x="522" y="157.5" text-anchor="end" class="axis">25ms</text>
+<line x1="530" y1="366" x2="878" y2="366" stroke="#E5E2DC" stroke-width="1.2"/>
+<line x1="530" y1="154" x2="530" y2="366" stroke="#E5E2DC" stroke-width="1.2"/>
+<line x1="725.0" y1="300.9" x2="625.0" y2="300.7" stroke="#D9653B" stroke-width="1.4" stroke-dasharray="4,3"/>
+<circle cx="617.0" cy="300.7" r="6.5" fill="none" stroke="#D9653B" stroke-width="1.8" stroke-dasharray="3,2"/>
+<text x="579.0" y="322.7" text-anchor="start" class="footer" fill="#B54A24" style="fill:#B54A24;">~1.0 GB (synth _source)</text>
+<circle cx="733.0" cy="300.9" r="8" fill="#D9653B" stroke="#FFFFFF" stroke-width="2"/>
+<text x="721.0" y="276.9" text-anchor="end" class="label">QW Trimmed+Hashes</text>
+<text x="721.0" y="288.9" text-anchor="end" class="val-sub">2.45 GB · 7.7 ms</text>
+<circle cx="801.8" cy="303.8" r="6.5" fill="#B54A24" stroke="#FFFFFF" stroke-width="2"/>
+<text x="829.8" y="325.8" text-anchor="end" class="label">QW Clustered</text>
+<text x="829.8" y="337.8" text-anchor="end" class="val-sub">3.28 GB · 7.3 ms</text>
+<circle cx="805.1" cy="300.5" r="6" fill="#F2B59B" stroke="#FFFFFF" stroke-width="2"/>
+<text x="847.1" y="276.5" text-anchor="end" class="label">QW Full (105 idx)</text>
+<text x="847.1" y="288.5" text-anchor="end" class="val-sub">3.32 GB · 7.7 ms</text>
+<circle cx="649.3" cy="245.9" r="7.5" fill="#D99B26" stroke="#FFFFFF" stroke-width="2"/>
+<text x="659.3" y="221.9" text-anchor="start" class="label">ClickHouse 26.8</text>
+<text x="659.3" y="233.9" text-anchor="start" class="val-sub">1.44 GB · 14.2 ms</text>
+<circle cx="805.1" cy="184.4" r="6" fill="#A8A49B" stroke="#FFFFFF" stroke-width="2"/>
+<text x="791.1" y="180.4" text-anchor="end" class="label">QW 0.9.3 Base</text>
+<text x="791.1" y="192.4" text-anchor="end" class="val-sub">3.32 GB · 21.4 ms</text>
+<text x="704.0" y="408" text-anchor="middle" class="footer">Index Size on Disk (GB) →</text>
+<rect x="920" y="86" width="424" height="336" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c4)"/>
+<text x="940" y="114" class="card-title">OpenSearch Big5 10M (44 queries)</text>
+<text x="940" y="132" class="card-sub">Same 9.89M docs · 16 shards (OS/ES) vs 49 splits</text>
+<rect x="972" y="310" width="72" height="56" rx="4" fill="#D9653B" fill-opacity="0.05"/>
+<text x="978" y="359" class="footer" fill="#B54A24" style="fill:#B54A24;">Optimal</text>
+<line x1="972.0" y1="154" x2="972.0" y2="366" stroke="#ECE9E2"/>
+<text x="972.0" y="381" text-anchor="middle" class="axis">0 GB</text>
+<line x1="1054.9" y1="154" x2="1054.9" y2="366" stroke="#ECE9E2"/>
+<text x="1054.9" y="381" text-anchor="middle" class="axis">2 GB</text>
+<line x1="1137.7" y1="154" x2="1137.7" y2="366" stroke="#ECE9E2"/>
+<text x="1137.7" y="381" text-anchor="middle" class="axis">4 GB</text>
+<line x1="1220.6" y1="154" x2="1220.6" y2="366" stroke="#ECE9E2"/>
+<text x="1220.6" y="381" text-anchor="middle" class="axis">6 GB</text>
+<line x1="1303.4" y1="154" x2="1303.4" y2="366" stroke="#ECE9E2"/>
+<text x="1303.4" y="381" text-anchor="middle" class="axis">8 GB</text>
+<line x1="972" y1="366.0" x2="1320" y2="366.0" stroke="#ECE9E2"/>
+<text x="964" y="369.5" text-anchor="end" class="axis">0ms</text>
+<line x1="972" y1="314.3" x2="1320" y2="314.3" stroke="#ECE9E2"/>
+<text x="964" y="317.8" text-anchor="end" class="axis">2ms</text>
+<line x1="972" y1="262.6" x2="1320" y2="262.6" stroke="#ECE9E2"/>
+<text x="964" y="266.1" text-anchor="end" class="axis">4ms</text>
+<line x1="972" y1="210.9" x2="1320" y2="210.9" stroke="#ECE9E2"/>
+<text x="964" y="214.4" text-anchor="end" class="axis">6ms</text>
+<line x1="972" y1="159.2" x2="1320" y2="159.2" stroke="#ECE9E2"/>
+<text x="964" y="162.7" text-anchor="end" class="axis">8ms</text>
+<line x1="972" y1="366" x2="1320" y2="366" stroke="#E5E2DC" stroke-width="1.2"/>
+<line x1="972" y1="154" x2="972" y2="366" stroke="#E5E2DC" stroke-width="1.2"/>
+<circle cx="1059.0" cy="292.6" r="8" fill="#D9653B" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1071.0" y="288.6" text-anchor="start" class="label">Quickwit 0.9.3-perf</text>
+<text x="1071.0" y="300.6" text-anchor="start" class="val-sub">2.10 GB · 2.84 ms</text>
+<circle cx="1059.0" cy="240.9" r="6.5" fill="#A8A49B" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1071.0" y="236.9" text-anchor="start" class="label">QW 0.9.3 Base</text>
+<text x="1071.0" y="248.9" text-anchor="start" class="val-sub">2.10 GB · 4.84 ms</text>
+<circle cx="1128.6" cy="196.9" r="7.5" fill="#6E56CF" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1140.6" y="188.9" text-anchor="start" class="label">Elasticsearch 8.17.4</text>
+<text x="1140.6" y="200.9" text-anchor="start" class="val-sub">3.78 GB · 6.54 ms</text>
+<circle cx="1271.1" cy="231.8" r="7.5" fill="#2A8C78" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1259.1" y="213.8" text-anchor="end" class="label">OpenSearch 3.10.0</text>
+<text x="1259.1" y="225.8" text-anchor="end" class="val-sub">7.22 GB · 5.19 ms</text>
+<text x="1146.0" y="408" text-anchor="middle" class="footer">Index Size on Disk (GB) →</text>
+<text x="36" y="446" class="footer">Quickwit 0.9.3-perf sits on the strict Pareto frontier across all three benchmarks, combining columnar compression with inverted-index selectivity.</text>
+</svg>
+      </div>
+    </section>
+
+    <!-- KEY TAKEAWAYS -->
+    <section id="findings">
+      <div class="section-head">
+        <h2>5. Key Architectural Takeaways &amp; Next Opportunities</h2>
+        <span class="section-tag">Engineering roadmap</span>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>1. Trimmed Doc Mapping Cuts Wide-Table Size by 26% with Zero Latency Loss</h4>
+          <p>
+            On ClickBench (105 columns), keeping only the <strong>14 filter/search columns</strong> indexed (including
+            <code>URLHash</code> &amp; <code>RefererHash</code>) while keeping all 105 columns <code>fast: true</code> and
+            <code>stored: true</code> reduced inverted index files (<code>.idx</code> + <code>.term</code>) by <strong>~80%</strong>,
+            shrank total storage from <code>3.32 GB &rarr; 2.45 GB</code>, cut ingest to <code>61.1 s</code>, and kept Hot latency at
+            <code>432 ms</code> (geomean <code>7.68 ms</code>) with 100% verbatim row retrieval on <code>Q20/Q24/Q25</code>.
+          </p>
+        </div>
+        <div class="card">
+          <h4>2. Synthetic <code>_source</code> from <code>.fast</code> Is the Next 2× Storage Win</h4>
+          <p>
+            In the trimmed ClickBench index, Tantivy's columnar <code>.fast</code> holds all 105 columns in just
+            <strong>~0.68 GB</strong> (less than half of ClickHouse's <code>1.44 GB</code>), while <code>.store</code> takes
+            <strong>~1.10 GB (56%)</strong> solely for <code>fetch_docs</code>. Reconstructing returned rows directly from
+            <code>.fast</code> columns would bring ClickBench down to <strong>~1.0 GB</strong> while preserving full <code>size: 100</code> row retrieval.
+          </p>
+        </div>
+        <div class="card">
+          <h4>3. <code>docs_clustering</code> Helps Unsorted Analytics, Hurts Pre-Grouped Logs</h4>
+          <p>
+            Clustering ClickBench by <code>CounterID &rarr; EventDate+RegionID &rarr; UserID</code> improved Hot latency
+            <strong>-4.0%</strong> (<code>427 &rarr; 410 ms</code>) and Run 1 <strong>-10%</strong>. On Big5 CloudWatch logs,
+            however, clustering fragmented natural <code>log_group</code>/<code>log_stream</code> RLE runs (<code>+4.1%</code>
+            latency, <code>2.36×</code> slower ingest).
+          </p>
+        </div>
+        <div class="card">
+          <h4>4. Clear Next Targets vs SereneDB 26.09.1</h4>
+          <p>
+            Across all 77 SearchBench queries, Quickwit dominates BM25 <code>top_k</code> (<strong>2.91× cold / 1.74× hot</strong>),
+            boolean counts (<strong>1.92× / 1.85×</strong>), and aggregations (<strong>1.51×</strong>) at <strong>2.36×</strong> smaller
+            footprint. SereneDB's remaining lead is concentrated in <code>count_pattern</code> (regex/wildcard: <code>113 vs 218 ms</code>)
+            and <code>recent_*</code> doc fetches (<code>85 vs 110 ms</code>).
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div>
+        Quickwit <a class="commit-link" href="https://github.com/fmassot/quickwit/commit/5d7468d0f9efd57fc09bca1a31608284af85a380" target="_blank" rel="noopener"><code>fmassot/quickwit@5d7468d0f</code></a>
+        + Tantivy <a class="commit-link" href="https://github.com/fmassot/tantivy/commit/da556bd624ae8830a3b1e9c568419f3645324cdd" target="_blank" rel="noopener"><code>fmassot/tantivy@da556bd62</code></a>
+      </div>
+      <div>Generated 2026-11-21 · Self-contained offline HTML report (print-to-PDF ready)</div>
+    </footer>
+  </main>
+
+  <script>
+    function switchTab(id, btn) {
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('tab-' + id).classList.add('active');
+      btn.classList.add('active');
+    }
+  </script>
+</body>
+</html>
