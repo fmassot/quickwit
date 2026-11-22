@@ -196,9 +196,7 @@ pub fn specialized_top_k_segment_collector(
     order1: SortOrder,
     order2: SortOrder,
 ) -> Box<dyn QuickwitSegmentTopKCollector> {
-    // TODO: Add support for search_after to the specialized collector.
-    // Eventually we may want to remove the generic collector to reduce complexity.
-    if search_after_option.is_some() || score_extractor.is_score() {
+    if score_extractor.is_score() {
         return Box::new(GenericQuickwitSegmentTopKCollector::new(
             split_id,
             score_extractor,
@@ -209,6 +207,15 @@ pub fn specialized_top_k_segment_collector(
             order2,
         ));
     }
+
+    let precomp_search_after_order = match &search_after_option {
+        Some(search_after) if !search_after.split_id.is_empty() => order1
+            .compare(split_id.as_str(), search_after.split_id.as_str())
+            .then_with(|| order1.compare(&segment_ord, &search_after.segment_ord)),
+        _ => Ordering::Equal,
+    };
+    let search_after =
+        SearchAfterSegment::new(search_after_option, order1, order2, &score_extractor);
 
     let sort_first_by_ff = score_extractor.first.is_fast_field();
     let sort_second_by_ff = score_extractor
@@ -239,6 +246,8 @@ pub fn specialized_top_k_segment_collector(
                 score_extractor,
                 leaf_max_hits,
                 segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
         (SortType::DocId, SortOrder::Asc, _) => {
@@ -247,6 +256,8 @@ pub fn specialized_top_k_segment_collector(
                 score_extractor,
                 leaf_max_hits,
                 segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
         (SortType::OneFFSort, SortOrder::Asc, SortOrder::Asc) => {
@@ -255,7 +266,12 @@ pub fn specialized_top_k_segment_collector(
                 (),
                 true,
             >::new(
-                split_id, score_extractor, leaf_max_hits, segment_ord
+                split_id,
+                score_extractor,
+                leaf_max_hits,
+                segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
         (SortType::OneFFSort, SortOrder::Desc, SortOrder::Asc) => Box::new(
@@ -264,6 +280,8 @@ pub fn specialized_top_k_segment_collector(
                 score_extractor,
                 leaf_max_hits,
                 segment_ord,
+                search_after,
+                precomp_search_after_order,
             ),
         ),
         (SortType::OneFFSort, SortOrder::Asc, SortOrder::Desc) => {
@@ -272,7 +290,12 @@ pub fn specialized_top_k_segment_collector(
                 (),
                 true,
             >::new(
-                split_id, score_extractor, leaf_max_hits, segment_ord
+                split_id,
+                score_extractor,
+                leaf_max_hits,
+                segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
         (SortType::OneFFSort, SortOrder::Desc, SortOrder::Desc) => Box::new(
@@ -281,6 +304,8 @@ pub fn specialized_top_k_segment_collector(
                 score_extractor,
                 leaf_max_hits,
                 segment_ord,
+                search_after,
+                precomp_search_after_order,
             ),
         ),
         (SortType::TwoFFSorts, SortOrder::Asc, SortOrder::Asc) => {
@@ -289,7 +314,12 @@ pub fn specialized_top_k_segment_collector(
                 Option<Reverse<u64>>,
                 true,
             >::new(
-                split_id, score_extractor, leaf_max_hits, segment_ord
+                split_id,
+                score_extractor,
+                leaf_max_hits,
+                segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
         (SortType::TwoFFSorts, SortOrder::Asc, SortOrder::Desc) => {
@@ -298,7 +328,12 @@ pub fn specialized_top_k_segment_collector(
                 Option<u64>,
                 true,
             >::new(
-                split_id, score_extractor, leaf_max_hits, segment_ord
+                split_id,
+                score_extractor,
+                leaf_max_hits,
+                segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
         (SortType::TwoFFSorts, SortOrder::Desc, SortOrder::Asc) => {
@@ -307,7 +342,12 @@ pub fn specialized_top_k_segment_collector(
                 Option<Reverse<u64>>,
                 false,
             >::new(
-                split_id, score_extractor, leaf_max_hits, segment_ord
+                split_id,
+                score_extractor,
+                leaf_max_hits,
+                segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
         (SortType::TwoFFSorts, SortOrder::Desc, SortOrder::Desc) => {
@@ -316,7 +356,12 @@ pub fn specialized_top_k_segment_collector(
                 Option<u64>,
                 false,
             >::new(
-                split_id, score_extractor, leaf_max_hits, segment_ord
+                split_id,
+                score_extractor,
+                leaf_max_hits,
+                segment_ord,
+                search_after,
+                precomp_search_after_order,
             ))
         }
     }
@@ -534,8 +579,18 @@ where
     }
 }
 
-/// No search after handling
-/// Quickwit collector working at the scale of the segment.
+/// Typed `search_after` predicate matching `GenericQuickwitSegmentTopKCollector`'s ordering.
+#[derive(Copy, Clone)]
+enum SearchAfterFilter<V1, V2, const REVERSE_DOCID: bool> {
+    /// Accept hit iff `(hit.value1, hit.value2) < (bound1, bound2)`.
+    StrictValues(V1, V2),
+    /// Accept hit iff `(hit.value1, hit.value2) <= (bound1, bound2)`.
+    InclusiveValues(V1, V2),
+    /// Accept hit iff `hit < bound_hit` (includes `doc_id` tie-breaking).
+    StrictHit(Hit<V1, V2, REVERSE_DOCID>),
+}
+
+/// Monomorphized Quickwit collector working at the scale of the segment.
 struct SpecializedSegmentTopKCollector<
     V1: Copy + PartialEq + Eq + PartialOrd + Ord + IntoOptionU64 + Debug + MinValue,
     V2: Copy + PartialEq + Eq + PartialOrd + Ord + IntoOptionU64 + Debug + MinValue,
@@ -545,6 +600,7 @@ struct SpecializedSegmentTopKCollector<
     hit_fetcher: SpecSortingFieldExtractor<V1, V2>,
     top_k_hits: TopKComputer<Hit<V1, V2, REVERSE_DOCID>>,
     segment_ord: u32,
+    search_after_filter: Option<SearchAfterFilter<V1, V2, REVERSE_DOCID>>,
 }
 
 impl<
@@ -558,15 +614,35 @@ impl<
         score_extractor: SortingFieldExtractorPair,
         leaf_max_hits: usize,
         segment_ord: u32,
+        search_after: Option<SearchAfterSegment>,
+        precomp_search_after_order: Ordering,
     ) -> Self {
         let hit_fetcher =
             SpecSortingFieldExtractor::new(score_extractor.first, score_extractor.second);
         let top_k_hits = TopKComputer::new(leaf_max_hits);
+        let search_after_filter = search_after.map(|sa| {
+            let value1 = V1::from_option_u64(sa.sort_value);
+            let value2 = V2::from_option_u64(sa.sort_value2);
+            if !sa.compare_on_equal {
+                SearchAfterFilter::StrictValues(value1, value2)
+            } else {
+                match precomp_search_after_order {
+                    Ordering::Less => SearchAfterFilter::InclusiveValues(value1, value2),
+                    Ordering::Greater => SearchAfterFilter::StrictValues(value1, value2),
+                    Ordering::Equal => SearchAfterFilter::StrictHit(Hit {
+                        doc_id: sa.doc_id,
+                        value1,
+                        value2,
+                    }),
+                }
+            }
+        });
         Self {
             split_id,
             hit_fetcher,
             top_k_hits,
             segment_ord,
+            search_after_filter,
         }
     }
 }
@@ -579,8 +655,33 @@ impl<
     fn collect_top_k_block(&mut self, docs: &[DocId]) {
         self.hit_fetcher.fetch_data(docs);
         let iter = self.hit_fetcher.iter_hits::<REVERSE_DOCID>(docs);
-        for doc_id in iter {
-            self.top_k_hits.push(doc_id);
+        match self.search_after_filter {
+            None => {
+                for hit in iter {
+                    self.top_k_hits.push(hit);
+                }
+            }
+            Some(SearchAfterFilter::StrictValues(bound1, bound2)) => {
+                for hit in iter {
+                    if (hit.value1, hit.value2) < (bound1, bound2) {
+                        self.top_k_hits.push(hit);
+                    }
+                }
+            }
+            Some(SearchAfterFilter::InclusiveValues(bound1, bound2)) => {
+                for hit in iter {
+                    if (hit.value1, hit.value2) <= (bound1, bound2) {
+                        self.top_k_hits.push(hit);
+                    }
+                }
+            }
+            Some(SearchAfterFilter::StrictHit(bound_hit)) => {
+                for hit in iter {
+                    if hit < bound_hit {
+                        self.top_k_hits.push(hit);
+                    }
+                }
+            }
         }
     }
 

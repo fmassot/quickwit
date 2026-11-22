@@ -36,7 +36,7 @@ pub use self::caching_directory::{
     CachingDirectory, MemoryReservation, MemoryReserver, OutOfMemoryError,
 };
 pub use self::debug_proxy_directory::{DebugProxyDirectory, ReadOperation};
-pub use self::hot_directory::{HotDirectory, write_hotcache};
+pub use self::hot_directory::{HotDirectory, StaticDirectoryCache, write_hotcache};
 pub use self::storage_directory::StorageDirectory;
 pub use self::union_directory::UnionDirectory;
 

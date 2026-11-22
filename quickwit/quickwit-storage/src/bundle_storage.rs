@@ -41,7 +41,7 @@ pub struct BundleStorage {
     storage: Arc<dyn Storage>,
     /// The file path of the bundle in the storage.
     bundle_filepath: PathBuf,
-    file_ranges: BundleFileRanges,
+    file_ranges: Arc<BundleFileRanges>,
 }
 
 impl BundleStorage {
@@ -79,13 +79,23 @@ impl BundleStorage {
     ) -> anyhow::Result<(Self, OwnedBytes)> {
         let (file_ranges, hotcache) = BundleFileRanges::open_from_split_bytes(split_bytes)?;
         Ok((
-            BundleStorage {
-                storage,
-                bundle_filepath,
-                file_ranges,
-            },
+            Self::open_from_file_ranges(storage, bundle_filepath, Arc::new(file_ranges)),
             hotcache,
         ))
+    }
+
+    /// Opens a [`BundleStorage`] from a pre-parsed [`BundleFileRanges`], avoiding re-parsing the
+    /// bundle footer metadata.
+    pub fn open_from_file_ranges(
+        storage: Arc<dyn Storage>,
+        bundle_filepath: PathBuf,
+        file_ranges: Arc<BundleFileRanges>,
+    ) -> Self {
+        BundleStorage {
+            storage,
+            bundle_filepath,
+            file_ranges,
+        }
     }
 
     /// Returns Iterator over files contained in the bundle.
@@ -424,7 +434,7 @@ impl BundleFileRanges {
     /// See docs/internals/split-format.md
     /// [Files, BundleFileRanges, BundleMetadata Len, HotCache, HotCache Len, Split Footer Trailer]
     /// Returns (Self, Hotcache)
-    fn open_from_split_bytes(split_bytes: OwnedBytes) -> anyhow::Result<(Self, OwnedBytes)> {
+    pub fn open_from_split_bytes(split_bytes: OwnedBytes) -> anyhow::Result<(Self, OwnedBytes)> {
         let split_slice = FileSlice::new(Arc::new(split_bytes));
         let split_slice = strip_split_footer_trailer(split_slice)?;
         let (bundle_and_hotcache_bytes, hotcache_len_data) =

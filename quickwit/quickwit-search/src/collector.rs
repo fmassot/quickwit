@@ -13,15 +13,17 @@
 // limitations under the License.
 
 use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use itertools::Itertools;
 use quickwit_common::binary_heap::{SortKeyMapper, TopK};
 use quickwit_doc_mapper::{FastFieldWarmupInfo, WarmupInfo};
 use quickwit_proto::search::{
-    LeafResourceStats, LeafSearchResponse, PartialHit, SearchRequest, SortByValue, SortOrder,
-    SortValue, SplitSearchError,
+    CountHits, LeafResourceStats, LeafSearchResponse, PartialHit, SearchRequest, SortByValue,
+    SortOrder, SortValue, SplitSearchError,
 };
 use quickwit_proto::types::SplitId;
 use serde::Deserialize;
@@ -704,6 +706,61 @@ impl QuickwitIncrementalAggregations {
     }
 }
 
+/// Loads a shared positive `f32` score threshold encoded as bits (`0` means no threshold yet).
+#[inline]
+pub(crate) fn load_shared_score_threshold(threshold: &AtomicU32) -> Score {
+    let bits = threshold.load(AtomicOrdering::Relaxed);
+    if bits == 0 {
+        Score::MIN
+    } else {
+        f32::from_bits(bits)
+    }
+}
+
+/// Atomically raises a shared positive `f32` score threshold.
+///
+/// Only finite strictly-positive scores are stored, because IEEE-754 non-negative `f32` bit
+/// representations preserve numeric ordering under unsigned integer comparison.
+#[inline]
+pub(crate) fn update_shared_score_threshold(threshold: &AtomicU32, score: f64) {
+    let score_f32 = score as f32;
+    if score_f32.is_finite() && score_f32 > 0.0 {
+        threshold.fetch_max(score_f32.to_bits(), AtomicOrdering::Relaxed);
+    }
+}
+
+/// Entry stored in the min-heap used by [`QuickwitCollector::collect_segment`] when pruning by
+/// BM25 score. Higher score is better; lower `doc_id` wins ties to match Tantivy's
+/// `Weight::for_each_pruning` strict `score > threshold` pruning contract.
+#[derive(Copy, Clone, Debug)]
+struct PrunedScoreHit {
+    score: Score,
+    doc_id: DocId,
+}
+
+impl PartialEq for PrunedScoreHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PrunedScoreHit {}
+
+impl PartialOrd for PrunedScoreHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrunedScoreHit {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.doc_id.cmp(&self.doc_id))
+    }
+}
+
 /// The quickwit collector is the tantivy Collector used in Quickwit.
 ///
 /// It defines the data that should be accumulated about the documents matching
@@ -717,11 +774,48 @@ pub(crate) struct QuickwitCollector {
     pub aggregation: Option<QuickwitAggregations>,
     pub agg_context_params: AggContextParams,
     search_after: Option<PartialHit>,
+    pub count_hits: CountHits,
+    pub shared_score_threshold: Option<Arc<AtomicU32>>,
 }
 
 impl QuickwitCollector {
     pub fn is_count_only(&self) -> bool {
         self.max_hits == 0 && self.aggregation.is_none()
+    }
+    /// Returns true if this collector can use Tantivy's Block-Max WAND pruning (`for_each_pruning`)
+    /// to skip non-competitive documents and blocks.
+    pub fn uses_score_pruning(&self) -> bool {
+        self.count_hits == CountHits::Underestimate
+            && self.aggregation.is_none()
+            && self.search_after.is_none()
+            && (self.max_hits + self.start_offset) > 0
+            && matches!(
+                self.sort_by.first,
+                SortByComponent::Score {
+                    order: SortOrder::Desc
+                }
+            )
+            && self.sort_by.second.is_none()
+    }
+    /// Returns true if this collector can probe backwards from `max_doc` to collect the top-K
+    /// highest matching `DocId`s without scanning the entire segment.
+    pub fn uses_doc_id_desc_pruning(&self) -> bool {
+        self.count_hits == CountHits::Underestimate
+            && self.aggregation.is_none()
+            && self.search_after.is_none()
+            && (self.max_hits + self.start_offset) > 0
+            && matches!(
+                self.sort_by.first,
+                SortByComponent::DocId {
+                    order: SortOrder::Desc
+                }
+            )
+            && self.sort_by.second.is_none()
+    }
+    /// Returns true if this collector uses any early-termination / pruning path that may
+    /// underestimate `num_hits`.
+    pub fn uses_pruning(&self) -> bool {
+        self.uses_score_pruning() || self.uses_doc_id_desc_pruning()
     }
     /// Updates search parameters affecting the returned documents.
     /// Does not update aggregations.
@@ -731,6 +825,7 @@ impl QuickwitCollector {
         self.max_hits = search_request.max_hits as usize;
         self.start_offset = search_request.start_offset as usize;
         self.search_after.clone_from(&search_request.search_after);
+        self.count_hits = search_request.count_hits();
     }
     pub fn fast_field_names(&self) -> HashSet<String> {
         let mut fast_field_names = HashSet::default();
@@ -829,6 +924,219 @@ impl Collector for QuickwitCollector {
                 .unwrap_or(false)
     }
 
+    fn collect_segment(
+        &self,
+        weight: &dyn tantivy::query::Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<tantivy::Result<LeafSearchResponse>> {
+        if self.uses_doc_id_desc_pruning() {
+            let leaf_max_hits = self.max_hits + self.start_offset;
+            let max_doc = reader.max_doc();
+            let alive_bitset = reader.alive_bitset();
+            let mut tail_hits: Vec<DocId> = Vec::with_capacity(leaf_max_hits);
+            if max_doc > 0 {
+                let mut first_scorer = weight.scorer(reader, 1.0)?;
+                if first_scorer.doc() < max_doc {
+                    let size_hint = first_scorer.size_hint().max(1);
+                    let min_window = (leaf_max_hits as u64).saturating_mul(4).max(1024);
+                    let est_window = ((max_doc as u64)
+                        .saturating_mul((leaf_max_hits as u64).saturating_mul(4))
+                        / (size_hint as u64))
+                        .max(min_window)
+                        .min(max_doc as u64) as u32;
+                    let mut window_end = max_doc;
+                    let mut window_size = est_window;
+                    let mut reused_first_scorer = false;
+                    let mut window_matches: Vec<DocId> = Vec::new();
+                    while tail_hits.len() < leaf_max_hits && window_end > 0 {
+                        let window_start = window_end.saturating_sub(window_size);
+                        let mut scorer = if !reused_first_scorer {
+                            reused_first_scorer = true;
+                            std::mem::replace(
+                                &mut first_scorer,
+                                Box::new(tantivy::query::EmptyScorer),
+                            )
+                        } else {
+                            weight.scorer(reader, 1.0)?
+                        };
+                        let mut doc = if window_start > 0 && scorer.doc() < window_start {
+                            scorer.seek(window_start)
+                        } else {
+                            scorer.doc()
+                        };
+                        window_matches.clear();
+                        while doc < window_end {
+                            if alive_bitset.is_none_or(|bitset| bitset.is_alive(doc)) {
+                                window_matches.push(doc);
+                            }
+                            doc = scorer.advance();
+                        }
+                        let needed = leaf_max_hits - tail_hits.len();
+                        let take_from = window_matches.len().saturating_sub(needed);
+                        for &doc_id in window_matches[take_from..].iter().rev() {
+                            tail_hits.push(doc_id);
+                        }
+                        window_end = window_start;
+                        window_size = window_size.saturating_mul(8);
+                    }
+                }
+            }
+            let num_hits = tail_hits.len() as u64;
+            let partial_hits: Vec<PartialHit> = tail_hits
+                .into_iter()
+                .map(|doc_id| PartialHit {
+                    sort_value: None,
+                    sort_value2: None,
+                    doc_id,
+                    split_id: self.split_id.to_string(),
+                    segment_ord,
+                })
+                .collect();
+            return Ok(Ok(LeafSearchResponse {
+                intermediate_aggregation_result: None,
+                num_hits,
+                partial_hits,
+                failed_splits: Vec::new(),
+                num_attempted_splits: 1,
+                num_successful_splits: 1,
+                resource_stats: None,
+            }));
+        }
+
+        if !self.uses_score_pruning() {
+            let with_scoring = self.requires_scoring();
+            let mut segment_collector = self.for_segment(segment_ord, reader)?;
+            if let Some(alive_bitset) = reader.alive_bitset() {
+                if with_scoring {
+                    weight.for_each(reader, &mut |doc, score| {
+                        if alive_bitset.is_alive(doc) {
+                            segment_collector.collect(doc, score);
+                        }
+                    })?;
+                } else {
+                    let mut alive_docs = [0u32; tantivy::COLLECT_BLOCK_BUFFER_LEN];
+                    weight.for_each_no_score(reader, &mut |docs| {
+                        let mut alive_len = 0;
+                        for &doc in docs {
+                            if alive_bitset.is_alive(doc) {
+                                alive_docs[alive_len] = doc;
+                                alive_len += 1;
+                            }
+                        }
+                        if alive_len > 0 {
+                            segment_collector.collect_block(&alive_docs[..alive_len]);
+                        }
+                    })?;
+                }
+            } else if with_scoring {
+                weight.for_each(reader, &mut |doc, score| {
+                    segment_collector.collect(doc, score);
+                })?;
+            } else {
+                weight.for_each_no_score(reader, &mut |docs| {
+                    segment_collector.collect_block(docs);
+                })?;
+            }
+            return Ok(segment_collector.harvest());
+        }
+
+        let leaf_max_hits = self.max_hits + self.start_offset;
+        let initial_threshold = self
+            .shared_score_threshold
+            .as_ref()
+            .map(|shared| load_shared_score_threshold(shared))
+            .unwrap_or(Score::MIN);
+        let mut heap: BinaryHeap<Reverse<PrunedScoreHit>> =
+            BinaryHeap::with_capacity(leaf_max_hits + 1);
+        let mut num_hits: u64 = 0;
+        let mut current_threshold = initial_threshold;
+
+        let push_hit = |heap: &mut BinaryHeap<Reverse<PrunedScoreHit>>,
+                        num_hits: &mut u64,
+                        current_threshold: &mut Score,
+                        doc_id: DocId,
+                        score: Score|
+         -> Score {
+            *num_hits += 1;
+            let entry = Reverse(PrunedScoreHit { score, doc_id });
+            if heap.len() < leaf_max_hits {
+                heap.push(entry);
+                if heap.len() == leaf_max_hits {
+                    let local_threshold = heap.peek().unwrap().0.score;
+                    *current_threshold = initial_threshold.max(local_threshold);
+                }
+            } else {
+                let replaced = if let Some(mut min_entry) = heap.peek_mut() {
+                    if entry.0 > min_entry.0 {
+                        *min_entry = entry;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if replaced {
+                    let local_threshold = heap.peek().unwrap().0.score;
+                    *current_threshold = initial_threshold.max(local_threshold);
+                }
+            }
+            *current_threshold
+        };
+
+        if let Some(alive_bitset) = reader.alive_bitset() {
+            weight.for_each_pruning(initial_threshold, reader, &mut |doc_id, score| {
+                if alive_bitset.is_deleted(doc_id) {
+                    return current_threshold;
+                }
+                push_hit(
+                    &mut heap,
+                    &mut num_hits,
+                    &mut current_threshold,
+                    doc_id,
+                    score,
+                )
+            })?;
+        } else {
+            weight.for_each_pruning(initial_threshold, reader, &mut |doc_id, score| {
+                push_hit(
+                    &mut heap,
+                    &mut num_hits,
+                    &mut current_threshold,
+                    doc_id,
+                    score,
+                )
+            })?;
+        }
+
+        let mut sorted_hits: Vec<PrunedScoreHit> =
+            heap.into_iter().map(|Reverse(hit)| hit).collect();
+        sorted_hits.sort_unstable_by(|left, right| right.cmp(left));
+        let partial_hits: Vec<PartialHit> = sorted_hits
+            .into_iter()
+            .map(|hit| PartialHit {
+                sort_value: Some(SortByValue {
+                    sort_value: Some(SortValue::F64(hit.score as f64)),
+                }),
+                sort_value2: None,
+                doc_id: hit.doc_id,
+                split_id: self.split_id.to_string(),
+                segment_ord,
+            })
+            .collect();
+
+        Ok(Ok(LeafSearchResponse {
+            intermediate_aggregation_result: None,
+            num_hits,
+            partial_hits,
+            failed_splits: Vec::new(),
+            num_attempted_splits: 1,
+            num_successful_splits: 1,
+            resource_stats: None,
+        }))
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<tantivy::Result<LeafSearchResponse>>,
@@ -885,22 +1193,8 @@ fn merge_intermediate_aggregation_result<'a>(
             Some(serialized)
         }
         Some(QuickwitAggregations::TantivyAggregations(aggregations)) => {
-            let merged_opt = intermediate_aggregation_results
-                .map(|bytes| postcard::from_bytes(bytes).map_err(map_error))
-                .try_fold::<_, _, Result<_, TantivyError>>(
-                    None,
-                    |acc: Option<IntermediateAggregationResults>, fruits_res| {
-                        let fruits = fruits_res?;
-                        match acc {
-                            Some(mut merged_fruits) => {
-                                merged_fruits.merge_fruits(fruits)?;
-                                Ok(Some(merged_fruits))
-                            }
-                            None => Ok(Some(fruits)),
-                        }
-                    },
-                )?;
-            let mut merged = merged_opt.unwrap_or_default();
+            let slices: Vec<&'a [u8]> = intermediate_aggregation_results.collect();
+            let mut merged = merge_tantivy_intermediate_slices(&slices)?;
             // Leaf results can be merged again at the root or by a federated query. Keep the
             // intermediate candidate set (`segment_size`) rather than applying final pruning.
             merged.prune_intermediate_results(aggregations, PruneMode::Intermediate)?;
@@ -911,6 +1205,81 @@ fn merge_intermediate_aggregation_result<'a>(
     };
 
     Ok(merged_intermediate_aggregation_result)
+}
+
+/// Deserializes and merges serialized [`IntermediateAggregationResults`] slices.
+///
+/// Uses a parallel tree reduction on the current rayon pool when merging 8 or more slices so
+/// multi-split leaf merges scale across CPU cores instead of running serially on one thread.
+fn merge_tantivy_intermediate_slices(
+    slices: &[&[u8]],
+) -> tantivy::Result<IntermediateAggregationResults> {
+    use rayon::prelude::*;
+
+    const PARALLEL_THRESHOLD: usize = 8;
+    const CHUNK_SIZE: usize = 4;
+
+    if slices.is_empty() {
+        return Ok(IntermediateAggregationResults::default());
+    }
+    if slices.len() < PARALLEL_THRESHOLD {
+        let mut iter = slices.iter();
+        let mut acc: IntermediateAggregationResults =
+            postcard::from_bytes(iter.next().unwrap()).map_err(map_error)?;
+        for bytes in iter {
+            let next_fruit: IntermediateAggregationResults =
+                postcard::from_bytes(bytes).map_err(map_error)?;
+            acc.merge_fruits(next_fruit)?;
+        }
+        return Ok(acc);
+    }
+
+    let mut partials: Vec<IntermediateAggregationResults> = slices
+        .par_chunks(CHUNK_SIZE)
+        .map(|chunk| {
+            let mut iter = chunk.iter();
+            let mut acc: IntermediateAggregationResults =
+                postcard::from_bytes(iter.next().unwrap()).map_err(map_error)?;
+            for bytes in iter {
+                let next_fruit: IntermediateAggregationResults =
+                    postcard::from_bytes(bytes).map_err(map_error)?;
+                acc.merge_fruits(next_fruit)?;
+            }
+            Ok(acc)
+        })
+        .collect::<tantivy::Result<Vec<_>>>()?;
+
+    while partials.len() >= PARALLEL_THRESHOLD {
+        let chunk_count = partials.len().div_ceil(CHUNK_SIZE);
+        let mut groups: Vec<Vec<IntermediateAggregationResults>> = Vec::with_capacity(chunk_count);
+        let mut drain_iter = partials.into_iter();
+        loop {
+            let group: Vec<IntermediateAggregationResults> =
+                drain_iter.by_ref().take(CHUNK_SIZE).collect();
+            if group.is_empty() {
+                break;
+            }
+            groups.push(group);
+        }
+        partials = groups
+            .into_par_iter()
+            .map(|group| {
+                let mut iter = group.into_iter();
+                let mut acc = iter.next().unwrap();
+                for next_fruit in iter {
+                    acc.merge_fruits(next_fruit)?;
+                }
+                Ok(acc)
+            })
+            .collect::<tantivy::Result<Vec<_>>>()?;
+    }
+
+    let mut iter = partials.into_iter();
+    let mut acc = iter.next().unwrap_or_default();
+    for next_fruit in iter {
+        acc.merge_fruits(next_fruit)?;
+    }
+    Ok(acc)
 }
 
 /// Merges a set of Leaf Results.
@@ -1042,8 +1411,24 @@ pub(crate) fn make_collector_for_split(
         Some(aggregation) => Some(serde_json::from_str(aggregation)?),
         None => None,
     };
+    Ok(make_collector_for_split_with_parsed_agg(
+        split_id,
+        search_request,
+        aggregation,
+        agg_context_params,
+    ))
+}
+
+/// Builds a [`QuickwitCollector`] reusing an already-parsed [`QuickwitAggregations`] so
+/// multi-split leaf searches do not re-parse the aggregation JSON once per split.
+pub(crate) fn make_collector_for_split_with_parsed_agg(
+    split_id: SplitId,
+    search_request: &SearchRequest,
+    aggregation: Option<QuickwitAggregations>,
+    agg_context_params: AggContextParams,
+) -> QuickwitCollector {
     let sort_by = sort_by_from_request(search_request);
-    Ok(QuickwitCollector {
+    QuickwitCollector {
         split_id,
         start_offset: search_request.start_offset as usize,
         max_hits: search_request.max_hits as usize,
@@ -1051,7 +1436,9 @@ pub(crate) fn make_collector_for_split(
         aggregation,
         agg_context_params,
         search_after: search_request.search_after.clone(),
-    })
+        count_hits: search_request.count_hits(),
+        shared_score_threshold: None,
+    }
 }
 
 /// Builds a QuickwitCollector that's only useful for merging fruits.
@@ -1076,6 +1463,8 @@ pub(crate) fn make_merge_collector(
         aggregation,
         agg_context_params,
         search_after: search_request.search_after.clone(),
+        count_hits: search_request.count_hits(),
+        shared_score_threshold: None,
     })
 }
 
@@ -2143,5 +2532,117 @@ mod tests {
         // Intermediate mode preserves more candidates than the final size (2), while bounding the
         // merged response to segment_size (4).
         assert_eq!(buckets.entries().len(), 4);
+    }
+
+    #[test]
+    fn test_quickwit_collector_score_pruning_and_doc_id_desc_pruning() {
+        use quickwit_proto::search::CountHits;
+        use tantivy::Index;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::{IndexRecordOption, Schema, TEXT};
+
+        use super::{QuickwitCollector, SortByComponent};
+
+        let mut schema_builder = Schema::builder();
+        let body_field = schema_builder.add_text_field("body", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer(15_000_000).unwrap();
+        for i in 0..500 {
+            let mut doc = TantivyDocument::new();
+            let text = if i % 25 == 0 {
+                "charge charge charge"
+            } else if i % 5 == 0 {
+                "charge charge"
+            } else if i % 2 == 0 {
+                "charge"
+            } else {
+                "other"
+            };
+            doc.add_text(body_field, text);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        // Add a larger second segment (> 1024 docs) with sparse matches near the end to exercise
+        // multi-window backward probing.
+        for i in 0..4000 {
+            let mut doc = TantivyDocument::new();
+            let text = if i < 2000 && i % 4 == 0 {
+                "charge"
+            } else if i >= 3995 {
+                "charge"
+            } else {
+                "other"
+            };
+            doc.add_text(body_field, text);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let searcher = index.reader().unwrap().searcher();
+        let query = TermQuery::new(
+            tantivy::Term::from_field_text(body_field, "charge"),
+            IndexRecordOption::WithFreqs,
+        );
+
+        // 1. Score pruning (CountHits::Underestimate) matches exact CountHits::CountAll top-K
+        //    scores.
+        let mut exact_score_collector = QuickwitCollector {
+            split_id: SplitId::from("split-1"),
+            start_offset: 0,
+            max_hits: 10,
+            sort_by: SortByComponent::Score {
+                order: SortOrder::Desc,
+            }
+            .into(),
+            aggregation: None,
+            agg_context_params: Default::default(),
+            search_after: None,
+            count_hits: CountHits::CountAll,
+            shared_score_threshold: None,
+        };
+        assert!(!exact_score_collector.uses_score_pruning());
+        let exact_score_resp = searcher.search(&query, &exact_score_collector).unwrap();
+
+        exact_score_collector.count_hits = CountHits::Underestimate;
+        assert!(exact_score_collector.uses_score_pruning());
+        let pruned_score_resp = searcher.search(&query, &exact_score_collector).unwrap();
+        assert_eq!(
+            pruned_score_resp.partial_hits.len(),
+            exact_score_resp.partial_hits.len()
+        );
+        let exact_scores: Vec<_> = exact_score_resp
+            .partial_hits
+            .iter()
+            .map(|h| h.sort_value())
+            .collect();
+        let pruned_scores: Vec<_> = pruned_score_resp
+            .partial_hits
+            .iter()
+            .map(|h| h.sort_value())
+            .collect();
+        assert_eq!(pruned_scores, exact_scores);
+
+        // 2. DocId DESC backward probing matches exact CountHits::CountAll doc IDs identically.
+        let mut doc_id_collector = QuickwitCollector {
+            split_id: SplitId::from("split-1"),
+            start_offset: 0,
+            max_hits: 15,
+            sort_by: SortByComponent::DocId {
+                order: SortOrder::Desc,
+            }
+            .into(),
+            aggregation: None,
+            agg_context_params: Default::default(),
+            search_after: None,
+            count_hits: CountHits::CountAll,
+            shared_score_threshold: None,
+        };
+        assert!(!doc_id_collector.uses_doc_id_desc_pruning());
+        let exact_doc_resp = searcher.search(&query, &doc_id_collector).unwrap();
+
+        doc_id_collector.count_hits = CountHits::Underestimate;
+        assert!(doc_id_collector.uses_doc_id_desc_pruning());
+        let pruned_doc_resp = searcher.search(&query, &doc_id_collector).unwrap();
+        assert_eq!(pruned_doc_resp.partial_hits, exact_doc_resp.partial_hits);
     }
 }

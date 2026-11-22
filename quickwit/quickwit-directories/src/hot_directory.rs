@@ -164,13 +164,19 @@ impl StaticDirectoryCacheBuilder {
     }
 }
 
+/// Parsed, immutable hotcache contents for a split directory.
+///
+/// Can be cached across requests and wrapped around any per-request underlying [`Directory`] via
+/// [`HotDirectory::open_with_static_cache`].
 #[derive(Debug)]
-struct StaticDirectoryCache {
+pub struct StaticDirectoryCache {
     file_lengths: HashMap<PathBuf, u64>,
     slices: HashMap<PathBuf, Arc<StaticSliceCache>>,
+    num_bytes_without_doc_store: u64,
 }
 
 impl StaticDirectoryCache {
+    /// Parses a serialized hotcache payload into a reusable [`StaticDirectoryCache`].
     pub fn open(mut bytes: OwnedBytes) -> anyhow::Result<StaticDirectoryCache> {
         let HotDirectoryMeta {
             mut slice_offsets,
@@ -186,20 +192,34 @@ impl StaticDirectoryCache {
                 StaticSliceCache::open(bytes.slice(start..end)).map(|s| (path, Arc::new(s)))
             })
             .collect::<tantivy::Result<_>>()?;
+        let num_bytes_without_doc_store: u64 = file_lengths
+            .iter()
+            .filter(|(path, _)| !path.to_string_lossy().ends_with("store"))
+            .map(|(_, file_length)| *file_length)
+            .sum();
         Ok(StaticDirectoryCache {
             file_lengths,
             slices,
+            num_bytes_without_doc_store,
         })
     }
 
+    /// Returns the sum of all file lengths excluding doc store files.
+    pub fn num_bytes_without_doc_store(&self) -> u64 {
+        self.num_bytes_without_doc_store
+    }
+
+    /// Returns the cached slice index for `path`, or an empty slice cache if absent.
     pub fn get_slice(&self, path: &Path) -> Arc<StaticSliceCache> {
         self.slices.get(path).cloned().unwrap_or_default()
     }
 
+    /// Returns the byte length of `path` in the split, if present.
     pub fn get_file_length(&self, path: &Path) -> Option<u64> {
         self.file_lengths.get(path).copied()
     }
 
+    /// Returns all files and their byte lengths sorted by path.
     pub fn get_file_lengths(&self) -> Vec<(PathBuf, u64)> {
         let mut entries = self
             .file_lengths
@@ -357,13 +377,21 @@ impl HotDirectory {
         underlying: D,
         hot_cache_bytes: OwnedBytes,
     ) -> anyhow::Result<HotDirectory> {
-        let static_cache = StaticDirectoryCache::open(hot_cache_bytes)?;
-        Ok(HotDirectory {
+        let static_cache = Arc::new(StaticDirectoryCache::open(hot_cache_bytes)?);
+        Ok(Self::open_with_static_cache(underlying, static_cache))
+    }
+
+    /// Wraps an index directory with a pre-parsed [`StaticDirectoryCache`].
+    pub fn open_with_static_cache<D: Directory>(
+        underlying: D,
+        static_cache: Arc<StaticDirectoryCache>,
+    ) -> HotDirectory {
+        HotDirectory {
             inner: Arc::new(InnerHotDirectory {
                 underlying: Box::new(underlying),
-                cache: Arc::new(static_cache),
+                cache: static_cache,
             }),
-        })
+        }
     }
 
     /// Get all the files in the directory and their sizes.
@@ -375,11 +403,7 @@ impl HotDirectory {
 
     /// Sum of the file lengths, the doc store files excluded.
     pub fn num_bytes_without_doc_store(&self) -> u64 {
-        self.get_file_lengths()
-            .iter()
-            .filter(|(path, _)| !path.to_string_lossy().ends_with("store"))
-            .map(|(_, file_length)| *file_length)
-            .sum()
+        self.inner.cache.num_bytes_without_doc_store()
     }
 }
 

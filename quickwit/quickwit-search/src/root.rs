@@ -183,6 +183,102 @@ struct RequestMetadata {
 /// needed for leaf search requests.
 /// Note: the requirements on timestamp fields and resolved query ASTs can be lifted
 /// but it adds complexity that does not seem needed right now.
+fn validate_request_and_build_metadata_from_entries(
+    entries: &[crate::service::CachedIndexMetadataEntry],
+    search_request: &SearchRequest,
+) -> crate::Result<RequestMetadata> {
+    validate_sort_by_fields_and_search_after(
+        &search_request.sort_fields,
+        &search_request.search_after,
+    )?;
+    let query_ast: QueryAst = serde_json::from_str(&search_request.query_ast)
+        .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
+    let mut indexes_meta_for_leaf_search: HashMap<IndexUid, IndexMetasForLeafSearch> =
+        HashMap::with_capacity(entries.len());
+    let mut query_ast_resolved_opt: Option<QueryAst> = None;
+    let mut timestamp_field_opt: Option<String> = None;
+    let mut sort_fields_is_datetime: HashMap<String, bool> = HashMap::new();
+
+    for entry in entries {
+        let index_metadata = &entry.index_metadata;
+        let doc_mapper = &entry.doc_mapper;
+        let query_ast_resolved_for_index = query_ast
+            .clone()
+            .parse_user_query(doc_mapper.default_search_fields())
+            // We convert the error to return a 400 to the user (and not a 500).
+            .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
+
+        // Validate uniqueness of resolved query AST.
+        if let Some(query_ast_resolved) = &query_ast_resolved_opt {
+            if query_ast_resolved != &query_ast_resolved_for_index {
+                return Err(SearchError::InvalidQuery(
+                    "resolved query ASTs must be the same across indexes. resolving queries with \
+                     different default fields are different between indexes is not supported"
+                        .to_string(),
+                ));
+            }
+        } else {
+            query_ast_resolved_opt = Some(query_ast_resolved_for_index.clone());
+        }
+
+        // Validate uniqueness of timestamp field if any.
+        if let Some(timestamp_field_for_index) = doc_mapper.timestamp_field_name() {
+            match timestamp_field_opt {
+                Some(timestamp_field) if timestamp_field != timestamp_field_for_index => {
+                    return Err(SearchError::InvalidQuery(
+                        "the timestamp field (if present) must be the same for all indexes"
+                            .to_string(),
+                    ));
+                }
+                None => {
+                    timestamp_field_opt = Some(timestamp_field_for_index.to_string());
+                }
+                _ => {}
+            }
+        }
+
+        // Validate request against the current index schema.
+        let schema = doc_mapper.schema();
+        validate_request(&schema, &doc_mapper.timestamp_field_name(), search_request)?;
+
+        validate_sort_field_types(
+            &schema,
+            &search_request.sort_fields,
+            &mut sort_fields_is_datetime,
+        )?;
+
+        // Validates the query by effectively building it against the current schema.
+        doc_mapper.query(
+            doc_mapper.schema(),
+            query_ast_resolved_for_index,
+            true,
+            None,
+        )?;
+
+        let index_metadata_for_leaf_search = IndexMetasForLeafSearch {
+            index_uri: index_metadata.index_uri().clone(),
+            doc_mapper_str: entry.doc_mapper_str.to_string(),
+        };
+        indexes_meta_for_leaf_search.insert(
+            index_metadata.index_uid.clone(),
+            index_metadata_for_leaf_search,
+        );
+    }
+
+    let query_ast_resolved = query_ast_resolved_opt.ok_or_else(|| {
+        SearchError::Internal(
+            "resolved query AST must be present. this should never happen".to_string(),
+        )
+    })?;
+
+    Ok(RequestMetadata {
+        timestamp_field_opt,
+        query_ast_resolved,
+        indexes_meta_for_leaf_search,
+        sort_fields_is_datetime,
+    })
+}
+
 fn validate_request_and_build_metadata(
     indexes_metadata: &[IndexMetadata],
     search_request: &SearchRequest,
@@ -1421,7 +1517,7 @@ pub fn ensure_all_indexes_found(
 async fn refine_and_list_matches(
     metastore: &MetastoreServiceClient,
     search_request: &mut SearchRequest,
-    indexes_metadata: Vec<IndexMetadata>,
+    indexes_metadata: &[IndexMetadata],
     query_ast_resolved: QueryAst,
     sort_fields_is_datetime: HashMap<String, bool>,
     timestamp_field_opt: Option<String>,
@@ -1462,6 +1558,7 @@ async fn refine_and_list_matches(
 /// Fetches the list of splits and their metadata from the metastore
 #[instrument(skip_all)]
 async fn plan_splits_for_root_search(
+    searcher_context: &SearcherContext,
     search_request: &mut SearchRequest,
     metastore: &MetastoreServiceClient,
     query_features: &mut QueryFeatureCounts,
@@ -1469,27 +1566,70 @@ async fn plan_splits_for_root_search(
     let list_indexes_metadatas_request = ListIndexesMetadataRequest {
         index_id_patterns: search_request.index_id_patterns.clone(),
     };
-    let indexes_metadata: Vec<IndexMetadata> = metastore
+    let response = metastore
         .list_indexes_metadata(list_indexes_metadatas_request)
-        .await?
-        .deserialize_indexes_metadata()
         .await?;
+    let payload_key = match &response.indexes_metadata_json_opt {
+        Some(json) => crate::service::IndexesMetadataPayloadKey::Json(json.clone()),
+        None => crate::service::IndexesMetadataPayloadKey::Zstd(
+            response.indexes_metadata_json_zstd.clone(),
+        ),
+    };
+    let cached_indexes = if let Some(cached) =
+        searcher_context.indexes_metadata_cache.get(&payload_key)
+    {
+        cached
+    } else {
+        let indexes_metadata: Vec<IndexMetadata> = response.deserialize_indexes_metadata().await?;
+        let mut entries = Vec::with_capacity(indexes_metadata.len());
+        for index_metadata in &indexes_metadata {
+            let doc_mapper = build_doc_mapper(
+                &index_metadata.index_config.doc_mapping,
+                &index_metadata.index_config.search_settings,
+            )
+            .map_err(|err| {
+                SearchError::Internal(format!("failed to build doc mapper. cause: {err}"))
+            })?;
+            let doc_mapper_str: Arc<str> = serde_json::to_string(&doc_mapper)
+                .map_err(|err| {
+                    SearchError::Internal(format!("failed to serialize doc mapper. cause: {err}"))
+                })?
+                .into();
+            entries.push(crate::service::CachedIndexMetadataEntry {
+                index_metadata: index_metadata.clone(),
+                doc_mapper,
+                doc_mapper_str,
+            });
+        }
+        let parsed = Arc::new(crate::service::CachedIndexesMetadata {
+            indexes_metadata,
+            entries,
+        });
+        searcher_context
+            .indexes_metadata_cache
+            .put(payload_key, parsed.clone());
+        parsed
+    };
 
     if !search_request.ignore_missing_indexes {
-        ensure_all_indexes_found(&indexes_metadata[..], &search_request.index_id_patterns[..])?;
+        ensure_all_indexes_found(
+            &cached_indexes.indexes_metadata[..],
+            &search_request.index_id_patterns[..],
+        )?;
     }
 
-    if indexes_metadata.is_empty() {
+    if cached_indexes.indexes_metadata.is_empty() {
         return Ok((Vec::new(), HashMap::default()));
     }
 
-    let request_metadata = validate_request_and_build_metadata(&indexes_metadata, search_request)?;
+    let request_metadata =
+        validate_request_and_build_metadata_from_entries(&cached_indexes.entries, search_request)?;
     *query_features = QueryFeatureCounts::from_query_ast(&request_metadata.query_ast_resolved);
 
     let split_metadatas = refine_and_list_matches(
         metastore,
         search_request,
-        indexes_metadata,
+        &cached_indexes.indexes_metadata,
         request_metadata.query_ast_resolved,
         request_metadata.sort_fields_is_datetime,
         request_metadata.timestamp_field_opt,
@@ -1545,7 +1685,12 @@ pub async fn root_search(
 
     let (split_metadatas, indexes_meta_for_leaf_search) = RootSearchMetricsFuture {
         start: start_instant,
-        tracked: plan_splits_for_root_search(search_request, metastore, query_features),
+        tracked: plan_splits_for_root_search(
+            searcher_context,
+            search_request,
+            metastore,
+            query_features,
+        ),
         is_success: None,
         step: RootSearchMetricsStep::Plan,
     }
@@ -1657,7 +1802,7 @@ pub async fn search_plan(
     let split_metadatas = refine_and_list_matches(
         metastore,
         &mut search_request,
-        indexes_metadata,
+        &indexes_metadata,
         request_metadata.query_ast_resolved.clone(),
         request_metadata.sort_fields_is_datetime,
         request_metadata.timestamp_field_opt,
@@ -1678,12 +1823,18 @@ pub async fn search_plan(
         .into_iter()
         .map(|split| format!("{}/{}", split.index_uid.index_id, split.split_id))
         .collect();
-    // this is an upper bound, we'd need access to a hotdir for more precise results
     let fieldnorm_query_count = if warmup_info.field_norms {
-        doc_mapper
-            .schema()
-            .fields()
-            .filter(|(_, entry)| entry.has_fieldnorms())
+        let queried_fields: HashSet<tantivy::schema::Field> = warmup_info
+            .terms_grouped_by_field
+            .keys()
+            .chain(warmup_info.term_ranges_grouped_by_field.keys())
+            .chain(warmup_info.term_dict_fields.iter())
+            .chain(warmup_info.automatons_grouped_by_field.keys())
+            .copied()
+            .collect();
+        queried_fields
+            .into_iter()
+            .filter(|field| doc_mapper.schema().get_field_entry(*field).has_fieldnorms())
             .count()
     } else {
         0

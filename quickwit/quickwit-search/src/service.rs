@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::VecDeque;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -213,7 +214,9 @@ impl SearchService for SearchServiceImpl {
         let storage = self.storage_resolver.resolve(&index_uri).await?;
         let snippet_request_opt: Option<&SnippetRequest> =
             fetch_docs_request.snippet_request.as_ref();
-        let doc_mapper = deserialize_doc_mapper(&fetch_docs_request.doc_mapper)?;
+        let doc_mapper = self
+            .searcher_context
+            .deserialize_doc_mapper(&fetch_docs_request.doc_mapper)?;
         let fetch_docs_response = fetch_docs(
             self.searcher_context.clone(),
             fetch_docs_request.partial_hits,
@@ -400,6 +403,106 @@ pub(crate) async fn scroll(
         resource_stats,
     })
 }
+/// Generic bounded FIFO cache with shared-read `RwLock` access.
+pub(crate) struct BoundedCache<K, V> {
+    capacity: usize,
+    inner: RwLock<BoundedCacheInner<K, V>>,
+}
+
+struct BoundedCacheInner<K, V> {
+    map: rustc_hash::FxHashMap<K, V>,
+    order: VecDeque<K>,
+}
+
+impl<K, V> BoundedCache<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone,
+{
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            inner: RwLock::new(BoundedCacheInner {
+                map: rustc_hash::FxHashMap::default(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.inner.read().unwrap().map.get(key).cloned()
+    }
+
+    pub(crate) fn put(&self, key: K, value: V) {
+        if self.capacity == 0 {
+            return;
+        }
+        let mut inner = self.inner.write().unwrap();
+        if inner.map.contains_key(&key) {
+            return;
+        }
+        while inner.map.len() >= self.capacity {
+            if let Some(evicted) = inner.order.pop_front() {
+                inner.map.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+        inner.order.push_back(key.clone());
+        inner.map.insert(key, value);
+    }
+}
+
+/// Immutable split identity key for [`SplitHeaderCache`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SplitHeaderCacheKey {
+    pub split_id: String,
+    pub split_footer_start: u64,
+    pub split_footer_end: u64,
+    pub num_docs: u64,
+}
+
+/// Pre-parsed immutable split footer structures cached per split across leaf searches.
+///
+/// Avoids re-parsing `BundleFileRanges` (JSON), `StaticDirectoryCache` (postcard), and Tantivy's
+/// `meta.json` (JSON) on every split search while keeping per-request `CountingStorage`,
+/// `CachingDirectory`, and warmup memory reservation completely intact.
+pub(crate) struct CachedSplitHeader {
+    pub file_ranges: Arc<quickwit_storage::BundleFileRanges>,
+    pub static_directory_cache: Arc<quickwit_directories::StaticDirectoryCache>,
+}
+
+pub(crate) type SplitHeaderCache = BoundedCache<SplitHeaderCacheKey, Arc<CachedSplitHeader>>;
+
+/// Exact wire-payload key for [`ParsedIndexesMetadataCache`].
+///
+/// Keying by the raw bytes returned from `list_indexes_metadata` guarantees zero staleness:
+/// any index metadata change alters the payload bytes and misses automatically.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum IndexesMetadataPayloadKey {
+    Zstd(prost::bytes::Bytes),
+    Json(String),
+}
+
+/// Pre-parsed index metadata and compiled `DocMapper` for root search planning.
+pub(crate) struct CachedIndexMetadataEntry {
+    pub index_metadata: quickwit_metastore::IndexMetadata,
+    pub doc_mapper: Arc<DocMapper>,
+    pub doc_mapper_str: Arc<str>,
+}
+
+pub(crate) struct CachedIndexesMetadata {
+    pub indexes_metadata: Vec<quickwit_metastore::IndexMetadata>,
+    pub entries: Vec<CachedIndexMetadataEntry>,
+}
+
+pub(crate) type ParsedIndexesMetadataCache =
+    BoundedCache<IndexesMetadataPayloadKey, Arc<CachedIndexesMetadata>>;
+
 /// [`SearcherContext`] provides a common set of variables
 /// shared by a searcher instance (which instantiates a
 /// [`SearchServiceImpl`]).
@@ -412,6 +515,12 @@ pub struct SearcherContext {
     pub search_permit_provider: SearchPermitProvider,
     /// Split footer cache.
     pub split_footer_cache: MemorySizedCache<String>,
+    /// Pre-parsed bundle ranges, hotcache directory, and Tantivy `meta.json` per immutable split.
+    pub(crate) split_header_cache: Arc<SplitHeaderCache>,
+    /// Pre-parsed `DocMapper` cache keyed by exact JSON `doc_mapper_str`.
+    pub(crate) doc_mapper_cache: Arc<BoundedCache<String, Arc<DocMapper>>>,
+    /// Pre-parsed `ListIndexesMetadataResponse` cache keyed by exact raw payload bytes.
+    pub(crate) indexes_metadata_cache: Arc<ParsedIndexesMetadataCache>,
     /// Per-split and per-query cache.
     pub leaf_search_cache: LeafSearchCache,
     /// Per-split and per-predicate cache.
@@ -483,18 +592,42 @@ impl SearcherContext {
         let lambda_invoker =
             lambda_invoker.map(|invoker| Arc::new(invoker) as Arc<dyn LambdaLeafSearchInvoker>);
 
+        const SPLIT_HEADER_CACHE_CAPACITY: usize = 8_192;
+        const DOC_MAPPER_CACHE_CAPACITY: usize = 256;
+        const INDEXES_METADATA_CACHE_CAPACITY: usize = 256;
         Self {
             searcher_config,
             fast_fields_cache: storage_long_term_cache,
             predicate_cache: predicate_cache.into(),
             search_permit_provider: leaf_search_split_semaphore,
             split_footer_cache: global_split_footer_cache,
+            split_header_cache: Arc::new(SplitHeaderCache::with_capacity(
+                SPLIT_HEADER_CACHE_CAPACITY,
+            )),
+            doc_mapper_cache: Arc::new(BoundedCache::with_capacity(DOC_MAPPER_CACHE_CAPACITY)),
+            indexes_metadata_cache: Arc::new(ParsedIndexesMetadataCache::with_capacity(
+                INDEXES_METADATA_CACHE_CAPACITY,
+            )),
             leaf_search_cache,
             list_fields_cache,
             split_cache_opt,
             aggregation_limit,
             lambda_invoker,
         }
+    }
+
+    /// Deserializes a JSON-encoded `DocMapper` string with bounded caching by exact string content.
+    pub(crate) fn deserialize_doc_mapper(
+        &self,
+        doc_mapper_str: &str,
+    ) -> crate::Result<Arc<DocMapper>> {
+        if let Some(cached) = self.doc_mapper_cache.get(doc_mapper_str) {
+            return Ok(cached);
+        }
+        let doc_mapper = deserialize_doc_mapper(doc_mapper_str)?;
+        self.doc_mapper_cache
+            .put(doc_mapper_str.to_string(), doc_mapper.clone());
+        Ok(doc_mapper)
     }
 
     /// Returns the shared instance to track the aggregation memory usage.
