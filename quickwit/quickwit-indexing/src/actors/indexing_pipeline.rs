@@ -513,7 +513,12 @@ impl Handler<SuperviseLoop> for IndexingPipeline {
     ) -> Result<(), ActorExitStatus> {
         self.perform_observe(ctx);
         self.perform_health_check(ctx).await?;
-        ctx.schedule_self_msg(SUPERVISE_INTERVAL, supervise_loop_token);
+        let supervise_interval = if self.params.local_source_opt.is_some() {
+            Duration::from_millis(50)
+        } else {
+            SUPERVISE_INTERVAL
+        };
+        ctx.schedule_self_msg(supervise_interval, supervise_loop_token);
         Ok(())
     }
 }

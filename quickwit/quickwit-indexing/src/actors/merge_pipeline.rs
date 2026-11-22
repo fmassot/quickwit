@@ -476,13 +476,31 @@ impl Handler<SuperviseLoop> for MergePipeline {
     }
 }
 
+#[derive(Debug)]
+struct ShutdownPoll;
+
+#[async_trait]
+impl Handler<ShutdownPoll> for MergePipeline {
+    type Reply = ();
+    async fn handle(
+        &mut self,
+        shutdown_poll: ShutdownPoll,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        self.perform_observe().await;
+        self.perform_health_check(ctx).await?;
+        ctx.schedule_self_msg(Duration::from_millis(20), shutdown_poll);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Handler<FinishPendingMergesAndShutdownPipeline> for MergePipeline {
     type Reply = ();
     async fn handle(
         &mut self,
         _: FinishPendingMergesAndShutdownPipeline,
-        _ctx: &ActorContext<Self>,
+        ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
         info!(index_uid=%self.params.pipeline_id.index_uid, "shutdown merge pipeline initiated");
         // From now on, we will not respawn the pipeline if it fails.
@@ -507,6 +525,8 @@ impl Handler<FinishPendingMergesAndShutdownPipeline> for MergePipeline {
                 .mailbox()
                 .send_message(RunFinalizeMergePolicyAndQuit)
                 .await;
+            // Poll quickly during shutdown instead of waiting up to `SUPERVISE_LOOP_INTERVAL` (1s).
+            ctx.schedule_self_msg(Duration::from_millis(10), ShutdownPoll);
         } else {
             // we won't respawn the pipeline in the future, so there is nothing
             // to do here.

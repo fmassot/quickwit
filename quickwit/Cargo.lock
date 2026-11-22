@@ -4861,7 +4861,7 @@ dependencies = [
 [[package]]
 name = "jitexpr"
 version = "0.1.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "cranelift",
  "cranelift-jit",
@@ -6388,7 +6388,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 [[package]]
 name = "ownedbytes"
 version = "0.9.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -10900,7 +10900,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "tantivy"
 version = "0.27.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -10959,7 +10959,7 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.27.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "bitpacking",
 ]
@@ -10967,7 +10967,7 @@ dependencies = [
 [[package]]
 name = "tantivy-columnar"
 version = "0.27.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "downcast-rs",
  "fastdivide",
@@ -10983,7 +10983,7 @@ dependencies = [
 [[package]]
 name = "tantivy-common"
 version = "0.27.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -11019,7 +11019,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.27.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "fnv",
  "nom 7.1.3",
@@ -11031,7 +11031,7 @@ dependencies = [
 [[package]]
 name = "tantivy-sstable"
 version = "0.27.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "futures-util",
  "itertools 0.14.0",
@@ -11045,7 +11045,7 @@ dependencies = [
 [[package]]
 name = "tantivy-stacker"
 version = "0.27.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "murmurhash32",
  "tantivy-common",
@@ -11054,7 +11054,7 @@ dependencies = [
 [[package]]
 name = "tantivy-tokenizer-api"
 version = "0.7.0"
-source = "git+https://github.com/fmassot/tantivy.git?rev=712a09b5d977ea0c3c99d379c3a7ff0fa89e1868#712a09b5d977ea0c3c99d379c3a7ff0fa89e1868"
+source = "git+https://github.com/fmassot/tantivy.git?rev=489855ba40edd36bfa3268f205ac85fbfd61de63#489855ba40edd36bfa3268f205ac85fbfd61de63"
 dependencies = [
  "serde",
 ]
