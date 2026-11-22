@@ -13,6 +13,8 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 async-compression = { workspace = true }
 async-trait = { workspace = true }
 aws-sdk-kinesis = { workspace = true, optional = true }
@@ -23,6 +25,7 @@ fail = { workspace = true }
 flume = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
+glob = { workspace = true }
 google-cloud-auth = { workspace = true, optional = true }
 google-cloud-googleapis = { workspace = true, optional = true }
 google-cloud-pubsub = { workspace = true, optional = true }
@@ -31,6 +34,7 @@ libz-sys = { workspace = true, optional = true }
 memchr = { workspace = true }
 oneshot = { workspace = true }
 openssl = { workspace = true, optional = true }
+parquet = { workspace = true }
 percent-encoding = { workspace = true }
 pulsar = { workspace = true, optional = true }
 quickwit-query = { workspace = true }

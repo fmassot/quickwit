@@ -146,9 +146,10 @@ impl SourceConfigForSerialization {
                     | SourceInputFormat::OtlpLogsProtobuf
                     | SourceInputFormat::OtlpTracesJson
                     | SourceInputFormat::OtlpTracesProtobuf
+                    | SourceInputFormat::Parquet
             )
         {
-            bail!("VRL transforms are not supported for OTLP input formats");
+            bail!("VRL transforms are not supported for OTLP or Parquet input formats");
         }
 
         Ok(SourceConfig {

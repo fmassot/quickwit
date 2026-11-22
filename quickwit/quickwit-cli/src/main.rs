@@ -467,6 +467,10 @@ mod tests {
                 "wikipedia",
                 "--config",
                 "/config.yaml",
+                "--input-format",
+                "parquet",
+                "--input-path",
+                "/tmp/hits.parquet",
                 "--num-pipelines",
                 "4",
             ])
@@ -475,6 +479,7 @@ mod tests {
         assert!(matches!(
             command,
             CliCommand::Tool(ToolCliCommand::LocalIngest(LocalIngestDocsArgs {
+                input_format: SourceInputFormat::Parquet,
                 num_pipelines,
                 ..
             })) if num_pipelines.get() == 4,
