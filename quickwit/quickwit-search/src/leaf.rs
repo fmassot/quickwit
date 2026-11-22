@@ -247,6 +247,26 @@ pub(crate) async fn open_index_with_caches(
     ephemeral_unbounded_cache: Option<ByteRangeCache>,
     warmup_memory: Option<Arc<SplitWarmupMemory>>,
 ) -> crate::Result<(Index, HotDirectory)> {
+    let (index, hot_directory, _meta_snapshot) = open_index_with_caches_and_snapshot(
+        searcher_context,
+        index_storage,
+        split_and_footer_offsets,
+        tokenizer_manager,
+        ephemeral_unbounded_cache,
+        warmup_memory,
+    )
+    .await?;
+    Ok((index, hot_directory))
+}
+
+async fn open_index_with_caches_and_snapshot(
+    searcher_context: &SearcherContext,
+    index_storage: Arc<dyn Storage>,
+    split_and_footer_offsets: &SplitIdAndFooterOffsets,
+    tokenizer_manager: Option<&TokenizerManager>,
+    ephemeral_unbounded_cache: Option<ByteRangeCache>,
+    warmup_memory: Option<Arc<SplitWarmupMemory>>,
+) -> crate::Result<(Index, HotDirectory, tantivy::IndexMetaSnapshot)> {
     let index_storage_with_retry_on_timeout =
         configure_storage_retries(searcher_context, index_storage);
 
@@ -275,7 +295,8 @@ pub(crate) async fn open_index_with_caches(
         HotDirectory::open(directory, hotcache_bytes)?
     };
 
-    let mut index = Index::open(hot_directory.clone())?;
+    let meta_snapshot = Index::load_meta_snapshot(&hot_directory)?;
+    let mut index = Index::open_with_meta_snapshot(hot_directory.clone(), &meta_snapshot)?;
     if let Some(tokenizer_manager) = tokenizer_manager {
         index.set_tokenizers(tokenizer_manager.tantivy_manager().clone());
     }
@@ -285,7 +306,7 @@ pub(crate) async fn open_index_with_caches(
             .clone(),
     );
     set_expr_compilation_cache(&mut index);
-    Ok((index, hot_directory))
+    Ok((index, hot_directory, meta_snapshot))
 }
 
 /// Runs `fut`, racing it against `cancel`. If cancellation fires first, the
@@ -726,7 +747,7 @@ async fn leaf_search_single_split(
     // ABOVE this wrapper, so reads served from cache do not contribute to the
     // counters — that is the desired "downloaded from object storage" semantics.
     let (storage, download_counters) = CountingStorage::instrument_storage(storage);
-    let (index, hot_directory) = open_index_with_caches(
+    let (index, hot_directory, meta_snapshot) = open_index_with_caches_and_snapshot(
         &ctx.searcher_context,
         storage,
         &split,
@@ -747,7 +768,7 @@ async fn leaf_search_single_split(
     let searcher = index
         .reader_builder()
         .reload_policy(ReloadPolicy::Manual)
-        .try_into()
+        .try_into_with_meta_snapshot(&meta_snapshot)
         .inspect_err(|_| {
             leaf_search_state_guard
                 .set_state(SplitSearchState::Error(SplitSearchErrorKind::CreateReader))
