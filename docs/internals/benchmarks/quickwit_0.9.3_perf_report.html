@@ -433,6 +433,7 @@
         <a href="#deep-dive">Categories &amp; Pareto</a>
         <a href="#indexing">Indexing</a>
         <a href="#changes">Changes &amp; Minimal LOC</a>
+        <a href="#isolated-prs">Isolated PRs</a>
         <a href="#findings">Key Takeaways</a>
       </nav>
     </div>
@@ -1771,12 +1772,26 @@
               <td class="num">2.19 GB</td>
             </tr>
             <tr class="highlight">
-              <td rowspan="2"><strong>ClickBench 10M</strong><br><span class="dim">9.77M valid rows · 105 columns</span></td>
-              <td><strong>Quickwit Trimmed+Hashes</strong> <span class="badge b-qw">14 idx</span></td>
+              <td rowspan="4"><strong>ClickBench 10M</strong><br><span class="dim">9.77M valid rows · 105 columns</span></td>
+              <td><strong>Quickwit Step 1+2 (<code>--num-pipelines 8</code>)</strong> <span class="badge b-qw">14 idx</span></td>
+              <td>Parquet &rarr; JSON pipe &rarr; <code>local-ingest</code> (<code>1f809aa6b</code> + <code>712a09b5d</code>)</td>
+              <td class="num win">23.14 s <span class="dim">(7.4× vs main)</span></td>
+              <td class="num win">422.3k rows/s</td>
+              <td class="num">2.45 GB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit Wave 6 (single pipeline)</strong> <span class="badge b-qw">14 idx</span></td>
               <td>Parquet &rarr; JSON pipe &rarr; <code>local-ingest</code></td>
               <td class="num">61.1 s</td>
               <td class="num">159.9k rows/s</td>
               <td class="num">2.45 GB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit 0.9.3 <code>main</code></strong> <span class="badge b-base">main</span></td>
+              <td>Parquet &rarr; JSON pipe &rarr; <code>local-ingest</code> (<code>b9fbdc7a8</code>)</td>
+              <td class="num">171.2 s</td>
+              <td class="num">57.1k rows/s</td>
+              <td class="num">2.70 GB</td>
             </tr>
             <tr>
               <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">28 parts</span></td>
@@ -1786,12 +1801,26 @@
               <td class="num win">1.44 GB</td>
             </tr>
             <tr class="highlight">
-              <td rowspan="3"><strong>JSONBench 10M</strong><br><span class="dim">10M Bluesky JSON events · 1.3 GB .json.gz</span></td>
-              <td><strong>Quickwit 0.9.3-perf Hybrid</strong> <span class="badge b-qw">5 typed + dynamic</span></td>
+              <td rowspan="5"><strong>JSONBench 10M</strong><br><span class="dim">10M Bluesky JSON events · 1.3 GB .json.gz</span></td>
+              <td><strong>Quickwit Step 1+2 Hybrid (<code>--num-pipelines 8</code>)</strong> <span class="badge b-qw">5 typed</span></td>
+              <td><code>pigz -dc</code> &rarr; <code>local-ingest</code> (<code>1f809aa6b</code> + <code>712a09b5d</code>)</td>
+              <td class="num win">12.0 s <span class="dim">(2.7× vs main)</span></td>
+              <td class="num win">833.3k docs/s</td>
+              <td class="num">1.46 GB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit Wave 6 Hybrid</strong> <span class="badge b-qw">5 typed + dynamic</span></td>
               <td><code>gzip -dc</code> &rarr; <code>local-ingest</code></td>
               <td class="num">28.1 s</td>
               <td class="num">356.5k docs/s</td>
               <td class="num">1.46 GB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit 0.9.3 <code>main</code> Hybrid</strong> <span class="badge b-base">main</span></td>
+              <td><code>pigz -dc</code> &rarr; <code>local-ingest</code> (<code>b9fbdc7a8</code>)</td>
+              <td class="num">32.1 s</td>
+              <td class="num">311.5k docs/s</td>
+              <td class="num">1.52 GB</td>
             </tr>
             <tr>
               <td><strong>Quickwit 0.9.3-perf Pure Dynamic</strong> <span class="badge b-qw">0 typed</span></td>
@@ -2184,10 +2213,315 @@
       </div>
     </section>
 
+    <!-- ISOLATED PR BACKLOG AGAINST MAIN -->
+    <section id="isolated-prs">
+      <div class="section-head">
+        <h2>7. Isolated, Merge-Ready Search PRs Against <code>main</code></h2>
+        <span class="section-tag">10 standalone branches off pure <code>main</code> (<code>quickwit@b9fbdc7a8</code> + <code>tantivy@0aa896fe2</code>) · Ordered by impact</span>
+      </div>
+
+      <p class="dim" style="margin-top:-8px;margin-bottom:20px;">
+        Every branch below is branched directly off upstream <code>main</code>, unit-tested, pushed to GitHub, and benchmarked in isolation directly against pure <code>main</code> using <code>main</code>-compatible indexes (so each PR can be reviewed and merged independently without adopting the monolithic <code>perf/searchbench</code> branch). Pure <code>main</code> baselines on this hardware: <strong>SearchBench 100M</strong> <code>3.49s</code> cold / <code>2.64s</code> hot (<code>5,745 MB</code> I/O), <strong>ClickBench 10M</strong> <code>1,465 ms</code> run1 / <code>1,273 ms</code> hot, <strong>Big5 10M</strong> <code>321.4 ms</code> run1 / <code>290.4 ms</code> hot, <strong>JSONBench 10M</strong> <code>105.9 ms</code> cold / <code>65.9 ms</code> hot.
+      </p>
+
+      <div class="kpi-grid">
+        <div class="kpi">
+          <div class="kpi-label">Merge-Ready Branches</div>
+          <div class="kpi-value accent">10 <span style="font-size:13px;font-weight:600;color:var(--muted)">branches (9 PR units)</span></div>
+          <div class="kpi-sub">8 standalone Tantivy + 1 standalone QW + 1 paired</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">#1 Single-PR Impact</div>
+          <div class="kpi-value accent">-1.00s <span style="font-size:13px;font-weight:600;color:var(--muted)">cold / -60% I/O</span></div>
+          <div class="kpi-sub"><code>perf/pr-fast-collectors-and-caches</code> (0 Tantivy edits)</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Peak Query Speedups</div>
+          <div class="kpi-value accent">13.2× <span style="font-size:13px;font-weight:600;color:var(--muted)">/ 6.7× / 5.7×</span></div>
+          <div class="kpi-sub">SB <code>minmatch</code> · CB <code>Q33</code> · Big5 <code>B29</code></div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Highest-ROI Single PR</div>
+          <div class="kpi-value accent">+33 <span style="font-size:13px;font-weight:600;color:var(--muted)">LOC</span></div>
+          <div class="kpi-sub"><code>perf/pr-fast-field-range-queries</code>: Big5 -25.7 ms run1</div>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;" viewBox="0 0 1380 470">
+  <defs>
+    <filter id="shadow_c7" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#141413" flood-opacity="0.04"/>
+    </filter>
+  </defs>
+  <rect width="1380" height="470" fill="#FAF9F6"/>
+  <style>
+    text { font-family: Adwaita Sans, Liberation Sans, sans-serif; fill: #141413; }
+    .title { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .subtitle { font-size: 13px; fill: #5E5C56; }
+    .card-title { font-size: 15px; font-weight: 700; }
+    .card-sub { font-size: 11.5px; fill: #5E5C56; }
+    .label { font-size: 11.5px; fill: #141413; font-weight: 600; }
+    .val { font-size: 10.5px; font-weight: 700; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .val-sub { font-size: 10px; fill: #5E5C56; font-family: JetBrainsMono Nerd Font, Liberation Mono, monospace; }
+    .footer { font-size: 10.5px; fill: #8C8980; }
+  </style>
+  <text x="36" y="40" class="title">Isolated PR Performance vs Pure main — Suite Reduction &amp; Peak Query Speedups</text>
+  <text x="36" y="61" class="subtitle">Each PR branch measured standalone on quickwit@b9fbdc7a8 + tantivy@0aa896fe2 · Left: Full-suite latency cut (%) · Right: Peak targeted query speedup</text>
+
+  <!-- Left panel: Suite-wide % latency reduction (scale: 35% = 280px => 8px per %) -->
+  <rect x="36" y="82" width="650" height="354" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c7)"/>
+  <text x="58" y="110" class="card-title">Full-Suite Latency Reduction vs Pure main (Isolated)</text>
+  <text x="58" y="128" class="card-sub">Percentage cut on each PR's primary benchmark suite · Coral = Search · Teal = Analytics/JSON</text>
+
+  <text x="278" y="160" text-anchor="end" class="label">1. fast-collectors-and-caches (QW)</text>
+  <rect x="288" y="149" width="230" height="14" rx="3.5" fill="#D9653B"/>
+  <text x="526" y="160" class="val">-28.7% SB cold (-1.00s, -60% I/O)</text>
+
+  <text x="278" y="191" text-anchor="end" class="label">2. sstable + warming-cache (Paired)</text>
+  <rect x="288" y="180" width="213" height="14" rx="3.5" fill="#D9653B"/>
+  <text x="509" y="191" class="val">-26.6% SB hot (-701 ms) · -26.6% CB</text>
+
+  <text x="278" y="222" text-anchor="end" class="label">3. deferred-sub-aggs (Tantivy)</text>
+  <rect x="288" y="211" width="212" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="508" y="222" class="val">-26.5% CB hot (-337 ms) · -31% run1</text>
+
+  <text x="278" y="253" text-anchor="end" class="label">4. wand-disjunction-phrase (Tantivy)</text>
+  <rect x="288" y="242" width="138" height="14" rx="3.5" fill="#D9653B"/>
+  <text x="434" y="253" class="val">-17.2% SB hot (-453 ms) · -14.3% cold</text>
+
+  <text x="278" y="284" text-anchor="end" class="label">5. cardinality-fast-paths (Tantivy)</text>
+  <rect x="288" y="273" width="131" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="427" y="284" class="val">-16.4% JSONBench hot · -7.7% Big5</text>
+
+  <text x="278" y="315" text-anchor="end" class="label">6. stats-histogram-composite (Tantivy)</text>
+  <rect x="288" y="304" width="118" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="414" y="315" class="val">-14.8% Big5 hot (-43 ms) · -15.8% run1</text>
+
+  <text x="278" y="346" text-anchor="end" class="label">7. dense-bitset-intersection (Tantivy)</text>
+  <rect x="288" y="335" width="101" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="397" y="346" class="val">-12.6% JSONBench hot (-8.3 ms)</text>
+
+  <text x="278" y="377" text-anchor="end" class="label">8. optional-term-agg (Tantivy)</text>
+  <rect x="288" y="366" width="98" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="394" y="377" class="val">-12.3% JSONBench hot (+248 LOC)</text>
+
+  <text x="278" y="408" text-anchor="end" class="label">9. fast-field-range-queries (Tantivy)</text>
+  <rect x="288" y="397" width="64" height="14" rx="3.5" fill="#6E56CF"/>
+  <text x="360" y="408" class="val">-8.0% Big5 run1 / -5.6% hot (+33 LOC!)</text>
+
+  <!-- Right panel: Peak targeted query/category speedups (log-ish visual bar capped at 14x = 260px) -->
+  <rect x="704" y="82" width="640" height="354" rx="12" fill="#FFFFFF" stroke="#E5E2DC" filter="url(#shadow_c7)"/>
+  <text x="726" y="110" class="card-title">Peak Targeted Category / Query Speedups vs Pure main</text>
+  <text x="726" y="128" class="card-sub">Highest single-category or query speedup delivered by each isolated PR</text>
+
+  <text x="954" y="160" text-anchor="end" class="label">SB count_minmatch (PR #3 WAND)</text>
+  <rect x="964" y="149" width="250" height="14" rx="3.5" fill="#B54A24"/>
+  <text x="1222" y="160" class="val">13.15x (125 -&gt; 10 ms)</text>
+
+  <text x="954" y="191" text-anchor="end" class="label">CB Q33 nested terms (PR #4 Def.)</text>
+  <rect x="964" y="180" width="168" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="1140" y="191" class="val">6.70x (288 -&gt; 43 ms)</text>
+
+  <text x="954" y="222" text-anchor="end" class="label">Big5 B29 composite (PR #5 Stats)</text>
+  <rect x="964" y="211" width="146" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="1118" y="222" class="val">5.69x (20.7 -&gt; 3.6 ms)</text>
+
+  <text x="954" y="253" text-anchor="end" class="label">SB count_pattern (PR #2 SSTable)</text>
+  <rect x="964" y="242" width="118" height="14" rx="3.5" fill="#D9653B"/>
+  <text x="1090" y="253" class="val">4.24x (903 -&gt; 213 ms)</text>
+
+  <text x="954" y="284" text-anchor="end" class="label">Big5 B44 / SB recent (PR #1 QW)</text>
+  <rect x="964" y="273" width="114" height="14" rx="3.5" fill="#D9653B"/>
+  <text x="1086" y="284" class="val">4.13x / 3.84x cold</text>
+
+  <text x="954" y="315" text-anchor="end" class="label">CB Q23 LIKE regex (PR #2 SSTable)</text>
+  <rect x="964" y="304" width="106" height="14" rx="3.5" fill="#D9653B"/>
+  <text x="1078" y="315" class="val">3.79x (159 -&gt; 42 ms)</text>
+
+  <text x="954" y="346" text-anchor="end" class="label">JB Q1 optional terms (PR #8 Opt.)</text>
+  <rect x="964" y="335" width="76" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="1048" y="346" class="val">2.42x (5.65 -&gt; 2.33 ms)</text>
+
+  <text x="954" y="377" text-anchor="end" class="label">CB Q05 / Big5 B34 (PR #6 Card.)</text>
+  <rect x="964" y="366" width="74" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="1046" y="377" class="val">2.38x / 1.85x</text>
+
+  <text x="954" y="408" text-anchor="end" class="label">JB Q3 dense filter (PR #7 Bitset)</text>
+  <rect x="964" y="397" width="54" height="14" rx="3.5" fill="#2A8C78"/>
+  <text x="1026" y="408" class="val">1.57x (15.1 -&gt; 9.6 ms)</text>
+
+  <text x="36" y="456" class="footer">All 9 PR units passed crate unit tests and exact-answer regression verification against pure main (0 real answer mismatches across all suites).</text>
+</svg>
+      </div>
+
+      <h3>7.1 Isolated PR Backlog &amp; Recommended Merge Order</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Order</th>
+              <th>PR Branch &amp; Commit</th>
+              <th>Repo / Deps</th>
+              <th class="num">Diff LOC</th>
+              <th>Measured Gain Directly vs Pure <code>main</code></th>
+              <th>Tests</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="highlight">
+              <td class="num"><strong>PR #1</strong></td>
+              <td>
+                <strong>Fast Collectors, <code>SplitHeaderCache</code> &amp; <code>DocMapperCache</code></strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/quickwit/tree/perf/pr-fast-collectors-and-caches" target="_blank" rel="noopener"><code>perf/pr-fast-collectors-and-caches</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/478ad8e80b314940f12b313e87ad5a1e64f6e013" target="_blank" rel="noopener"><code>478ad8e80</code></a>)
+              </td>
+              <td><span class="badge b-qw">Quickwit</span><br><span class="dim">Standalone on <code>tantivy main</code></span></td>
+              <td class="num">+1,416 / -176<br><span class="dim">12 files</span></td>
+              <td>
+                <strong>SearchBench 100M:</strong> Cold <code>3.49 &rarr; 2.49s</code> (<strong class="win">-1,004 ms, 1.40×</strong>) · Hot <code>2.64 &rarr; 2.03s</code> (<strong class="win">-610 ms, 1.30×</strong>) · I/O <code>5,745 &rarr; 2,325 MB</code> (<strong class="win">-60%</strong>) · <code>top_k 2.38×</code> cold, <code>recent_sorted 3.84×</code> cold, <code>recent_unsorted 3.32×</code> hot<br>
+                <strong>Big5 10M:</strong> Run1 <code>321.4 &rarr; 266.6 ms</code> (<strong class="win">1.21×</strong>) · Hot <code>290.4 &rarr; 232.8 ms</code> (<strong class="win">-57.6 ms, 1.25×</strong>; <code>B44 4.13×</code>, <code>B42 3.87×</code>, <code>B03 3.03×</code>)<br>
+                <strong>ClickBench 10M:</strong> Run1 <code>1,465 &rarr; 1,306 ms</code> (<strong>-159 ms</strong>) · Hot <code>1,273 &rarr; 1,176 ms</code> (<strong>-97 ms</strong>)
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim"><code>quickwit-search</code> + <code>make fmt</code></span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #2</strong></td>
+              <td>
+                <strong>SSTable Automaton/Substring Scanning + Quickwit Warming Cache</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-sstable-automaton-scanning" target="_blank" rel="noopener"><code>perf/pr-sstable-automaton-scanning</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/ccc49d3424bfd69652d24843072f3a75e24813cb" target="_blank" rel="noopener"><code>ccc49d342</code></a>)<br>
+                + <a class="commit-link" href="https://github.com/fmassot/quickwit/tree/perf/pr-automaton-warming-cache" target="_blank" rel="noopener"><code>perf/pr-automaton-warming-cache</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/ffdb0ffa4ddd5cb49b15d63ba8ec037f24ef857d" target="_blank" rel="noopener"><code>ffdb0ffa4</code></a>)
+              </td>
+              <td><span class="badge b-qw">Paired</span><br><span class="dim">Tantivy + Quickwit</span></td>
+              <td class="num">+1,322 / -54<br>+339 / -41<br><span class="dim">13 + 5 files</span></td>
+              <td>
+                <strong>SearchBench 100M:</strong> Cold <code>3.49 &rarr; 2.76s</code> (<strong class="win">-736 ms, 1.26×</strong>) · Hot <code>2.64 &rarr; 1.94s</code> (<strong class="win">-701 ms, 1.36×</strong>) · <code>count_pattern</code> <strong class="win">4.24× hot</strong> (<code>903 &rarr; 213 ms</code>) / <strong class="win">3.43× cold</strong> (<code>1,038 &rarr; 303 ms</code>)<br>
+                <strong>ClickBench 10M:</strong> Run1 <code>1,465 &rarr; 1,076 ms</code> (<strong class="win">-389 ms, 1.36×</strong>) · Hot <code>1,273 &rarr; 1,005 ms</code> (<strong class="win">-268 ms, 1.27×</strong>) · <code>Q23 3.79×</code>, <code>Q21 3.76×</code>, <code>Q22 3.75×</code>, <code>Q24 3.04×</code><br>
+                <span class="dim">Note: Tantivy <code>ccc49d342</code> standalone yields 1.07× on <code>count_pattern</code>; pairing with <code>ffdb0ffa4</code> unlocks the full 4.24× win.</span>
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">50 sstable + 24 tantivy + <code>quickwit-query</code></span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #3</strong></td>
+              <td>
+                <strong>Block-Max WAND Union, 4096-doc Disjunction &amp; Phrase Pruning</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-wand-disjunction-phrase" target="_blank" rel="noopener"><code>perf/pr-wand-disjunction-phrase</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/98d4865c0c4db1976164d8e3c873c6b0bdab6e41" target="_blank" rel="noopener"><code>98d4865c0</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy</span><br><span class="dim">Standalone</span></td>
+              <td class="num">+1,206 / -131<br><span class="dim">11 files</span></td>
+              <td>
+                <strong>SearchBench 100M:</strong> Cold <code>3.49 &rarr; 2.99s</code> (<strong class="win">-500 ms, 1.17×</strong>) · Hot <code>2.64 &rarr; 2.18s</code> (<strong class="win">-453 ms, 1.21×</strong>) · <code>count_minmatch</code> <strong class="win">13.15× hot</strong> (<code>125 &rarr; 10 ms</code>) / <code>7.73× cold</code> · <code>count_phrase</code> <strong class="win">1.85× hot</strong> (<code>192 &rarr; 103 ms</code>) · <code>top_k</code> <strong class="win">1.33× hot</strong> (<code>780 &rarr; 589 ms</code>) · <code>recent_unsorted 1.32×</code>
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">363/363 query &amp; postings</span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #4</strong></td>
+              <td>
+                <strong>Two-Pass Deferred Sub-Aggregations &amp; <code>ShiftedTermMap</code></strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-deferred-sub-aggs" target="_blank" rel="noopener"><code>perf/pr-deferred-sub-aggs</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/cf1c4ef44d37ebbc88e6fcd213b949e30383cefd" target="_blank" rel="noopener"><code>cf1c4ef44</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy</span><br><span class="dim">Standalone</span></td>
+              <td class="num">+1,572 / -260<br><span class="dim">6 files</span></td>
+              <td>
+                <strong>ClickBench 10M:</strong> Run1 <code>1,465 &rarr; 1,011 ms</code> (<strong class="win">-454 ms, 1.45×</strong>) · Hot <code>1,273 &rarr; 936 ms</code> (<strong class="win">-337 ms, 1.36×</strong>) · <code>Q33</code> <strong class="win">6.70×</strong> (<code>288 &rarr; 43 ms</code>), <code>Q32</code> <strong class="win">3.31×</strong> (<code>43 &rarr; 13 ms</code>), <code>Q18</code> <strong class="win">3.15×</strong> (<code>63 &rarr; 20 ms</code>), <code>Q17</code> <strong class="win">3.00×</strong> (<code>60 &rarr; 20 ms</code>)<br>
+                <strong>JSONBench 10M:</strong> <code>Q1</code> <code>5.65 &rarr; 4.85 ms</code> (<strong>-14%</strong>)
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">339/339 aggregation</span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #5</strong></td>
+              <td>
+                <strong>Compact <code>StatsBuckets</code>, Histogram/Composite/Range Fast Paths &amp; Sibling Block Cache</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-stats-histogram-composite-aggs" target="_blank" rel="noopener"><code>perf/pr-stats-histogram-composite-aggs</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/ceaa73a4268fa2b5da72befb6c5e1f7dd6a46a24" target="_blank" rel="noopener"><code>ceaa73a42</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy</span><br><span class="dim">Standalone</span></td>
+              <td class="num">+2,050 / -103<br><span class="dim">11 files</span></td>
+              <td>
+                <strong>Big5 10M:</strong> Run1 <code>321.4 &rarr; 270.5 ms</code> (<strong class="win">-50.9 ms, 1.19×</strong>) · Hot <code>290.4 &rarr; 247.4 ms</code> (<strong class="win">-43.0 ms, 1.17×</strong>) · <code>B29_composite_date_histo</code> <strong class="win">5.69×</strong> (<code>20.7 &rarr; 3.6 ms</code>), <code>B28</code> <strong class="win">2.86×</strong>, <code>B27</code> <strong class="win">2.28×</strong>, <code>B23_range_with_metrics</code> <strong class="win">1.72×</strong> (<code>20.2 &rarr; 11.8 ms</code>)<br>
+                <strong>JSONBench 10M:</strong> <code>Q4</code> <code>8.28 &rarr; 7.55 ms</code> (Took <code>7 &rarr; 6 ms</code>)
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">339 agg + 7 columnar</span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #6</strong></td>
+              <td>
+                <strong>Cardinality Fast Paths (In-Place <code>HllUnion</code>, <code>FlatBitset</code>, <code>stream_all_terms_cb</code>, Coupon Cache)</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-cardinality-fast-paths" target="_blank" rel="noopener"><code>perf/pr-cardinality-fast-paths</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/bdd21d95c732ae239eb71f96eec471242225917d" target="_blank" rel="noopener"><code>bdd21d95c</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy</span><br><span class="dim">Standalone</span></td>
+              <td class="num">+921 / -110<br><span class="dim">9 files</span></td>
+              <td>
+                <strong>JSONBench 10M:</strong> Cold <code>105.9 &rarr; 95.3 ms</code> (<strong>-10.0%</strong>) · Hot <code>65.9 &rarr; 55.1 ms</code> (<strong class="win">-16.4%, 1.20×</strong>) · <code>Q2</code> <strong class="win">1.38× hot</strong> (<code>36.90 &rarr; 26.73 ms</code>)<br>
+                <strong>Big5 10M:</strong> Hot <code>290.4 &rarr; 268.0 ms</code> (<strong>-22.4 ms, 1.08×</strong>) · <code>B34_cardinality_high_2</code> <strong class="win">1.85×</strong> (<code>40.1 &rarr; 21.7 ms</code>)<br>
+                <strong>ClickBench 10M:</strong> Run1 <code>1,465 &rarr; 1,330 ms</code> (<strong>-135 ms</strong>) · <code>Q05</code> <strong class="win">2.38×</strong>, <code>Q09 1.74×</code>, <code>Q12 1.70×</code>, <code>Q14 1.50×</code>
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">44 sstable + 20 card.</span></td>
+            </tr>
+            <tr>
+              <td class="num"><strong>PR #7</strong></td>
+              <td>
+                <strong>Dense Block-Bitset <code>Intersection::for_each_no_score</code> &amp; <code>fill_bitset_block</code></strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-dense-bitset-intersection" target="_blank" rel="noopener"><code>perf/pr-dense-bitset-intersection</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/3aba02b178a9dbf4173f613aca0d7d9c598a406c" target="_blank" rel="noopener"><code>3aba02b17</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy</span><br><span class="dim">Standalone</span></td>
+              <td class="num">+649 / -28<br><span class="dim">10 files</span></td>
+              <td>
+                <strong>JSONBench 10M:</strong> Hot <code>65.9 &rarr; 57.6 ms</code> (<strong class="win">-12.6%</strong>, Took <code>62 &rarr; 54 ms</code>) · <code>Q3</code> <strong class="win">1.57× hot</strong> (<code>15.08 &rarr; 9.60 ms</code>, <strong>-36.3%</strong>)<br>
+                <strong>Big5 10M:</strong> Hot <code>290.4 &rarr; 280.7 ms</code> (<strong>-9.7 ms</strong>, geomean <code>5.34 &rarr; 5.05 ms</code>)
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">354 query + 13 common</span></td>
+            </tr>
+            <tr>
+              <td class="num"><strong>PR #8</strong></td>
+              <td>
+                <strong><code>Optional</code> Column Fast Paths &amp; Bounded Sub-Agg Top-K Heap</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-optional-term-agg-fast-paths" target="_blank" rel="noopener"><code>perf/pr-optional-term-agg-fast-paths</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/8f2270e39d7f3dbf84b0775371168a4c207364ee" target="_blank" rel="noopener"><code>8f2270e39</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy</span><br><span class="dim">Standalone</span></td>
+              <td class="num win">+248 / -58<br><span class="dim">5 files</span></td>
+              <td>
+                <strong>JSONBench 10M:</strong> Hot <code>65.9 &rarr; 57.8 ms</code> (<strong class="win">-12.3%</strong>, Took <code>62 &rarr; 55 ms</code>) · <code>Q1</code> <strong class="win">2.42× hot</strong> (<code>5.65 &rarr; 2.33 ms</code>, <strong>-58.8%</strong>) · <code>Q3</code> <strong class="win">1.21×</strong> (<code>15.08 &rarr; 12.50 ms</code>)
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">44 columnar + 48 term_agg</span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #9</strong></td>
+              <td>
+                <strong>Fast-Field Range Queries (<code>RangeDocSet::fill_buffer</code> &amp; Horizon Ramp)</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-fast-field-range-queries" target="_blank" rel="noopener"><code>perf/pr-fast-field-range-queries</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/939c736111eca15260666686c2566c959d9d5783" target="_blank" rel="noopener"><code>939c73611</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy</span><br><span class="dim">Standalone</span></td>
+              <td class="num win">+33 / -1<br><span class="dim">1 file</span></td>
+              <td>
+                <strong>Big5 10M:</strong> Run1 <code>321.4 &rarr; 295.7 ms</code> (<strong class="win">-25.7 ms, -8.0%</strong>) · Hot <code>290.4 &rarr; 274.0 ms</code> (<strong class="win">-16.4 ms, -5.6%</strong>) · Geomean <code>5.34 &rarr; 4.90 ms</code> (<strong class="win">1.09×</strong>) from <strong>33 lines of code</strong>
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">35/35 range_query</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h4>Incremental Merge Notes</h4>
+        <p style="margin-bottom:0;">
+          <strong>Zero cross-repo coupling for 8 of 9 PR units:</strong> <strong>PR #1</strong> merges into Quickwit with zero Tantivy changes; <strong>PR #3–PR #9</strong> merge into Tantivy independently in any order and immediately accelerate Quickwit upon bumping the Tantivy rev. Only <strong>PR #2</strong> pairs a Tantivy SSTable API addition (<code>warm_postings_*_collecting_term_infos</code>) with a small Quickwit warming-cache wiring PR (<code>ffdb0ffa4</code>). Note that <code>BlockwiseRleBitpacked</code> (codec <code>id=4</code>) and <code>IndexMetaSnapshot</code> are intentionally kept out of these query-only PRs so every branch above reads existing production splits with 100% backward compatibility.
+        </p>
+      </div>
+    </section>
+
     <!-- KEY TAKEAWAYS -->
     <section id="findings">
       <div class="section-head">
-        <h2>7. Key Architectural Takeaways &amp; Next Opportunities</h2>
+        <h2>8. Key Architectural Takeaways &amp; Next Opportunities</h2>
         <span class="section-tag">Engineering roadmap</span>
       </div>
 
@@ -2234,8 +2568,9 @@
 
     <footer>
       <div>
-        Quickwit <a class="commit-link" href="https://github.com/fmassot/quickwit/commit/4eeae3725c09bb8ca22a51238f0af60a3e519956" target="_blank" rel="noopener"><code>fmassot/quickwit@4eeae3725</code></a>
-        + Tantivy <a class="commit-link" href="https://github.com/fmassot/tantivy/commit/5ac25aa6a26fc43083cc87e1ad169c98524b86c5" target="_blank" rel="noopener"><code>fmassot/tantivy@5ac25aa6a</code></a>
+        Quickwit <a class="commit-link" href="https://github.com/fmassot/quickwit/commit/1f809aa6b" target="_blank" rel="noopener"><code>fmassot/quickwit@1f809aa6b</code></a>
+        + Tantivy <a class="commit-link" href="https://github.com/fmassot/tantivy/commit/712a09b5d" target="_blank" rel="noopener"><code>fmassot/tantivy@712a09b5d</code></a>
+        · 10 isolated PR branches off <code>main</code>
       </div>
       <div>Generated 2026-11-22 · Self-contained offline HTML report (print-to-PDF ready)</div>
     </footer>
