@@ -39,8 +39,8 @@ use quickwit_proto::search::{
 };
 use quickwit_proto::types::SplitId;
 use quickwit_query::query_ast::{
-    BoolQuery, CacheNode, HitSet, PredicateCache, QueryAst, QueryAstTransformer, RangeQuery,
-    TermQuery, get_or_compile_cached_fst_regex,
+    AutomatonTermInfosCache, BoolQuery, CacheNode, HitSet, PredicateCache, QueryAst,
+    QueryAstTransformer, RangeQuery, TermQuery, get_or_compile_cached_fst_regex,
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_storage::{
@@ -339,6 +339,7 @@ pub(crate) async fn warmup(
     warmup_info: &WarmupInfo,
     priority: Priority,
     on_absent: &(dyn Fn(&Term, SegmentId) + Sync),
+    automaton_term_infos_cache: Option<&AutomatonTermInfosCache>,
 ) -> crate::Result<bool> {
     debug!(warmup_info=?warmup_info);
 
@@ -391,7 +392,12 @@ pub(crate) async fn warmup(
     .instrument(debug_span!("warm_up_all_postings"));
     let warm_up_automatons_future = run_cancellable(
         abort_token.as_ref(),
-        warm_up_automatons(searcher, &warmup_info.automatons_grouped_by_field, priority),
+        warm_up_automatons(
+            searcher,
+            &warmup_info.automatons_grouped_by_field,
+            priority,
+            automaton_term_infos_cache,
+        ),
     )
     .instrument(debug_span!("warm_up_automatons"));
 
@@ -554,6 +560,7 @@ async fn warm_up_automatons(
     searcher: &Searcher,
     terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
     priority: Priority,
+    automaton_term_infos_cache: Option<&AutomatonTermInfosCache>,
 ) -> crate::Result<()> {
     let mut warm_up_futures = Vec::new();
     let cpu_intensive_executor = |task| async move {
@@ -563,32 +570,75 @@ async fn warm_up_automatons(
             .map_err(|_| std::io::Error::other("task panicked"))?
     };
     for (field, automatons) in terms_grouped_by_field {
+        let field = *field;
         for segment_reader in searcher.segment_readers() {
-            let inv_idx = segment_reader.inverted_index(*field)?;
+            let inv_idx = segment_reader.inverted_index(field)?;
+            let segment_id = segment_reader.segment_id();
             for automaton in automatons {
                 let inv_idx_clone = inv_idx.clone();
+                let cache_opt = automaton_term_infos_cache.cloned();
                 warm_up_futures.push(async move {
                     match automaton {
                         Automaton::Regex(path, regex_str) => {
-                            let regex =
-                                get_or_compile_cached_fst_regex(regex_str).ok_or_else(|| {
-                                    SearchError::InvalidArgument(format!(
-                                        "failed to parse regex `{regex_str}` during warmup"
-                                    ))
-                                })?;
-                            inv_idx_clone
-                                .warm_postings_automaton(
-                                    quickwit_query::query_ast::JsonPathPrefix {
-                                        automaton: regex,
-                                        prefix: path.clone().unwrap_or_default(),
+                            let prefix = path.clone().unwrap_or_default();
+                            let term_infos = if prefix.is_empty() {
+                                if let Some(needle) =
+                                    quickwit_query::query_ast::extract_pure_substring_literal(
+                                        regex_str,
+                                    )
+                                {
+                                    inv_idx_clone
+                                        .warm_postings_substring_collecting_term_infos(
+                                            needle,
+                                            true,
+                                            cpu_intensive_executor,
+                                        )
+                                        .await
+                                } else {
+                                    let regex = get_or_compile_cached_fst_regex(regex_str)
+                                        .ok_or_else(|| {
+                                            SearchError::InvalidArgument(format!(
+                                                "failed to parse regex `{regex_str}` during warmup"
+                                            ))
+                                        })?;
+                                    inv_idx_clone
+                                        .warm_postings_automaton_collecting_term_infos(
+                                            quickwit_query::query_ast::SharedAutomaton(regex),
+                                            cpu_intensive_executor,
+                                        )
+                                        .await
+                                }
+                            } else {
+                                let regex = get_or_compile_cached_fst_regex(regex_str).ok_or_else(
+                                    || {
+                                        SearchError::InvalidArgument(format!(
+                                            "failed to parse regex `{regex_str}` during warmup"
+                                        ))
                                     },
-                                    cpu_intensive_executor,
-                                )
-                                .await
-                                .map_err(|io_error| {
-                                    SearchError::from(io_error)
-                                        .with_context("failed to load automaton")
-                                })
+                                )?;
+                                inv_idx_clone
+                                    .warm_postings_automaton_collecting_term_infos(
+                                        quickwit_query::query_ast::JsonPathPrefix {
+                                            automaton: regex,
+                                            prefix: prefix.clone(),
+                                        },
+                                        cpu_intensive_executor,
+                                    )
+                                    .await
+                            }
+                            .map_err(|io_error| {
+                                SearchError::from(io_error).with_context("failed to load automaton")
+                            })?;
+                            if let Some(cache) = cache_opt {
+                                cache.insert(
+                                    segment_id,
+                                    field,
+                                    prefix,
+                                    regex_str.clone(),
+                                    term_infos,
+                                );
+                            }
+                            Ok::<(), SearchError>(())
                         }
                     }
                 });
@@ -773,9 +823,14 @@ async fn leaf_search_single_split(
                 split.split_id.clone(),
             ))
         };
-    let (query, mut warmup_info) =
-        ctx.doc_mapper
-            .query(index.schema(), query_ast.clone(), false, predicate_cache)?;
+    let automaton_term_infos_cache = AutomatonTermInfosCache::new();
+    let (query, mut warmup_info) = ctx.doc_mapper.query_with_automaton_cache(
+        index.schema(),
+        query_ast.clone(),
+        false,
+        predicate_cache,
+        Some(automaton_term_infos_cache.clone()),
+    )?;
 
     let collector_warmup_info = collector.warmup_info();
     warmup_info.merge(collector_warmup_info);
@@ -840,6 +895,7 @@ async fn leaf_search_single_split(
                 job_cost: search_permit.job_cost(),
             },
             &record_absence,
+            Some(&automaton_term_infos_cache),
         )
         .instrument(warmup_span.clone())
         .await
@@ -3021,6 +3077,7 @@ mod tests {
                 &|term: &Term, _segment_id| {
                     reported.lock().unwrap().push(term.clone());
                 },
+                None,
             )
             .await
             .unwrap();

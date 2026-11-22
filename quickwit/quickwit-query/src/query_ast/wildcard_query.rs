@@ -192,15 +192,31 @@ impl BuildTantivyAst for WildcardQuery {
             }
             Err(e) => return Err(e),
         };
-        let regex =
-            tantivy_fst::Regex::new(&regex).context("failed to parse regex built from wildcard")?;
+        let regex_compiled =
+            crate::query_ast::get_or_compile_cached_fst_regex(&regex).ok_or_else(|| {
+                anyhow::anyhow!("failed to parse regex built from wildcard `{regex}`")
+            })?;
+        let prefix = path.unwrap_or_default();
+        let term_infos_lookup = context
+            .automaton_term_infos_cache
+            .as_ref()
+            .map(|cache| cache.lookup_for(field, prefix.clone(), regex));
+        if prefix.is_empty() {
+            let regex_query = AutomatonQuery {
+                field,
+                automaton: regex_compiled,
+                term_infos_lookup,
+            };
+            return Ok(regex_query.into());
+        }
         let regex_automaton_with_path = JsonPathPrefix {
-            prefix: path.unwrap_or_default(),
-            automaton: regex.into(),
+            prefix,
+            automaton: regex_compiled,
         };
         let regex_query_with_path = AutomatonQuery {
             field,
             automaton: Arc::new(regex_automaton_with_path),
+            term_infos_lookup,
         };
         Ok(regex_query_with_path.into())
     }

@@ -14,8 +14,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Context;
-pub use prefix::{AutomatonQuery, JsonPathPrefix};
+pub use prefix::{AutomatonQuery, AutomatonTermInfosCache, JsonPathPrefix, SharedAutomaton};
 use serde::{Deserialize, Serialize};
 use tantivy::Term;
 use tantivy::schema::{Field, FieldType, JsonObjectOptions, Schema as TantivySchema};
@@ -32,6 +31,66 @@ pub struct ResolvedRegex {
     pub field: Field,
     pub json_path: Option<Vec<u8>>,
     pub regex: String,
+}
+
+/// Extracts the unescaped byte literal from a pure substring regex of the form `.*<literal>.*`
+/// (case-sensitive, no regex metacharacters or flags other than escaped ASCII punctuation such as
+/// `\.` produced by `regex::escape`).
+///
+/// Returns `None` for any pattern with regex operators, flags (e.g. `(?i)`), empty literals,
+/// character-class escapes (`\d`, `\w`, `\s`, etc.), or literal newlines, so callers fall back to
+/// general automaton evaluation.
+pub fn extract_pure_substring_literal(regex: &str) -> Option<Vec<u8>> {
+    let inner = regex.strip_prefix(".*")?.strip_suffix(".*")?;
+    if inner.is_empty() {
+        return None;
+    }
+    let mut literal = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let escaped = chars.next()?;
+                // Only allow the exact ASCII punctuation escapes emitted by `regex::escape`.
+                if matches!(
+                    escaped,
+                    '\\' | '.'
+                        | '+'
+                        | '*'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '|'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '^'
+                        | '$'
+                        | '#'
+                        | '&'
+                        | '-'
+                        | '~'
+                ) {
+                    literal.push(escaped as u8);
+                } else {
+                    return None;
+                }
+            }
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\n' => {
+                return None;
+            }
+            _ => {
+                let mut utf8_buf = [0u8; 4];
+                literal.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
+            }
+        }
+    }
+    if literal.is_empty() {
+        None
+    } else {
+        Some(literal)
+    }
 }
 
 /// Returns true if the regex already contains a case-insensitive flag `i`
@@ -164,25 +223,134 @@ impl BuildTantivyAst for RegexQuery {
     ) -> Result<TantivyQueryAst, InvalidQuery> {
         let resolved = self.to_resolved(context.schema, Some(context.tokenizer_manager))?;
 
-        let regex = tantivy_fst::Regex::new(&resolved.regex).context("failed to parse regex")?;
+        let regex = match crate::query_ast::get_or_compile_cached_fst_regex(&resolved.regex) {
+            Some(regex) => regex,
+            None => {
+                // Re-compile to surface the exact regex compilation error.
+                let err = tantivy_fst::Regex::new(&resolved.regex)
+                    .expect_err("uncached regex compilation failed");
+                return Err(anyhow::Error::new(err)
+                    .context("failed to parse regex")
+                    .into());
+            }
+        };
+        let prefix = resolved.json_path.unwrap_or_default();
+        let term_infos_lookup = context
+            .automaton_term_infos_cache
+            .as_ref()
+            .map(|cache| cache.lookup_for(resolved.field, prefix.clone(), resolved.regex.clone()));
+        if prefix.is_empty() {
+            let regex_query = AutomatonQuery {
+                field: resolved.field,
+                automaton: regex,
+                term_infos_lookup,
+            };
+            return Ok(regex_query.into());
+        }
         let regex_automaton_with_path = JsonPathPrefix {
-            prefix: resolved.json_path.unwrap_or_default(),
-            automaton: regex.into(),
+            prefix,
+            automaton: regex,
         };
         let regex_query_with_path = AutomatonQuery {
             field: resolved.field,
             automaton: Arc::new(regex_automaton_with_path),
+            term_infos_lookup,
         };
         Ok(regex_query_with_path.into())
     }
 }
 
 mod prefix {
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
 
-    use tantivy::query::{AutomatonWeight, EnableScoring, Query, Weight};
+    use tantivy::index::SegmentId;
+    use tantivy::postings::TermInfo;
+    use tantivy::query::{AutomatonWeight, EnableScoring, Query, SegmentTermInfosLookup, Weight};
     use tantivy::schema::Field;
     use tantivy_fst::Automaton;
+
+    /// Per-split-search cache of matching [`TermInfo`] lists populated during async automaton
+    /// warmup and reused by [`AutomatonWeight`] to avoid scanning the term dictionary twice.
+    #[derive(Clone, Default)]
+    pub struct AutomatonTermInfosCache {
+        entries: Arc<RwLock<HashMap<(SegmentId, Field, Vec<u8>, String), Arc<[TermInfo]>>>>,
+    }
+
+    impl AutomatonTermInfosCache {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn insert(
+            &self,
+            segment_id: SegmentId,
+            field: Field,
+            prefix: Vec<u8>,
+            regex: String,
+            term_infos: Vec<TermInfo>,
+        ) {
+            self.entries
+                .write()
+                .unwrap()
+                .insert((segment_id, field, prefix, regex), Arc::from(term_infos));
+        }
+
+        pub fn lookup_for(
+            &self,
+            field: Field,
+            prefix: Vec<u8>,
+            regex: String,
+        ) -> SegmentTermInfosLookup {
+            let entries = self.entries.clone();
+            Arc::new(move |segment_id: SegmentId| {
+                entries
+                    .read()
+                    .unwrap()
+                    .get(&(segment_id, field, prefix.clone(), regex.clone()))
+                    .cloned()
+            })
+        }
+    }
+
+    /// Zero-cost cloneable wrapper around `Arc<A>` implementing [`Automaton`] directly without
+    /// the [`JsonPathPrefix`] state enum overhead when no JSON path prefix is needed.
+    pub struct SharedAutomaton<A>(pub Arc<A>);
+
+    impl<A> Clone for SharedAutomaton<A> {
+        fn clone(&self) -> Self {
+            SharedAutomaton(self.0.clone())
+        }
+    }
+
+    impl<A: Automaton> Automaton for SharedAutomaton<A> {
+        type State = A::State;
+
+        #[inline(always)]
+        fn start(&self) -> Self::State {
+            self.0.start()
+        }
+
+        #[inline(always)]
+        fn is_match(&self, state: &Self::State) -> bool {
+            self.0.is_match(state)
+        }
+
+        #[inline(always)]
+        fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
+            self.0.accept(state, byte)
+        }
+
+        #[inline(always)]
+        fn can_match(&self, state: &Self::State) -> bool {
+            self.0.can_match(state)
+        }
+
+        #[inline(always)]
+        fn will_always_match(&self, state: &Self::State) -> bool {
+            self.0.will_always_match(state)
+        }
+    }
 
     pub struct JsonPathPrefix<A> {
         pub prefix: Vec<u8>,
@@ -271,6 +439,7 @@ mod prefix {
     pub struct AutomatonQuery<A> {
         pub automaton: Arc<A>,
         pub field: Field,
+        pub term_infos_lookup: Option<SegmentTermInfosLookup>,
     }
 
     impl<A> std::fmt::Debug for AutomatonQuery<A> {
@@ -287,6 +456,7 @@ mod prefix {
             AutomatonQuery {
                 automaton: self.automaton.clone(),
                 field: self.field,
+                term_infos_lookup: self.term_infos_lookup.clone(),
             }
         }
     }
@@ -295,10 +465,11 @@ mod prefix {
     where A::State: Clone
     {
         fn weight(&self, _enabled_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
-            Ok(Box::new(AutomatonWeight::<A>::new(
-                self.field,
-                self.automaton.clone(),
-            )))
+            let mut weight = AutomatonWeight::<A>::new(self.field, self.automaton.clone());
+            if let Some(lookup) = self.term_infos_lookup.as_ref() {
+                weight = weight.with_term_infos_lookup(lookup.clone());
+            }
+            Ok(Box::new(weight))
         }
     }
 }
@@ -544,5 +715,34 @@ mod tests {
         assert!(matches!(abegh, JsonPathPrefixState::Inner(_)));
         assert!(automaton.can_match(&abegh));
         assert!(automaton.is_match(&abegh));
+    }
+
+    #[test]
+    fn test_extract_pure_substring_literal() {
+        use super::extract_pure_substring_literal;
+        assert_eq!(
+            extract_pure_substring_literal(".*google.*"),
+            Some(b"google".to_vec())
+        );
+        assert_eq!(
+            extract_pure_substring_literal(".*Google.*"),
+            Some(b"Google".to_vec())
+        );
+        assert_eq!(
+            extract_pure_substring_literal(".*\\.google\\..*"),
+            Some(b".google.".to_vec())
+        );
+        assert_eq!(
+            extract_pure_substring_literal(".*foo\\-bar\\+baz.*"),
+            Some(b"foo-bar+baz".to_vec())
+        );
+        assert_eq!(extract_pure_substring_literal("(?i).*google.*"), None);
+        assert_eq!(extract_pure_substring_literal(".*foo.*bar.*"), None);
+        assert_eq!(extract_pure_substring_literal(".*foo?.*"), None);
+        assert_eq!(extract_pure_substring_literal(".*\\d+.*"), None);
+        assert_eq!(extract_pure_substring_literal(".*.*"), None);
+        assert_eq!(extract_pure_substring_literal("google.*"), None);
+        assert_eq!(extract_pure_substring_literal(".*google"), None);
+        assert_eq!(extract_pure_substring_literal(".*trailing\\.*"), None);
     }
 }

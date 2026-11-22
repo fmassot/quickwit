@@ -49,7 +49,10 @@ pub use phrase_prefix_query::PhrasePrefixQuery;
 pub use query_features::QueryFeatureCounts;
 pub use range_query::RangeQuery;
 pub use regex_extract_eq::get_or_compile_cached_fst_regex;
-pub use regex_query::{AutomatonQuery, JsonPathPrefix, RegexQuery, ResolvedRegex};
+pub use regex_query::{
+    AutomatonQuery, AutomatonTermInfosCache, JsonPathPrefix, RegexQuery, ResolvedRegex,
+    SharedAutomaton, extract_pure_substring_literal,
+};
 use tantivy_query_ast::TantivyQueryAst;
 pub use term_query::TermQuery;
 pub use term_set_query::TermSetQuery;
@@ -189,6 +192,7 @@ pub struct BuildTantivyAstContext<'a> {
     pub tokenizer_manager: &'a TokenizerManager,
     pub search_fields: &'a [String],
     pub with_validation: bool,
+    pub automaton_term_infos_cache: Option<AutomatonTermInfosCache>,
 }
 
 impl<'a> BuildTantivyAstContext<'a> {
@@ -204,6 +208,7 @@ impl<'a> BuildTantivyAstContext<'a> {
             tokenizer_manager: &DEFAULT_TOKENIZER_MANAGER,
             search_fields: &[],
             with_validation: true,
+            automaton_term_infos_cache: None,
         }
     }
 

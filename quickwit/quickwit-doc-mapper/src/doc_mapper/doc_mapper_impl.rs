@@ -641,6 +641,25 @@ impl DocMapper {
         with_validation: bool,
         cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
     ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
+        self.query_with_automaton_cache(
+            split_schema,
+            query_ast,
+            with_validation,
+            cache_context,
+            None,
+        )
+    }
+
+    /// Same as [`DocMapper::query`], with an optional per-split-search cache populated by async
+    /// automaton warmup so regex/wildcard queries do not scan the term dictionary twice.
+    pub fn query_with_automaton_cache(
+        &self,
+        split_schema: Schema,
+        query_ast: QueryAst,
+        with_validation: bool,
+        cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
+        automaton_term_infos_cache: Option<quickwit_query::query_ast::AutomatonTermInfosCache>,
+    ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
         build_query(
             query_ast,
             &BuildTantivyAstContext {
@@ -648,6 +667,7 @@ impl DocMapper {
                 tokenizer_manager: self.tokenizer_manager(),
                 search_fields: &self.default_search_field_names[..],
                 with_validation,
+                automaton_term_infos_cache,
             },
             cache_context,
         )
