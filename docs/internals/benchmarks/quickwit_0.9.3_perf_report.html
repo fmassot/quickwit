@@ -1772,12 +1772,33 @@
               <td class="num">2.19 GB</td>
             </tr>
             <tr class="highlight">
-              <td rowspan="4"><strong>ClickBench 10M</strong><br><span class="dim">9.77M valid rows · 105 columns</span></td>
-              <td><strong>Quickwit Step 1+2 (<code>--num-pipelines 8</code>)</strong> <span class="badge b-qw">14 idx</span></td>
-              <td>Parquet &rarr; JSON pipe &rarr; <code>local-ingest</code> (<code>1f809aa6b</code> + <code>712a09b5d</code>)</td>
-              <td class="num win">23.14 s <span class="dim">(7.4× vs main)</span></td>
-              <td class="num win">422.3k rows/s</td>
-              <td class="num">2.45 GB</td>
+              <td rowspan="7"><strong>ClickBench 10M</strong><br><span class="dim">10.0M rows (9.77M valid JSON) · 105 columns</span></td>
+              <td><strong>Quickwit Parquet Analytical (<code>stored: false</code>)</strong> <span class="badge b-qw">8p · jemalloc</span></td>
+              <td>Native Parquet (<code>local-ingest --input-format parquet</code>)</td>
+              <td class="num win">5.97 s <span class="dim">(82.9 cpu-s · 28.7× vs main)</span></td>
+              <td class="num win">1,674k rows/s</td>
+              <td class="num win">1.10 GiB</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong>Quickwit Parquet Full (<code>zstd=1</code>)</strong> <span class="badge b-qw">105 stored+fast · 8p</span></td>
+              <td>Native Parquet (<code>docstore_compression_level: 1</code>, jemalloc)</td>
+              <td class="num win">7.56 s <span class="dim">(116.3 cpu-s · 22.6× vs main)</span></td>
+              <td class="num win">1,323k rows/s</td>
+              <td class="num">2.55 GiB</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong>Quickwit Parquet Full (<code>zstd=3</code> / <code>zstd=8</code>)</strong> <span class="badge b-qw">105 stored+fast · 8p</span></td>
+              <td>Native Parquet (<code>docstore_compression_level: 3</code> / default <code>8</code>)</td>
+              <td class="num win">7.90 s / 14.61 s</td>
+              <td class="num win">1,266k / 685k rows/s</td>
+              <td class="num">2.42 / 2.31 GiB</td>
+            </tr>
+            <tr>
+              <td><strong>Quickwit NDJSON Pipe (<code>zstd=1</code> / <code>zstd=8</code>)</strong> <span class="badge b-qw">Opt A–G · 8p</span></td>
+              <td>Parquet &rarr; JSON pipe &rarr; <code>local-ingest --num-pipelines 8</code></td>
+              <td class="num">13.87 s / 19.29 s</td>
+              <td class="num">704k / 506k rows/s</td>
+              <td class="num">2.66 / 2.43 GiB</td>
             </tr>
             <tr>
               <td><strong>Quickwit Wave 6 (single pipeline)</strong> <span class="badge b-qw">14 idx</span></td>
@@ -1794,11 +1815,11 @@
               <td class="num">2.70 GB</td>
             </tr>
             <tr>
-              <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">28 parts</span></td>
-              <td>Native Parquet direct <code>INSERT</code></td>
-              <td class="num win">~8 s</td>
-              <td class="num win">~1.2M rows/s</td>
-              <td class="num win">1.44 GB</td>
+              <td><strong>ClickHouse 26.8.2.7</strong> <span class="badge b-ch">MergeTree LZ4 · 0 idx</span></td>
+              <td>Native Parquet direct <code>INSERT</code> (columnar-only, LZ4)</td>
+              <td class="num win">3.14 s <span class="dim">(25.6 cpu-s)</span></td>
+              <td class="num win">3,186k rows/s</td>
+              <td class="num win">1.40 GiB</td>
             </tr>
             <tr class="highlight">
               <td rowspan="5"><strong>JSONBench 10M</strong><br><span class="dim">10M Bluesky JSON events · 1.3 GB .json.gz</span></td>
@@ -2217,18 +2238,18 @@
     <section id="isolated-prs">
       <div class="section-head">
         <h2>7. Isolated, Merge-Ready PRs Against <code>main</code> (Search, Codec &amp; Ingest)</h2>
-        <span class="section-tag">16 standalone branches off pure <code>main</code> (<code>quickwit@b9fbdc7a8</code> + <code>tantivy@0aa896fe2</code>) · 13 PR units</span>
+        <span class="section-tag">19 standalone branches off pure <code>main</code> (<code>quickwit@b9fbdc7a8</code> + <code>tantivy@0aa896fe2</code>) · 16 PR units</span>
       </div>
 
       <p class="dim" style="margin-top:-8px;margin-bottom:20px;">
-        Every branch below is branched directly off upstream <code>main</code>, unit-tested, pushed to GitHub, and benchmarked in isolation directly against pure <code>main</code> using <code>main</code>-compatible indexes (so each PR can be reviewed and merged independently without adopting the monolithic <code>perf/searchbench</code> branch). Pure <code>main</code> baselines on this hardware: <strong>SearchBench 100M</strong> <code>3.49s</code> cold / <code>2.64s</code> hot (<code>5,745 MB</code> I/O), <strong>ClickBench 10M</strong> <code>1,465 ms</code> run1 / <code>1,273 ms</code> hot (ingest <code>171.2s</code>), <strong>Big5 10M</strong> <code>321.4 ms</code> run1 / <code>290.4 ms</code> hot (ingest <code>96.1s</code>), <strong>JSONBench 10M</strong> <code>105.9 ms</code> cold / <code>65.9 ms</code> hot (ingest <code>32.1s</code>).
+        Every branch below is branched directly off upstream <code>main</code> (or stacked explicitly where noted), unit-tested, pushed to GitHub, and benchmarked in isolation directly against pure <code>main</code> using <code>main</code>-compatible indexes (so each PR can be reviewed and merged independently without adopting the monolithic <code>perf/searchbench</code> branch). Pure <code>main</code> baselines on this hardware: <strong>SearchBench 100M</strong> <code>3.49s</code> cold / <code>2.64s</code> hot (<code>5,745 MB</code> I/O), <strong>ClickBench 10M</strong> <code>1,465 ms</code> run1 / <code>1,273 ms</code> hot (ingest <code>171.2s</code>), <strong>Big5 10M</strong> <code>321.4 ms</code> run1 / <code>290.4 ms</code> hot (ingest <code>96.1s</code>), <strong>JSONBench 10M</strong> <code>105.9 ms</code> cold / <code>65.9 ms</code> hot (ingest <code>32.1s</code>).
       </p>
 
       <div class="kpi-grid">
         <div class="kpi">
           <div class="kpi-label">Merge-Ready Branches</div>
-          <div class="kpi-value accent">16 <span style="font-size:13px;font-weight:600;color:var(--muted)">branches (13 PR units)</span></div>
-          <div class="kpi-sub">10 Search + 1 Storage Codec + 2 Ingest PR units</div>
+          <div class="kpi-value accent">19 <span style="font-size:13px;font-weight:600;color:var(--muted)">branches (16 PR units)</span></div>
+          <div class="kpi-sub">10 Search + 1 Storage Codec + 5 Ingest PR units</div>
         </div>
         <div class="kpi">
           <div class="kpi-label">#1 Search PR Impact</div>
@@ -2237,8 +2258,8 @@
         </div>
         <div class="kpi">
           <div class="kpi-label">#1 Ingest PR Impact</div>
-          <div class="kpi-value accent">3.88× <span style="font-size:13px;font-weight:600;color:var(--muted)">/ 3.09× / 2.28×</span></div>
-          <div class="kpi-sub"><code>perf/pr-ingest-parallel-local</code> (0 Tantivy edits)</div>
+          <div class="kpi-value accent">9.98× <span style="font-size:13px;font-weight:600;color:var(--muted)">(22.6× combined)</span></div>
+          <div class="kpi-sub"><code>perf/pr-ingest-parquet</code>: <code>171.2 &rarr; 17.16s</code> (<code>7.56s</code> w/ PR #13–#15)</div>
         </div>
         <div class="kpi">
           <div class="kpi-label">Highest-ROI Single PR</div>
@@ -2559,20 +2580,69 @@
             <tr class="highlight">
               <td class="num"><strong>PR #13</strong></td>
               <td>
-                <strong>Ingest: Tantivy Fast Doc/Postings/ColumnHandle + Quickwit Streaming JSON</strong><br>
+                <strong>Ingest: Tantivy Fast Doc/Postings/ColumnHandle/RawTokenizer + Quickwit Streaming JSON</strong><br>
                 <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-ingest-fast-paths" target="_blank" rel="noopener"><code>perf/pr-ingest-fast-paths</code></a>
-                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/ca0fadf5ec6ac063027fabe5670788f4ba5715d3" target="_blank" rel="noopener"><code>ca0fadf5e</code></a>)<br>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/e5a13f995415b5ce539e66255cf96712d7e7dd71" target="_blank" rel="noopener"><code>e5a13f995</code></a>)<br>
                 + <a class="commit-link" href="https://github.com/fmassot/quickwit/tree/perf/pr-ingest-streaming-json" target="_blank" rel="noopener"><code>perf/pr-ingest-streaming-json</code></a>
                 (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/24fbd7ede8e620689b50da2ab6f73eda25e59cda" target="_blank" rel="noopener"><code>24fbd7ede</code></a>)
               </td>
               <td><span class="badge b-qw">Paired Ingest</span><br><span class="dim">Tantivy + Quickwit (no clustering)</span></td>
-              <td class="num">+1,442 / -298<br>+2,168 / -36<br><span class="dim">24 + 13 files</span></td>
+              <td class="num">+1,557 / -318<br>+2,168 / -36<br><span class="dim">24 + 13 files</span></td>
               <td>
-                <strong>ClickBench 10M (1p):</strong> <code>171.2 &rarr; 61.10s</code> (<strong class="win">2.80× faster, -64%</strong>) · combined w/ PR #12: <strong class="win">23.14s (7.40×)</strong><br>
+                <strong>ClickBench 10M (1p):</strong> <code>171.2 &rarr; 57.09s</code> (<strong class="win">3.00× faster, -67%</strong>; includes <code>(*self.tokenizer).as_any()</code> raw pass-through fix &amp; direct <code>CompactDoc::read_u64</code> / combined <code>serialize_doc_to_vec</code>)<br>
                 <strong>Big5 10M (1p):</strong> <code>96.1 &rarr; 65.12s</code> (<strong class="win">1.48× faster, -32%</strong>)<br>
                 <strong>JSONBench 10M (1p):</strong> <code>32.1 &rarr; 29.05s</code> (<code>1.11×</code>) · combined w/ PR #12: <strong class="win">12.0s (2.68×)</strong>
               </td>
-              <td><span class="badge b-ok">Pass</span><br><span class="dim">495+ tantivy + 245 QW + <code>make fmt</code></span></td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">400/400 tantivy + 245 QW + <code>make fmt</code></span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #14</strong></td>
+              <td>
+                <strong>Ingest: Dense Contiguous Columnar Writers &amp; Slice-Based u64 Codec Serialization</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/tantivy/tree/perf/pr-columnar-dense-writers" target="_blank" rel="noopener"><code>perf/pr-columnar-dense-writers</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/tantivy/commit/cca5a7f73969bb1ddac53c4d7785a801033a7873" target="_blank" rel="noopener"><code>cca5a7f73</code></a>)
+              </td>
+              <td><span class="badge b-es">Tantivy Ingest</span><br><span class="dim">Standalone on <code>tantivy main</code></span></td>
+              <td class="num">+1,523 / -114<br><span class="dim">10 files</span></td>
+              <td>
+                <strong>ClickBench 10M Parquet (<code>8p</code>, isolated over PR #16):</strong><br>
+                &bull; <code>zstd=1</code>: CPU <code>201.4 &rarr; 173.4s</code> (<strong class="win">-28.0 cpu-s, -13.9%</strong>), wall <code>17.16 &rarr; 16.16s</code><br>
+                &bull; <code>zstd=8</code>: CPU <code>304.1 &rarr; 278.5s</code> (<strong class="win">-25.6 cpu-s, -8.4%</strong>)<br>
+                <span class="dim">Flat <code>Vec&lt;u64&gt;</code> / <code>Vec&lt;UnorderedId&gt;</code> + <code>empty_bytes_id</code> cache + slice codec estimation cuts <code>ColumnarWriter::serialize</code> ~8× (<code>75 &rarr; &lt;8 cpu-s</code>). Masked by single-thread JSON parse on <code>main 1p</code>; unlocks full win once paired with PR #12/#13/#16.</span>
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">213/213 columnar + fastfield</span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #15</strong></td>
+              <td>
+                <strong>Ingest: Batch <code>Indexer::mem_usage</code> Accounting &amp; Fast Local/Shutdown Supervision</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/quickwit/tree/perf/pr-indexer-batch-mem-and-shutdown" target="_blank" rel="noopener"><code>perf/pr-indexer-batch-mem-and-shutdown</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/1c84cead9869f1ee8791452a420103751b06c320" target="_blank" rel="noopener"><code>1c84cead9</code></a>)
+              </td>
+              <td><span class="badge b-qw">Quickwit Ingest</span><br><span class="dim">Standalone on <code>tantivy main</code></span></td>
+              <td class="num win">+49 / -12<br><span class="dim">4 files</span></td>
+              <td>
+                <strong>Shutdown quantization:</strong> Eliminates <code>1.0–1.9s</code> idle tail on every <code>local-ingest</code> run (ClickBench 1M <code>1p</code>: <code>20.05 &rarr; 19.03s</code>, <strong class="win">-1.02s</strong>)<br>
+                <strong>Indexer CPU:</strong> Replaces <code>20M</code> per-document <code>mem_usage()</code> calls with 1 check per batch (<strong class="win">-2.4 cpu-s</strong> / ~1.9% of fast Parquet ingest)
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">28/28 <code>quickwit-indexing</code> + <code>make fmt</code></span></td>
+            </tr>
+            <tr class="highlight">
+              <td class="num"><strong>PR #16</strong></td>
+              <td>
+                <strong>Ingest: Native Parquet <code>local-ingest</code> (Row-Group Work-Stealing &amp; Projection Pushdown)</strong><br>
+                <a class="commit-link" href="https://github.com/fmassot/quickwit/tree/perf/pr-ingest-parquet" target="_blank" rel="noopener"><code>perf/pr-ingest-parquet</code></a>
+                (<a class="commit-link" href="https://github.com/fmassot/quickwit/commit/32cbfad5cc7ab4979e887711bb1b7b3df5a9b1a9" target="_blank" rel="noopener"><code>32cbfad5c</code></a>)
+              </td>
+              <td><span class="badge b-qw">Quickwit Ingest</span><br><span class="dim">Stacked on PR #12 · 0 Tantivy edits</span></td>
+              <td class="num">+1,524 / -46<br><span class="dim">16 files</span></td>
+              <td>
+                <strong>ClickBench 10M Parquet (<code>8p</code>, standalone on <code>tantivy main</code>):</strong><br>
+                &bull; <code>zstd=8</code>: <code>171.2 &rarr; 20.14s</code> (<strong class="win">8.50× faster</strong>, <code>496.5k rows/s</code>, <code>304.1 cpu-s</code>)<br>
+                &bull; <code>zstd=1</code>: <code>171.2 &rarr; 17.16s</code> (<strong class="win">9.98× faster</strong>, <code>582.8k rows/s</code>, <code>201.4 cpu-s</code>)<br>
+                <strong>Combined (PR #13 + #14 + #15 + #16 + <code>jemalloc</code>):</strong> <strong class="win">7.56s</strong> (<code>1,323k rows/s</code>, <strong>22.6× vs <code>main</code></strong>, all 105 stored + 105 fast + 14 idx) · <strong>7.90s</strong> at <code>zstd=3</code> · <strong class="win">5.97s</strong> (<code>1,674k rows/s</code>, <code>1.10 GiB</code>) analytical (<code>stored: false</code>)
+              </td>
+              <td><span class="badge b-ok">Pass</span><br><span class="dim">Parquet + CLI tests + <code>make fmt</code></span></td>
             </tr>
           </tbody>
         </table>
@@ -2581,7 +2651,7 @@
       <div class="card" style="margin-top:16px;">
         <h4>Incremental Merge Notes</h4>
         <p style="margin-bottom:0;">
-          <strong>10 of 13 PR units have zero cross-repo coupling:</strong> <strong>PR #1</strong> and <strong>PR #12</strong> merge into Quickwit directly on <code>tantivy main</code>; <strong>PR #3–PR #9</strong> (and optional <strong>PR #11</strong>) merge into Tantivy independently in any order. Only <strong>PR #2</strong> (SSTable automaton warming), <strong>PR #10</strong> (<code>IndexMetaSnapshot</code>), and <strong>PR #13</strong> (streaming JSON + <code>CompactDocValueWriter</code>) pair a Tantivy API addition with its Quickwit caller. Isolated testing also revealed that <strong>PR #11</strong> (<code>BlockwiseRleBitpacked</code>) should <em>not</em> be enabled globally by default because it regresses unsorted Big5 (<code>+3.1%</code>) and JSONBench (<code>+12.4%</code>) hot latency despite saving <code>525 MB</code> on ClickBench.
+          <strong>13 of 16 PR units have zero cross-repo coupling:</strong> <strong>PR #1</strong>, <strong>PR #12</strong>, <strong>PR #15</strong>, and <strong>PR #16</strong> (stacked on PR #12) merge into Quickwit directly on <code>tantivy main</code>; <strong>PR #3–PR #9</strong>, <strong>PR #14</strong> (and optional <strong>PR #11</strong>) merge into Tantivy independently in any order. Only <strong>PR #2</strong> (SSTable automaton warming), <strong>PR #10</strong> (<code>IndexMetaSnapshot</code>), and <strong>PR #13</strong> (streaming JSON + <code>CompactDocValueWriter</code>) pair a Tantivy API addition with its Quickwit caller. Isolated testing also revealed that <strong>PR #11</strong> (<code>BlockwiseRleBitpacked</code>) should <em>not</em> be enabled globally by default because it regresses unsorted Big5 (<code>+3.1%</code>) and JSONBench (<code>+12.4%</code>) hot latency despite saving <code>525 MB</code> on ClickBench.
         </p>
       </div>
     </section>
@@ -2636,9 +2706,9 @@
 
     <footer>
       <div>
-        Quickwit <a class="commit-link" href="https://github.com/fmassot/quickwit/commit/1f809aa6b" target="_blank" rel="noopener"><code>fmassot/quickwit@1f809aa6b</code></a>
-        + Tantivy <a class="commit-link" href="https://github.com/fmassot/tantivy/commit/712a09b5d" target="_blank" rel="noopener"><code>fmassot/tantivy@712a09b5d</code></a>
-        · 16 isolated PR branches off <code>main</code> (13 PR units)
+        Quickwit <a class="commit-link" href="https://github.com/fmassot/quickwit/commit/c33078fd0" target="_blank" rel="noopener"><code>fmassot/quickwit@c33078fd0</code></a>
+        + Tantivy <a class="commit-link" href="https://github.com/fmassot/tantivy/commit/489855ba4" target="_blank" rel="noopener"><code>fmassot/tantivy@489855ba4</code></a>
+        · 19 isolated PR branches off <code>main</code> (16 PR units)
       </div>
       <div>Generated 2026-11-22 · Self-contained offline HTML report (print-to-PDF ready)</div>
     </footer>
