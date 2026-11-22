@@ -311,7 +311,7 @@ impl IndexerState {
                 num_bytes,
             } = doc;
             counters.num_docs_in_workbench += 1;
-            let (indexed_split, split_created) = self.get_or_create_indexed_split(
+            let (indexed_split, _split_created) = self.get_or_create_indexed_split(
                 partition,
                 *last_delete_opstamp,
                 indexed_splits,
@@ -319,12 +319,6 @@ impl IndexerState {
                 counters,
                 ctx,
             )?;
-            let mem_usage_before = indexed_split.mem_usage() as u64;
-            if split_created {
-                // The split was just created. We need to account for the initial index writer's
-                // memory usage.
-                memory_usage_delta += mem_usage_before as i64;
-            }
             indexed_split.split_attrs.uncompressed_docs_size_in_bytes += num_bytes as u64;
             // Tantivy doc IDs are local to the split and continue across processed-doc batches.
             let split_doc_id = indexed_split.split_attrs.num_docs as DocId;
@@ -340,9 +334,16 @@ impl IndexerState {
                 .index_writer
                 .add_document(doc)
                 .context("failed to add document")?;
-            let mem_usage_after = indexed_split.mem_usage() as u64;
-            memory_usage_delta += mem_usage_after as i64 - mem_usage_before as i64;
             ctx.record_progress();
+        }
+        for indexed_split in indexed_splits
+            .values_mut()
+            .chain(other_indexed_split_opt.iter_mut())
+        {
+            let mem_usage_after = indexed_split.mem_usage() as u64;
+            memory_usage_delta +=
+                mem_usage_after as i64 - indexed_split.last_reported_mem_usage as i64;
+            indexed_split.last_reported_mem_usage = mem_usage_after;
         }
         memory_usage.increment(memory_usage_delta as f64);
         Ok(())

@@ -40,6 +40,8 @@ pub struct IndexedSplitBuilder {
     pub controlled_directory: ControlledDirectory,
     pub doc_id_clusterer_opt: Option<DocIdClusterer>,
     ram_directory_opt: Option<RamDirectory>,
+    /// Last memory usage (bytes) already reported to the workbench `GaugeGuard`.
+    pub last_reported_mem_usage: u64,
 }
 
 pub struct IndexedSplit {
@@ -133,6 +135,7 @@ impl IndexedSplitBuilder {
             split_scratch_directory,
             controlled_directory,
             ram_directory_opt,
+            last_reported_mem_usage: 0,
         })
     }
 
@@ -294,6 +297,7 @@ mod tests {
             controlled_directory,
             doc_id_clusterer_opt: None,
             ram_directory_opt: Some(ram_directory.clone()),
+            last_reported_mem_usage: 0,
         };
         let split = builder.finalize()?;
         // A file added only after persistence must not be visible through the returned index.

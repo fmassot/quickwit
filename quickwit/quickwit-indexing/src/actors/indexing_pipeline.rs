@@ -26,7 +26,7 @@ use quickwit_common::metrics::index_label;
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_common::{KillSwitch, io};
-use quickwit_config::{IndexingSettings, RetentionPolicy, SourceConfig};
+use quickwit_config::{IndexingSettings, RetentionPolicy, SourceConfig, SourceParams};
 use quickwit_doc_mapper::DocMapper;
 use quickwit_ingest::IngesterPool;
 use quickwit_metrics::{GaugeGuard, counter, gauge, label_values};
@@ -496,7 +496,19 @@ impl Handler<SuperviseLoop> for IndexingPipeline {
     ) -> Result<(), ActorExitStatus> {
         self.perform_observe(ctx);
         self.perform_health_check(ctx).await?;
-        ctx.schedule_self_msg(SUPERVISE_INTERVAL, supervise_loop_token);
+        let fast_poll = matches!(
+            self.params.source_config.source_params,
+            SourceParams::File(_) | SourceParams::Stdin
+        ) || self
+            .handles_opt
+            .as_ref()
+            .is_some_and(|handles| handles.source_handle.state().is_exit());
+        let supervise_interval = if fast_poll {
+            Duration::from_millis(50)
+        } else {
+            SUPERVISE_INTERVAL
+        };
+        ctx.schedule_self_msg(supervise_interval, supervise_loop_token);
         Ok(())
     }
 }
