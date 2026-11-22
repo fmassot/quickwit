@@ -61,8 +61,11 @@ use tracing::{debug, error, info, warn};
 use super::merge_pipeline::{MergePipeline, MergePipelineParams};
 use super::{FinishPendingMergesAndShutdownPipeline, MergePlanner, MergeSchedulerService};
 use crate::docs_clustering::Fingerprinter;
-use crate::models::{DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnPipeline};
-use crate::source::{AssignShards, Assignment};
+use crate::models::{
+    DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnChannelPipeline,
+    SpawnPipeline,
+};
+use crate::source::{AssignShards, Assignment, LocalBatchReceiver};
 use crate::split_store::IndexingSplitCache;
 use crate::{IndexingPipeline, IndexingPipelineParams, IndexingSplitStore, IndexingStatistics};
 
@@ -236,6 +239,7 @@ impl IndexingService {
         index_id: IndexId,
         source_config: SourceConfig,
         pipeline_uid: PipelineUid,
+        batch_rx_opt: Option<LocalBatchReceiver>,
     ) -> Result<IndexingPipelineId, IndexingError> {
         let index_metadata = self.index_metadata(ctx, &index_id).await?;
         let pipeline_id = IndexingPipelineId {
@@ -252,11 +256,13 @@ impl IndexingService {
             source_config,
             None,
             None,
+            batch_rx_opt,
         )
         .await?;
         Ok(pipeline_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_pipeline_inner(
         &mut self,
         ctx: &ActorContext<Self>,
@@ -265,6 +271,7 @@ impl IndexingService {
         source_config: SourceConfig,
         immature_splits_opt: Option<Vec<SplitMetadata>>,
         expected_params_fingerprint: Option<u64>,
+        batch_rx_opt: Option<LocalBatchReceiver>,
     ) -> Result<(), IndexingError> {
         if self
             .indexing_pipelines
@@ -297,6 +304,7 @@ impl IndexingService {
                 source_config,
                 immature_splits_opt,
                 params_fingerprint,
+                batch_rx_opt,
             )
             .await?;
 
@@ -306,6 +314,7 @@ impl IndexingService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_indexing_pipeline(
         &mut self,
         ctx: &ActorContext<Self>,
@@ -314,6 +323,7 @@ impl IndexingService {
         source_config: SourceConfig,
         immature_splits_opt: Option<Vec<SplitMetadata>>,
         params_fingerprint: u64,
+        batch_rx_opt: Option<LocalBatchReceiver>,
     ) -> Result<IndexingPipelineHandle, IndexingError> {
         let pipeline_uid_str = indexing_pipeline_id.pipeline_uid.to_string();
         let indexing_directory = temp_dir::Builder::default()
@@ -404,6 +414,7 @@ impl IndexingService {
             queues_dir_path: self.queue_dir_path.clone(),
             source_storage_resolver: self.storage_resolver.clone(),
             params_fingerprint,
+            batch_rx_opt,
             event_broker: self.event_broker.clone(),
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
@@ -784,6 +795,7 @@ impl IndexingService {
                             source_config.clone(),
                             immature_splits_opt,
                             Some(task_to_spawn.params_fingerprint),
+                            None,
                         )
                         .await
                     {
@@ -1018,6 +1030,27 @@ impl Handler<SpawnPipeline> for IndexingService {
                 message.index_id,
                 message.source_config,
                 message.pipeline_uid,
+                None,
+            )
+            .await)
+    }
+}
+
+#[async_trait]
+impl Handler<SpawnChannelPipeline> for IndexingService {
+    type Reply = Result<IndexingPipelineId, IndexingError>;
+    async fn handle(
+        &mut self,
+        message: SpawnChannelPipeline,
+        ctx: &ActorContext<Self>,
+    ) -> Result<Result<IndexingPipelineId, IndexingError>, ActorExitStatus> {
+        Ok(self
+            .spawn_pipeline(
+                ctx,
+                message.index_id,
+                message.source_config,
+                message.pipeline_uid,
+                Some(message.batch_rx),
             )
             .await)
     }

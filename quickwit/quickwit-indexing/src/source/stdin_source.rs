@@ -19,47 +19,39 @@ use async_trait::async_trait;
 use quickwit_actors::{ActorExitStatus, Mailbox};
 use quickwit_common::Progress;
 use quickwit_proto::metastore::SourceType;
-use tokio::io::{AsyncBufReadExt, BufReader};
 
+use super::chunked_line_reader::ChunkedLineReader;
 use super::{BATCH_NUM_BYTES_LIMIT, BatchBuilder};
 use crate::actors::DocProcessor;
 use crate::source::{Source, SourceContext, SourceRuntime, TypedSourceFactory};
 
 pub struct StdinBatchReader {
-    reader: BufReader<tokio::io::Stdin>,
-    is_eof: bool,
+    reader: ChunkedLineReader<tokio::io::Stdin>,
 }
 
 impl StdinBatchReader {
     pub fn new() -> Self {
         Self {
-            reader: BufReader::new(tokio::io::stdin()),
-            is_eof: false,
+            reader: ChunkedLineReader::new(tokio::io::stdin()),
         }
     }
 
     async fn read_batch(&mut self, source_progress: &Progress) -> anyhow::Result<BatchBuilder> {
         let mut batch_builder = BatchBuilder::new(SourceType::Stdin);
-        while batch_builder.num_bytes < BATCH_NUM_BYTES_LIMIT {
-            let mut buf = String::new();
-            // stdin might be slow because it's depending on external
-            // input (e.g. user typing on a keyboard)
-            let bytes_read = source_progress
-                .protect_future(self.reader.read_line(&mut buf))
-                .await?;
-            if bytes_read > 0 {
-                batch_builder.add_doc(buf.into());
-            } else {
-                self.is_eof = true;
-                break;
-            }
-        }
-
+        // stdin might be slow because it depends on external input (e.g. user typing on a
+        // keyboard), so `read_batch_into` protects every async read with `source_progress`.
+        self.reader
+            .read_batch_into(
+                BATCH_NUM_BYTES_LIMIT as usize,
+                source_progress,
+                &mut batch_builder,
+            )
+            .await?;
         Ok(batch_builder)
     }
 
     fn is_eof(&self) -> bool {
-        self.is_eof
+        self.reader.is_eof()
     }
 }
 

@@ -47,7 +47,8 @@ use crate::merge_policy::MergePolicy;
 use crate::metrics::{ACTOR_NAME, BACKPRESSURE_MICROS, INDEXING_PIPELINES};
 use crate::models::{IndexingStatistics, SharedPublishToken};
 use crate::source::{
-    AssignShards, Assignment, SourceActor, SourceRuntime, quickwit_supported_sources,
+    AssignShards, Assignment, ChannelSource, LocalBatchReceiver, Source, SourceActor,
+    SourceRuntime, quickwit_supported_sources,
 };
 use crate::split_store::IndexingSplitStore;
 
@@ -428,20 +429,23 @@ impl IndexingPipeline {
             .set_backpressure_micros_counter(counter!(parent: BACKPRESSURE_MICROS, labels: [label_values!(ACTOR_NAME => "doc_processor")]))
             .set_kill_switch(self.kill_switch.clone())
             .spawn(doc_processor);
-        let source_runtime = SourceRuntime {
-            pipeline_id: self.params.pipeline_id.clone(),
-            source_config: self.params.source_config.clone(),
-            metastore: self.params.metastore.clone(),
-            ingester_pool: self.params.ingester_pool.clone(),
-            queues_dir_path: self.params.queues_dir_path.clone(),
-            storage_resolver: self.params.source_storage_resolver.clone(),
-            event_broker: self.params.event_broker.clone(),
-            indexing_setting: self.params.indexing_settings.clone(),
-            publish_token: self.publish_token.clone(),
+        let source: Box<dyn Source> = if let Some(batch_rx) = self.params.batch_rx_opt.clone() {
+            Box::new(ChannelSource::new(batch_rx))
+        } else {
+            let source_runtime = SourceRuntime {
+                pipeline_id: self.params.pipeline_id.clone(),
+                source_config: self.params.source_config.clone(),
+                metastore: self.params.metastore.clone(),
+                ingester_pool: self.params.ingester_pool.clone(),
+                queues_dir_path: self.params.queues_dir_path.clone(),
+                storage_resolver: self.params.source_storage_resolver.clone(),
+                event_broker: self.params.event_broker.clone(),
+                indexing_setting: self.params.indexing_settings.clone(),
+                publish_token: self.publish_token.clone(),
+            };
+            ctx.protect_future(quickwit_supported_sources().load_source(source_runtime))
+                .await?
         };
-        let source = ctx
-            .protect_future(quickwit_supported_sources().load_source(source_runtime))
-            .await?;
         let actor_source = SourceActor::new(source, doc_processor_mailbox);
         let (source_mailbox, source_handle) = ctx
             .spawn_actor()
@@ -604,6 +608,9 @@ pub struct IndexingPipelineParams {
     pub ingester_pool: IngesterPool,
     pub queues_dir_path: PathBuf,
     pub params_fingerprint: u64,
+    /// Optional work-stealing batch channel overriding `source_config` loading (used by
+    /// `local-ingest --num-pipelines <N>`).
+    pub batch_rx_opt: Option<LocalBatchReceiver>,
 
     pub event_broker: EventBroker,
 }
@@ -739,6 +746,7 @@ mod tests {
             merge_planner_mailbox_opt: Some(merge_planner_mailbox),
             event_broker: EventBroker::default(),
             params_fingerprint: 42u64,
+            batch_rx_opt: None,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (_pipeline_mailbox, pipeline_handle) = universe.spawn_builder().spawn(pipeline);
@@ -846,6 +854,7 @@ mod tests {
             indexing_io_throughput_limiter_opt: None,
             merge_planner_mailbox_opt: Some(merge_planner_mailbox),
             params_fingerprint: 42u64,
+            batch_rx_opt: None,
             event_broker: EventBroker::default(),
         };
         let (_pipeline_mailbox, pipeline_handle) = universe
@@ -978,6 +987,7 @@ mod tests {
             merge_planner_mailbox_opt: Some(merge_planner_mailbox),
             event_broker: Default::default(),
             params_fingerprint: 42u64,
+            batch_rx_opt: None,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (_pipeline_mailbox, pipeline_handler) = universe.spawn_builder().spawn(pipeline);
@@ -1080,6 +1090,7 @@ mod tests {
             merge_planner_mailbox_opt: Some(merge_planner_mailbox.clone()),
             event_broker: Default::default(),
             params_fingerprint: 42u64,
+            batch_rx_opt: None,
         };
         let indexing_pipeline = IndexingPipeline::new(indexing_pipeline_params);
         let (_indexing_pipeline_mailbox, indexing_pipeline_handler) =
@@ -1165,6 +1176,7 @@ mod tests {
             merge_planner_mailbox_opt: None,
             event_broker: Default::default(),
             params_fingerprint: 42u64,
+            batch_rx_opt: None,
         };
         let indexing_pipeline = IndexingPipeline::new(indexing_pipeline_params);
         let (pipeline_mailbox, pipeline_handle) = universe.spawn_builder().spawn(indexing_pipeline);
@@ -1319,6 +1331,7 @@ mod tests {
             indexing_io_throughput_limiter_opt: None,
             merge_planner_mailbox_opt: Some(merge_planner_mailbox),
             params_fingerprint: 42u64,
+            batch_rx_opt: None,
             event_broker: Default::default(),
         };
         let pipeline = IndexingPipeline::new(pipeline_params);

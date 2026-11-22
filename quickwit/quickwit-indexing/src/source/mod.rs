@@ -52,6 +52,8 @@
 //!   that file.
 //! - the kafka source: the partition id is a kafka topic partition id, and the position is a kafka
 //!   offset.
+mod channel_source;
+mod chunked_line_reader;
 mod doc_file_reader;
 mod file_source;
 #[cfg(feature = "gcp-pubsub")]
@@ -79,6 +81,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytesize::ByteSize;
+pub use channel_source::{ChannelSource, LocalBatchReceiver, spawn_local_batch_reader};
 pub use file_source::{FileSource, FileSourceFactory};
 #[cfg(feature = "gcp-pubsub")]
 pub use gcp_pubsub_source::{GcpPubSubSource, GcpPubSubSourceFactory};

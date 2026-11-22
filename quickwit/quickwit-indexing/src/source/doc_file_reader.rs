@@ -17,6 +17,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use async_compression::tokio::bufread::GzipDecoder;
+#[cfg(test)]
 use bytes::Bytes;
 use quickwit_common::Progress;
 use quickwit_common::uri::Uri;
@@ -24,57 +25,78 @@ use quickwit_metastore::checkpoint::PartitionId;
 use quickwit_proto::metastore::SourceType;
 use quickwit_proto::types::Position;
 use quickwit_storage::StorageResolver;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 
+use super::chunked_line_reader::{ChunkedLineReader, READ_CHUNK_SIZE};
 use super::{BATCH_NUM_BYTES_LIMIT, BatchBuilder};
 
+#[cfg(test)]
 pub struct FileRecord {
     pub next_offset: u64,
     pub doc: Bytes,
+    #[allow(dead_code)]
     pub is_last: bool,
 }
 
 /// A helper wrapper that lets you skip bytes in compressed files where you
 /// cannot seek (e.g. gzip files).
 struct SkipReader {
-    reader: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
+    reader: ChunkedLineReader<Box<dyn AsyncRead + Send + Unpin>>,
     num_bytes_to_skip: usize,
 }
 
 impl SkipReader {
     fn new(reader: Box<dyn AsyncRead + Send + Unpin>, num_bytes_to_skip: usize) -> Self {
         Self {
-            reader: BufReader::new(reader),
+            reader: ChunkedLineReader::new(reader),
             num_bytes_to_skip,
         }
     }
 
-    async fn skip(&mut self) -> io::Result<()> {
-        // allocate on the heap to avoid stack overflows
-        let mut buf = vec![0u8; 64_000];
-        while self.num_bytes_to_skip > 0 {
-            let num_bytes_to_read = self.num_bytes_to_skip.min(buf.len());
-            let num_bytes_read = self
-                .reader
-                .read_exact(&mut buf[..num_bytes_to_read])
-                .await?;
-            self.num_bytes_to_skip -= num_bytes_read;
+    async fn skip_if_needed(&mut self) -> io::Result<()> {
+        if self.num_bytes_to_skip > 0 {
+            let to_skip = self.num_bytes_to_skip;
+            self.reader.skip_exact(to_skip).await?;
+            self.num_bytes_to_skip = 0;
         }
         Ok(())
     }
 
     /// Reads a line and peeks into the readers buffer. Returns the number of
-    /// bytes read and true the end of the file is reached.
+    /// bytes read and true if the end of the file is reached.
+    #[cfg(test)]
     async fn read_line_and_peek(&mut self, buf: &mut String) -> io::Result<(usize, bool)> {
+        let (line_bytes, is_eof) = self.read_line_bytes_and_peek().await?;
+        let line_str = std::str::from_utf8(&line_bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        buf.push_str(line_str);
+        Ok((line_bytes.len(), is_eof))
+    }
+
+    #[cfg(test)]
+    async fn read_line_bytes_and_peek(&mut self) -> io::Result<(Bytes, bool)> {
+        self.skip_if_needed().await?;
+        self.reader.read_line_and_peek().await
+    }
+
+    async fn read_batch_into(
+        &mut self,
+        max_batch_bytes: usize,
+        source_progress: &Progress,
+        batch_builder: &mut BatchBuilder,
+    ) -> io::Result<usize> {
         if self.num_bytes_to_skip > 0 {
-            self.skip().await?;
+            source_progress
+                .protect_future(self.skip_if_needed())
+                .await?;
         }
-        let line_size = self.reader.read_line(buf).await?;
-        if line_size == 0 {
-            return Ok((0, true));
-        }
-        let next_bytes = self.reader.fill_buf().await?;
-        Ok((line_size, next_bytes.is_empty()))
+        self.reader
+            .read_batch_into(max_batch_bytes, source_progress, batch_builder)
+            .await
+    }
+
+    fn is_eof(&self) -> bool {
+        self.reader.is_eof()
     }
 }
 
@@ -107,7 +129,10 @@ impl DocFileReader {
         // first `offset` bytes.
         let reader = if uri.extension() == Some("gz") {
             let stream = storage.get_slice_stream(file_name, 0..file_size).await?;
-            let decompressed_stream = Box::new(GzipDecoder::new(BufReader::new(stream)));
+            let decompressed_stream = Box::new(GzipDecoder::new(BufReader::with_capacity(
+                READ_CHUNK_SIZE,
+                stream,
+            )));
             DocFileReader {
                 reader: SkipReader::new(decompressed_stream, offset),
                 next_offset: offset as u64,
@@ -126,20 +151,38 @@ impl DocFileReader {
 
     /// Reads the next record from the underlying file. Returns `None` when EOF
     /// is reached.
+    #[cfg(test)]
     pub async fn next_record(&mut self) -> anyhow::Result<Option<FileRecord>> {
-        let mut buf = String::new();
         // TODO retry if stream is broken (#5243)
-        let (bytes_read, is_last) = self.reader.read_line_and_peek(&mut buf).await?;
-        if bytes_read == 0 {
+        let (doc, is_last) = self.reader.read_line_bytes_and_peek().await?;
+        if doc.is_empty() {
             Ok(None)
         } else {
-            self.next_offset += bytes_read as u64;
+            self.next_offset += doc.len() as u64;
             Ok(Some(FileRecord {
                 next_offset: self.next_offset,
-                doc: Bytes::from(buf),
+                doc,
                 is_last,
             }))
         }
+    }
+
+    pub(crate) async fn read_batch_into(
+        &mut self,
+        max_batch_bytes: usize,
+        source_progress: &Progress,
+        batch_builder: &mut BatchBuilder,
+    ) -> anyhow::Result<usize> {
+        let bytes_read = self
+            .reader
+            .read_batch_into(max_batch_bytes, source_progress, batch_builder)
+            .await?;
+        self.next_offset += bytes_read as u64;
+        Ok(bytes_read)
+    }
+
+    pub(crate) fn is_eof(&self) -> bool {
+        self.reader.is_eof()
     }
 }
 
@@ -189,24 +232,16 @@ impl ObjectUriBatchReader {
         if self.is_eof {
             return Ok(batch_builder);
         }
-        let limit_num_bytes = self.current_offset + BATCH_NUM_BYTES_LIMIT as usize;
-        let mut new_offset = self.current_offset;
-        while new_offset < limit_num_bytes {
-            if let Some(record) = source_progress
-                .protect_future(self.reader.next_record())
-                .await?
-            {
-                new_offset = record.next_offset as usize;
-                batch_builder.add_doc(record.doc);
-                if record.is_last {
-                    self.is_eof = true;
-                    break;
-                }
-            } else {
-                self.is_eof = true;
-                break;
-            }
-        }
+        let bytes_read = self
+            .reader
+            .read_batch_into(
+                BATCH_NUM_BYTES_LIMIT as usize,
+                source_progress,
+                &mut batch_builder,
+            )
+            .await?;
+        let new_offset = self.current_offset + bytes_read;
+        self.is_eof = self.reader.is_eof();
         let to_position = if self.is_eof {
             Position::eof(new_offset)
         } else {

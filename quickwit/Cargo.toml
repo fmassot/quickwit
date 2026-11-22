@@ -380,7 +380,7 @@ quickwit-telemetry-exporters = { path = "quickwit-telemetry-exporters" }
 quickwit-transport = { path = "quickwit-transport" }
 
 # perf/searchbench fork of tantivy (includes SearchBench, ClickBench, Big5, and JSONBench optimizations).
-tantivy = { git = "https://github.com/fmassot/tantivy.git", rev = "5ac25aa6a26fc43083cc87e1ad169c98524b86c5", default-features = false, features = [
+tantivy = { git = "https://github.com/fmassot/tantivy.git", rev = "712a09b5d977ea0c3c99d379c3a7ff0fa89e1868", default-features = false, features = [
   "jitexpr",
   "lz4-compression",
   "mmap",
@@ -389,7 +389,7 @@ tantivy = { git = "https://github.com/fmassot/tantivy.git", rev = "5ac25aa6a26fc
   "columnar-zstd-compression",
 ] }
 # Must stay on the same rev as `tantivy`.
-tantivy-common = { git = "https://github.com/fmassot/tantivy.git", rev = "5ac25aa6a26fc43083cc87e1ad169c98524b86c5" }
+tantivy-common = { git = "https://github.com/fmassot/tantivy.git", rev = "712a09b5d977ea0c3c99d379c3a7ff0fa89e1868" }
 tantivy-fst = "0.5"
 
 # This is actually not used directly the goal is to fix the version

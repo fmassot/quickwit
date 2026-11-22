@@ -36,7 +36,8 @@ pub use indexed_split::{
     IndexedSplitBuilder,
 };
 pub use indexing_service_message::{
-    DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnPipeline,
+    DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnChannelPipeline,
+    SpawnPipeline,
 };
 pub use indexing_statistics::IndexingStatistics;
 pub use merge_planner_message::NewSplits;
