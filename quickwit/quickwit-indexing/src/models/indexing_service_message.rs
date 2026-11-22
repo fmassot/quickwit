@@ -16,11 +16,25 @@ use quickwit_config::SourceConfig;
 use quickwit_proto::indexing::{IndexingPipelineId, MergePipelineId};
 use quickwit_proto::types::{IndexId, PipelineUid};
 
+use crate::source::LocalBatchReceiver;
+
 #[derive(Clone, Debug)]
 pub struct SpawnPipeline {
     pub index_id: IndexId,
     pub source_config: SourceConfig,
     pub pipeline_uid: PipelineUid,
+}
+
+/// Spawns an indexing pipeline fed by a shared in-process work-stealing batch channel.
+///
+/// Used by `local-ingest --num-pipelines <N>` to run multiple independent indexing
+/// pipelines sharing one merge pipeline over a single file or stdin stream.
+#[derive(Clone, Debug)]
+pub struct SpawnChannelPipeline {
+    pub index_id: IndexId,
+    pub source_config: SourceConfig,
+    pub pipeline_uid: PipelineUid,
+    pub batch_rx: LocalBatchReceiver,
 }
 
 /// Detaches a pipeline from the indexing service. The pipeline is no longer managed by the

@@ -39,8 +39,10 @@ use quickwit_index_management::{IndexService, clear_cache_directory};
 use quickwit_indexing::actors::{IndexingService, MergePipeline, MergeSchedulerService};
 use quickwit_indexing::docs_clustering::Fingerprinter;
 use quickwit_indexing::models::{
-    DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnPipeline,
+    DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnChannelPipeline,
+    SpawnPipeline,
 };
+use quickwit_indexing::source::spawn_local_batch_reader;
 use quickwit_indexing::{IndexingPipeline, IndexingSplitCache};
 use quickwit_ingest::IngesterPool;
 use quickwit_metastore::IndexMetadataResponseExt;
@@ -87,6 +89,9 @@ pub fn build_tool_command() -> Command {
                     arg!(--"transform-script" <SCRIPT> "VRL program to transform docs before ingesting.")
                         .required(false),
                     arg!(--"keep-cache" "Does not clear local cache directory upon completion.")
+                        .required(false),
+                    arg!(--"num-pipelines" <NUM_PIPELINES> "Number of parallel indexing pipelines.")
+                        .default_value("1")
                         .required(false),
                 ])
             )
@@ -177,6 +182,7 @@ pub struct LocalIngestDocsArgs {
     pub overwrite: bool,
     pub vrl_script: Option<String>,
     pub clear_cache: bool,
+    pub num_pipelines: NonZeroUsize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -263,6 +269,11 @@ impl ToolCliCommand {
         let overwrite = matches.get_flag("overwrite");
         let vrl_script = matches.remove_one::<String>("transform-script");
         let clear_cache = !matches.get_flag("keep-cache");
+        let num_pipelines = matches
+            .remove_one::<String>("num-pipelines")
+            .expect("`num-pipelines` should have a default value.")
+            .parse::<NonZeroUsize>()
+            .context("`num-pipelines` must be a positive integer")?;
 
         Ok(Self::LocalIngest(LocalIngestDocsArgs {
             config_uri,
@@ -272,6 +283,7 @@ impl ToolCliCommand {
             overwrite,
             vrl_script,
             clear_cache,
+            num_pipelines,
         }))
     }
 
@@ -418,7 +430,7 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
         .map(|vrl_script| TransformConfig::new(vrl_script, None));
     let source_config = SourceConfig {
         source_id: CLI_SOURCE_ID.to_string(),
-        num_pipelines: NonZeroUsize::MIN,
+        num_pipelines: args.num_pipelines,
         enabled: true,
         source_params,
         transform_config,
@@ -440,7 +452,9 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
     // aware of the running tasks. We thus create a fake cluster to instantiate the indexing service
     // and avoid impacting potential control plane running on the cluster.
     let cluster = create_empty_cluster(&config).await?;
+    let num_pipelines = args.num_pipelines.get();
     let indexer_config = IndexerConfig {
+        max_concurrent_split_uploads: (num_pipelines * 2).max(12),
         ..Default::default()
     };
     let runtimes_config = RuntimesConfig::get();
@@ -466,7 +480,7 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
         None,
         Some(merge_scheduler_service_mailbox),
         IngesterPool::default(),
-        storage_resolver,
+        storage_resolver.clone(),
         EventBroker::default(),
         split_cache,
         fingerprinter_opt,
@@ -474,21 +488,6 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
     .await?;
     let (indexing_server_mailbox, indexing_server_handle) =
         universe.spawn_builder().spawn(indexing_server);
-    let pipeline_id = indexing_server_mailbox
-        .ask_for_res(SpawnPipeline {
-            index_id: args.index_id.clone(),
-            source_config,
-            pipeline_uid: PipelineUid::random(),
-        })
-        .await?;
-    let merge_pipeline_handle = indexing_server_mailbox
-        .ask_for_res(DetachMergePipeline {
-            pipeline_id: pipeline_id.merge_pipeline_id(),
-        })
-        .await?;
-    let indexing_pipeline_handle = indexing_server_mailbox
-        .ask_for_res(DetachIndexingPipeline { pipeline_id })
-        .await?;
 
     if args.input_path_opt.is_none() && io::stdin().is_terminal() {
         let eof_shortcut = match env::consts::OS {
@@ -500,9 +499,67 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
              {eof_shortcut}."
         );
     }
-    let statistics =
-        start_statistics_reporting_loop(indexing_pipeline_handle, args.input_path_opt.is_none())
+
+    let (pipeline_ids, reader_handle_opt) = if num_pipelines == 1 {
+        let pipeline_id = indexing_server_mailbox
+            .ask_for_res(SpawnPipeline {
+                index_id: args.index_id.clone(),
+                source_config,
+                pipeline_uid: PipelineUid::random(),
+            })
             .await?;
+        (vec![pipeline_id], None)
+    } else {
+        let (batch_rx, reader_handle) = spawn_local_batch_reader(
+            args.input_path_opt.clone(),
+            storage_resolver,
+            num_pipelines * 2,
+        )
+        .await?;
+        let mut spawned_ids = Vec::with_capacity(num_pipelines);
+        for _ in 0..num_pipelines {
+            let pipeline_id = indexing_server_mailbox
+                .ask_for_res(SpawnChannelPipeline {
+                    index_id: args.index_id.clone(),
+                    source_config: source_config.clone(),
+                    pipeline_uid: PipelineUid::random(),
+                    batch_rx: batch_rx.clone(),
+                })
+                .await?;
+            spawned_ids.push(pipeline_id);
+        }
+        drop(batch_rx);
+        (spawned_ids, Some(reader_handle))
+    };
+
+    // Detach the single shared MergePipeline AFTER all N IndexingPipelines have been spawned
+    // so every pipeline registers with the same MergePipeline.
+    let merge_pipeline_handle = indexing_server_mailbox
+        .ask_for_res(DetachMergePipeline {
+            pipeline_id: pipeline_ids[0].merge_pipeline_id(),
+        })
+        .await?;
+    let mut indexing_pipeline_handles = Vec::with_capacity(pipeline_ids.len());
+    for pipeline_id in pipeline_ids {
+        let handle = indexing_server_mailbox
+            .ask_for_res(DetachIndexingPipeline { pipeline_id })
+            .await?;
+        indexing_pipeline_handles.push(handle);
+    }
+
+    let statistics_res =
+        start_statistics_reporting_loop(indexing_pipeline_handles, args.input_path_opt.is_none())
+            .await;
+    if let Some(reader_handle) = reader_handle_opt {
+        if statistics_res.is_err() {
+            reader_handle.abort();
+        } else {
+            reader_handle
+                .await
+                .context("local batch reader task panicked")??;
+        }
+    }
+    let statistics = statistics_res?;
 
     merge_pipeline_handle
         .mailbox()
@@ -769,41 +826,71 @@ async fn extract_split_cli(args: ExtractSplitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Starts a tokio task that displays the indexing statistics
-/// every once in awhile.
+fn aggregate_statistics(
+    statistics_iter: impl IntoIterator<Item = IndexingStatistics>,
+) -> IndexingStatistics {
+    let mut total = IndexingStatistics::default();
+    for stats in statistics_iter {
+        total.num_docs += stats.num_docs;
+        total.num_invalid_docs += stats.num_invalid_docs;
+        total.num_local_splits += stats.num_local_splits;
+        total.num_staged_splits += stats.num_staged_splits;
+        total.num_uploaded_splits += stats.num_uploaded_splits;
+        total.num_published_splits += stats.num_published_splits;
+        total.num_empty_splits += stats.num_empty_splits;
+        total.total_bytes_processed += stats.total_bytes_processed;
+        total.total_size_splits += stats.total_size_splits;
+    }
+    total
+}
+
+/// Starts a loop that displays aggregated indexing statistics once per second until all
+/// pipelines exit.
 pub async fn start_statistics_reporting_loop(
-    pipeline_handle: ActorHandle<IndexingPipeline>,
+    pipeline_handles: Vec<ActorHandle<IndexingPipeline>>,
     is_stdin: bool,
 ) -> anyhow::Result<IndexingStatistics> {
     let mut stdout_handle = stdout();
     let start_time = Instant::now();
     let mut throughput_calculator = ThroughputCalculator::new(start_time);
-    let mut report_interval = tokio::time::interval(Duration::from_secs(1));
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(50));
+    let mut last_display_at = Instant::now();
 
     loop {
-        // TODO fixme. The way we wait today is a bit lame: if the indexing pipeline exits, we will
-        // still wait up to an entire heartbeat...  Ideally we should  select between two
-        // futures.
-        report_interval.tick().await;
-        // Try to receive with a timeout of 1 second.
-        // 1 second is also the frequency at which we update statistic in the console
-        pipeline_handle.refresh_observe();
+        poll_interval.tick().await;
+        let all_exited = pipeline_handles
+            .iter()
+            .all(|handle| handle.state().is_exit());
 
-        let observation = pipeline_handle.last_observation();
-
-        // Let's not display live statistics to allow screen to scroll.
-        if observation.num_docs > 0 {
-            display_statistics(&mut stdout_handle, &mut throughput_calculator, &observation)?;
+        if all_exited || last_display_at.elapsed() >= Duration::from_secs(1) {
+            for handle in &pipeline_handles {
+                handle.refresh_observe();
+            }
+            let observation = aggregate_statistics(
+                pipeline_handles
+                    .iter()
+                    .map(|handle| handle.last_observation().clone()),
+            );
+            if observation.num_docs > 0 {
+                display_statistics(&mut stdout_handle, &mut throughput_calculator, &observation)?;
+            }
+            last_display_at = Instant::now();
         }
 
-        if pipeline_handle.state().is_exit() {
+        if all_exited {
             break;
         }
     }
-    let (pipeline_exit_status, pipeline_statistics) = pipeline_handle.join().await;
-    if !pipeline_exit_status.is_success() {
-        bail!(pipeline_exit_status);
+
+    let mut final_statistics = Vec::with_capacity(pipeline_handles.len());
+    for handle in pipeline_handles {
+        let (pipeline_exit_status, pipeline_statistics) = handle.join().await;
+        if !pipeline_exit_status.is_success() {
+            bail!(pipeline_exit_status);
+        }
+        final_statistics.push(pipeline_statistics);
     }
+    let pipeline_statistics = aggregate_statistics(final_statistics);
     // If we have received zero docs at this point,
     // there is no point in displaying report.
     if pipeline_statistics.num_docs == 0 {

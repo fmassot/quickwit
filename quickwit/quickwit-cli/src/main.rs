@@ -448,12 +448,36 @@ mod tests {
                     overwrite,
                     vrl_script: Some(vrl_script),
                     clear_cache,
+                    num_pipelines,
                 })) if &index_id == "wikipedia"
                        && config_uri == Uri::from_str("file:///config.yaml").unwrap()
                        && vrl_script == ".message = downcase(string!(.message))"
                        && overwrite
                        && !clear_cache
-                       && input_format == SourceInputFormat::PlainText,
+                       && input_format == SourceInputFormat::PlainText
+                       && num_pipelines.get() == 1,
+        ));
+
+        let app = build_cli().no_binary_name(true);
+        let matches = app
+            .try_get_matches_from([
+                "tool",
+                "local-ingest",
+                "--index",
+                "wikipedia",
+                "--config",
+                "/config.yaml",
+                "--num-pipelines",
+                "4",
+            ])
+            .unwrap();
+        let command = CliCommand::parse_cli_args(matches).unwrap();
+        assert!(matches!(
+            command,
+            CliCommand::Tool(ToolCliCommand::LocalIngest(LocalIngestDocsArgs {
+                num_pipelines,
+                ..
+            })) if num_pipelines.get() == 4,
         ));
     }
 
