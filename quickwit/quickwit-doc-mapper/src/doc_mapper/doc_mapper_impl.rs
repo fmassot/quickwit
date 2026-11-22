@@ -706,6 +706,42 @@ impl DocMapper {
     pub fn tokenizer_manager(&self) -> &TokenizerManager {
         &self.tokenizer_manager
     }
+
+    /// Returns the doc mapping mode type (`Strict`, `Lenient`, or `Dynamic`).
+    pub fn mode_type(&self) -> crate::ModeType {
+        self.mode.mode_type()
+    }
+
+    /// Returns the `_dynamic` field if dynamic mode is enabled.
+    pub fn dynamic_field(&self) -> Option<Field> {
+        self.dynamic_field
+    }
+
+    /// Returns the `_source` field if `store_source` is enabled.
+    pub fn source_field(&self) -> Option<Field> {
+        self.source_field
+    }
+
+    /// Returns the `_document_size` field if `store_document_size` is enabled.
+    pub fn document_size_field(&self) -> Option<Field> {
+        self.document_size_field
+    }
+
+    /// Returns whether `_field_presence` indexing is enabled.
+    pub fn index_field_presence(&self) -> bool {
+        self.index_field_presence
+    }
+
+    /// Populates the `_field_presence` field on `document` from its indexed fields.
+    pub fn populate_field_presence(&self, document: &mut Document) {
+        if self.index_field_presence {
+            let field_presence_hashes: FnvHashSet<u64> =
+                populate_field_presence(document, &self.schema, true);
+            for field_presence_hash in field_presence_hashes {
+                document.add_field_value(FIELD_PRESENCE_FIELD, &field_presence_hash);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use quickwit_config::SourceConfig;
 use quickwit_proto::indexing::{IndexingPipelineId, MergePipelineId};
 use quickwit_proto::types::{IndexId, PipelineUid};
 
-use crate::source::LocalBatchReceiver;
+use crate::source::{LocalBatchReceiver, LocalParquetReceiver};
 
 #[derive(Clone, Debug)]
 pub struct SpawnPipeline {
@@ -35,6 +35,16 @@ pub struct SpawnChannelPipeline {
     pub source_config: SourceConfig,
     pub pipeline_uid: PipelineUid,
     pub batch_rx: LocalBatchReceiver,
+}
+
+/// Spawns an indexing pipeline fed by a shared in-process work-stealing Parquet row-group
+/// queue.
+#[derive(Clone, Debug)]
+pub struct SpawnParquetPipeline {
+    pub index_id: IndexId,
+    pub source_config: SourceConfig,
+    pub pipeline_uid: PipelineUid,
+    pub parquet_rx: LocalParquetReceiver,
 }
 
 /// Detaches a pipeline from the indexing service. The pipeline is no longer managed by the

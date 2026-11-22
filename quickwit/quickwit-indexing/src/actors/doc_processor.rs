@@ -141,8 +141,9 @@ fn try_into_vrl_doc(
         SourceInputFormat::OtlpLogsJson
         | SourceInputFormat::OtlpLogsProtobuf
         | SourceInputFormat::OtlpTracesJson
-        | SourceInputFormat::OtlpTracesProtobuf => {
-            panic!("OTP logs or traces do not support VRL transforms")
+        | SourceInputFormat::OtlpTracesProtobuf
+        | SourceInputFormat::Parquet => {
+            panic!("OTLP or Parquet inputs do not support VRL transforms")
         }
     };
     let vrl_doc = VrlDoc::new(vrl_value, num_bytes);
@@ -185,6 +186,9 @@ fn try_into_json_docs(
             });
             JsonDocIterator::from(json_doc_result)
         }
+        SourceInputFormat::Parquet => JsonDocIterator::from(Err(DocProcessorError::JsonParsing(
+            "parquet input format requires the native parquet source".to_string(),
+        ))),
     }
 }
 
@@ -306,6 +310,12 @@ impl DocProcessorCounter {
         self.num_docs_metric.inc();
         self.num_bytes_metric.inc_by(num_bytes);
     }
+
+    fn record_docs(&self, num_docs: u64, num_bytes: u64) {
+        self.num_docs.fetch_add(num_docs, Ordering::Relaxed);
+        self.num_docs_metric.inc_by(num_docs);
+        self.num_bytes_metric.inc_by(num_bytes);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -381,6 +391,11 @@ impl DocProcessorCounters {
     pub fn record_valid(&self, num_bytes: u64) {
         self.num_bytes_total.fetch_add(num_bytes, Ordering::Relaxed);
         self.valid.record_doc(num_bytes);
+    }
+
+    pub fn record_valid_batch(&self, num_docs: u64, num_bytes: u64) {
+        self.num_bytes_total.fetch_add(num_bytes, Ordering::Relaxed);
+        self.valid.record_docs(num_docs, num_bytes);
     }
 
     pub fn record_error(&self, error: DocProcessorError, num_bytes: u64) {
@@ -595,6 +610,32 @@ impl Handler<RawDocBatch> for DocProcessor {
             raw_doc_batch.checkpoint_delta,
             raw_doc_batch.force_commit,
         );
+        ctx.send_message(&self.indexer_mailbox, processed_doc_batch)
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<ProcessedDocBatch> for DocProcessor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        processed_doc_batch: ProcessedDocBatch,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        if self.publish_lock.is_dead() {
+            return Ok(());
+        }
+        let batch_valid_docs = processed_doc_batch.docs.len() as u64;
+        let batch_valid_bytes: u64 = processed_doc_batch
+            .docs
+            .iter()
+            .map(|doc| doc.num_bytes as u64)
+            .sum();
+        self.counters
+            .record_valid_batch(batch_valid_docs, batch_valid_bytes);
         ctx.send_message(&self.indexer_mailbox, processed_doc_batch)
             .await?;
         Ok(())

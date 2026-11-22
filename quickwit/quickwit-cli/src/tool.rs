@@ -40,9 +40,9 @@ use quickwit_indexing::actors::{IndexingService, MergePipeline, MergeSchedulerSe
 use quickwit_indexing::docs_clustering::Fingerprinter;
 use quickwit_indexing::models::{
     DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnChannelPipeline,
-    SpawnPipeline,
+    SpawnParquetPipeline, SpawnPipeline,
 };
-use quickwit_indexing::source::spawn_local_batch_reader;
+use quickwit_indexing::source::{open_local_parquet_work_queue, spawn_local_batch_reader};
 use quickwit_indexing::{IndexingPipeline, IndexingSplitCache};
 use quickwit_ingest::IngesterPool;
 use quickwit_metastore::IndexMetadataResponseExt;
@@ -436,11 +436,23 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
         transform_config,
         input_format: args.input_format,
     };
+    let is_parquet = args.input_format == SourceInputFormat::Parquet;
+    if is_parquet && args.input_path_opt.is_none() {
+        bail!("`--input-format parquet` requires `--input-path` (file, directory, or glob)");
+    }
+    if is_parquet && source_config.transform_config.is_some() {
+        bail!("VRL transforms are not supported with `--input-format parquet`");
+    }
+
     run_index_checklist(
         &mut metastore,
         &storage_resolver,
         &args.index_id,
-        Some(&source_config),
+        if is_parquet {
+            None
+        } else {
+            Some(&source_config)
+        },
     )
     .await?;
 
@@ -500,7 +512,28 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
         );
     }
 
-    let (pipeline_ids, reader_handle_opt) = if num_pipelines == 1 {
+    let (pipeline_ids, reader_handle_opt) = if is_parquet {
+        let input_uri = args
+            .input_path_opt
+            .as_ref()
+            .expect("parquet input_path checked above");
+        let (parquet_rx, num_row_groups) = open_local_parquet_work_queue(input_uri.as_str())?;
+        let active_pipelines = num_pipelines.min(num_row_groups.max(1));
+        let mut spawned_ids = Vec::with_capacity(active_pipelines);
+        for _ in 0..active_pipelines {
+            let pipeline_id = indexing_server_mailbox
+                .ask_for_res(SpawnParquetPipeline {
+                    index_id: args.index_id.clone(),
+                    source_config: source_config.clone(),
+                    pipeline_uid: PipelineUid::random(),
+                    parquet_rx: parquet_rx.clone(),
+                })
+                .await?;
+            spawned_ids.push(pipeline_id);
+        }
+        drop(parquet_rx);
+        (spawned_ids, None)
+    } else if num_pipelines == 1 {
         let pipeline_id = indexing_server_mailbox
             .ask_for_res(SpawnPipeline {
                 index_id: args.index_id.clone(),

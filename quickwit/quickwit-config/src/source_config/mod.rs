@@ -213,6 +213,7 @@ pub enum SourceInputFormat {
     OtlpTracesProtobuf,
     #[serde(alias = "plain")]
     PlainText,
+    Parquet,
 }
 
 impl FromStr for SourceInputFormat {
@@ -222,6 +223,7 @@ impl FromStr for SourceInputFormat {
         match format_str {
             "json" => Ok(Self::Json),
             "plain" => Ok(Self::PlainText),
+            "parquet" => Ok(Self::Parquet),
             unknown => Err(format!("unknown source input format: `{unknown}`")),
         }
     }
