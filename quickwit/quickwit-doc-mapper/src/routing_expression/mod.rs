@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 pub(crate) use expression_dsl::parse_field_name;
 use serde_json::Value as JsonValue;
+use serde_json_borrow::{Map as BorrowedJsonMap, Value as BorrowedJsonValue};
 use siphasher::sip::SipHasher;
 
 pub trait RoutingExprContext {
@@ -96,6 +97,77 @@ impl RoutingExprContext for serde_json::Map<String, JsonValue> {
         if let Some(json_val) = find_value_in_map(self, attr_name) {
             hasher.write_u8(1u8);
             hash_json_val(json_val, hasher);
+        } else {
+            hasher.write_u8(0u8);
+        }
+    }
+}
+
+/// Hashes a borrowed JSON value identically to [`hash_json_val`].
+///
+/// Object entries are sorted by key before hashing to match `serde_json::Map`'s `BTreeMap` order.
+fn hash_borrowed_json_val<H: Hasher>(json_val: &BorrowedJsonValue<'_>, hasher: &mut H) {
+    match json_val {
+        BorrowedJsonValue::Null => {
+            hasher.write_u8(0u8);
+        }
+        BorrowedJsonValue::Bool(bool_val) => {
+            hasher.write_u8(1u8);
+            bool_val.hash(hasher);
+        }
+        BorrowedJsonValue::Number(num) => {
+            hasher.write_u8(2u8);
+            serde_json::Number::from(*num).hash(hasher);
+        }
+        BorrowedJsonValue::Str(text) => {
+            hasher.write_u8(3u8);
+            hasher.write_u64(text.len() as u64);
+            hasher.write(text.as_bytes());
+        }
+        BorrowedJsonValue::Array(arr) => {
+            hasher.write_u8(4u8);
+            hasher.write_u64(arr.len() as u64);
+            for elem in arr {
+                hash_borrowed_json_val(elem, hasher);
+            }
+        }
+        BorrowedJsonValue::Object(obj) => {
+            let mut entries: Vec<(&str, &BorrowedJsonValue<'_>)> = obj.iter().collect();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            hasher.write_u8(5u8);
+            hasher.write_u64(entries.len() as u64);
+            for (key, val) in entries {
+                hasher.write_u64(key.len() as u64);
+                hasher.write(key.as_bytes());
+                hash_borrowed_json_val(val, hasher);
+            }
+        }
+    }
+}
+
+fn find_borrowed_value<'a>(
+    mut root: &'a BorrowedJsonValue<'a>,
+    keys: &[String],
+) -> Option<&'a BorrowedJsonValue<'a>> {
+    for key in keys {
+        match root {
+            BorrowedJsonValue::Object(obj) => {
+                root = obj.get(key.as_str())?;
+            }
+            _ => return None,
+        }
+    }
+    Some(root)
+}
+
+impl RoutingExprContext for BorrowedJsonMap<'_> {
+    fn hash_attribute<H: Hasher>(&self, attr_name: &[String], hasher: &mut H) {
+        let val_opt = self
+            .get(attr_name[0].as_str())
+            .and_then(|val| find_borrowed_value(val, &attr_name[1..]));
+        if let Some(json_val) = val_opt {
+            hasher.write_u8(1u8);
+            hash_borrowed_json_val(json_val, hasher);
         } else {
             hasher.write_u8(0u8);
         }

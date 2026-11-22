@@ -306,6 +306,15 @@ impl DocProcessorCounter {
         self.num_docs_metric.inc();
         self.num_bytes_metric.inc_by(num_bytes);
     }
+
+    fn record_docs(&self, num_docs: u64, num_bytes: u64) {
+        if num_docs == 0 {
+            return;
+        }
+        self.num_docs.fetch_add(num_docs, Ordering::Relaxed);
+        self.num_docs_metric.inc_by(num_docs);
+        self.num_bytes_metric.inc_by(num_bytes);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -381,6 +390,14 @@ impl DocProcessorCounters {
     pub fn record_valid(&self, num_bytes: u64) {
         self.num_bytes_total.fetch_add(num_bytes, Ordering::Relaxed);
         self.valid.record_doc(num_bytes);
+    }
+
+    pub fn record_valid_batch(&self, num_docs: u64, num_bytes: u64) {
+        if num_docs == 0 {
+            return;
+        }
+        self.num_bytes_total.fetch_add(num_bytes, Ordering::Relaxed);
+        self.valid.record_docs(num_docs, num_bytes);
     }
 
     pub fn record_error(&self, error: DocProcessorError, num_bytes: u64) {
@@ -464,7 +481,14 @@ impl DocProcessor {
         Ok(Some(timestamp))
     }
 
-    fn process_raw_doc(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
+    fn process_raw_doc(
+        &mut self,
+        raw_doc: Bytes,
+        processed_docs: &mut Vec<ProcessedDoc>,
+        streaming_scratch: &mut Vec<u8>,
+        batch_valid_docs: &mut u64,
+        batch_valid_bytes: &mut u64,
+    ) {
         let num_bytes = raw_doc.len();
 
         #[cfg(feature = "vrl")]
@@ -472,13 +496,98 @@ impl DocProcessor {
         #[cfg(not(feature = "vrl"))]
         let transform_opt: Option<&mut VrlProgram> = None;
 
+        // Fast single-pass streaming path for plain JSON documents without VRL transforms or
+        // docs clustering: streams JSON directly into `CompactDoc` without materializing any
+        // intermediate DOM.
+        if self.input_format == SourceInputFormat::Json
+            && transform_opt.is_none()
+            && self.fingerprinter_opt.is_none()
+        {
+            if let Ok(raw_str) = std::str::from_utf8(&raw_doc) {
+                if self.doc_mapper.can_stream_json() {
+                    if let Some(streamed_res) = self
+                        .doc_mapper
+                        .try_doc_from_json_str_streaming_with_scratch(
+                            raw_str,
+                            streaming_scratch,
+                            &mut (),
+                        )
+                    {
+                        let processed_doc_result = streamed_res
+                            .map_err(|err| match err {
+                                DocParsingError::NotJsonObject(msg) => {
+                                    DocProcessorError::JsonParsing(msg)
+                                }
+                                other => DocProcessorError::DocMapperParsing(other),
+                            })
+                            .and_then(|(partition, doc)| {
+                                let timestamp_opt = self.extract_timestamp(&doc)?;
+                                Ok(ProcessedDoc {
+                                    doc,
+                                    fingerprint_opt: None,
+                                    timestamp_opt,
+                                    partition,
+                                    num_bytes,
+                                })
+                            });
+                        match processed_doc_result {
+                            Ok(processed_doc) => {
+                                *batch_valid_docs += 1;
+                                *batch_valid_bytes += processed_doc.num_bytes as u64;
+                                processed_docs.push(processed_doc);
+                            }
+                            Err(error) => {
+                                rate_limited_warn!(
+                                    limit_per_min = 10,
+                                    index_id = self.counters.index_id,
+                                    source_id = self.counters.source_id,
+                                    "{error}",
+                                );
+                                self.counters.record_error(error, num_bytes as u64);
+                            }
+                        }
+                        return;
+                    }
+                }
+                if let Ok(borrowed_val) = serde_json::from_str::<serde_json_borrow::Value>(raw_str)
+                {
+                    let processed_doc_result = match borrowed_val {
+                        serde_json_borrow::Value::Object(borrowed_obj) => {
+                            self.process_borrowed_json_obj(&borrowed_obj, num_bytes)
+                        }
+                        _ => Err(DocProcessorError::JsonParsing(
+                            "document is not an object".to_string(),
+                        )),
+                    };
+                    match processed_doc_result {
+                        Ok(processed_doc) => {
+                            *batch_valid_docs += 1;
+                            *batch_valid_bytes += processed_doc.num_bytes as u64;
+                            processed_docs.push(processed_doc);
+                        }
+                        Err(error) => {
+                            rate_limited_warn!(
+                                limit_per_min = 10,
+                                index_id = self.counters.index_id,
+                                source_id = self.counters.source_id,
+                                "{error}",
+                            );
+                            self.counters.record_error(error, num_bytes as u64);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         for json_doc_result in parse_raw_doc(self.input_format, raw_doc, num_bytes, transform_opt) {
             let processed_doc_result =
                 json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
 
             match processed_doc_result {
                 Ok(processed_doc) => {
-                    self.counters.record_valid(processed_doc.num_bytes as u64);
+                    *batch_valid_docs += 1;
+                    *batch_valid_bytes += processed_doc.num_bytes as u64;
                     processed_docs.push(processed_doc);
                 }
                 Err(error) => {
@@ -492,6 +601,24 @@ impl DocProcessor {
                 }
             }
         }
+    }
+
+    fn process_borrowed_json_obj(
+        &self,
+        borrowed_obj: &serde_json_borrow::Map<'_>,
+        num_bytes: usize,
+    ) -> Result<ProcessedDoc, DocProcessorError> {
+        let (partition, doc) = self
+            .doc_mapper
+            .doc_from_borrowed_json_obj(borrowed_obj, num_bytes as u64)?;
+        let timestamp_opt = self.extract_timestamp(&doc)?;
+        Ok(ProcessedDoc {
+            doc,
+            fingerprint_opt: None,
+            timestamp_opt,
+            partition,
+            num_bytes,
+        })
     }
 
     fn process_json_doc(&self, json_doc: JsonDoc) -> Result<ProcessedDoc, DocProcessorError> {
@@ -584,12 +711,23 @@ impl Handler<RawDocBatch> for DocProcessor {
             return Ok(());
         }
         let mut processed_docs: Vec<ProcessedDoc> = Vec::with_capacity(raw_doc_batch.docs.len());
+        let mut streaming_scratch: Vec<u8> = Vec::with_capacity(512);
+        let mut batch_valid_docs: u64 = 0;
+        let mut batch_valid_bytes: u64 = 0;
 
         for raw_doc in raw_doc_batch.docs {
             let _protected_zone_guard = ctx.protect_zone();
-            self.process_raw_doc(raw_doc, &mut processed_docs);
+            self.process_raw_doc(
+                raw_doc,
+                &mut processed_docs,
+                &mut streaming_scratch,
+                &mut batch_valid_docs,
+                &mut batch_valid_bytes,
+            );
             ctx.record_progress();
         }
+        self.counters
+            .record_valid_batch(batch_valid_docs, batch_valid_bytes);
         let processed_doc_batch = ProcessedDocBatch::new(
             processed_docs,
             raw_doc_batch.checkpoint_delta,
